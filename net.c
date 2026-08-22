@@ -275,14 +275,28 @@ typedef struct tcp_conn {
     bool used,accepted;
     uint8_t state;
     uint32_t rcv_isn,rcv_nxt;    /* 对方 ISN / 期望下一序号 */
-    uint32_t snd_isn,snd_nxt;    /* 本地 ISN / 下一发送序号 */
+    uint32_t snd_isn,snd_nxt,snd_una;  /* 本地 ISN / 下一发送 / 最早未确认 */
     uint32_t peer_ip;
-    uint16_t peer_port,lport;
-    uint8_t rxb[TCP_BUF_SIZE];
-    uint32_t rxn;                /* 已缓冲字节数 */
+    uint16_t peer_port,lport,peer_win; /* peer_win=对端通告窗口 */
+    uint8_t rxb[TCP_BUF_SIZE];   /* 接收缓冲 */
+    uint32_t rxn;
+    uint8_t sndb[TCP_BUF_SIZE];  /* 发送缓冲：snd_una..snd_nxt 区间数据 */
+    uint32_t snd_used;           /* 缓冲中未确认字节数 */
+    uint32_t rto_deadline;       /* 重传截止时刻(ticks) */
+    uint8_t  rto_backoff;        /* 退避指数 0/1/2/... */
+    uint32_t tw_until;           /* TIME_WAIT 释放时刻(ticks) */
 } tcp_conn_t;
 static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 static socket_t  tcp_socks[TCP_MAX_CONNS];
+
+#define TCP_RTO_INIT   30u   /* 300ms @100Hz */
+#define TCP_RTO_MAX    240u  /* 2.4s */
+static uint32_t rto_now(tcp_conn_t *c){uint32_t r=TCP_RTO_INIT<<c->rto_backoff;if(r>TCP_RTO_MAX)r=TCP_RTO_MAX;return r;}
+static void tcp_rto_arm(tcp_conn_t *c){c->rto_deadline=ticks+rto_now(c);c->rto_backoff=0;}
+static void tcp_rto_retry(tcp_conn_t *c){
+    if(c->rto_backoff<6)c->rto_backoff++;
+    c->rto_deadline=ticks+rto_now(c);
+}
 
 static tcp_conn_t *tcp_conn_find_free(void){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_peer(uint32_t ip,uint16_t sport){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].peer_ip==ip&&tcp_conns[i].peer_port==sport)return &tcp_conns[i];return NULL;}
@@ -293,15 +307,32 @@ static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,co
     tcp_hdr_t *t=(tcp_hdr_t*)seg;
     t->src_port=hton16(c->lport);t->dst_port=hton16(c->peer_port);
     t->seq=hton32(seq);t->ack_seq=hton32(ack);
-    t->off_res=0x50;t->flags=flags;t->window=hton16(TCP_RX_WINDOW);t->csum=0;t->urgent=0;
+    t->off_res=0x50;t->flags=flags;
+    uint16_t win=(uint16_t)(TCP_BUF_SIZE-c->rxn);              /* 动态通告接收窗口 */
+    t->window=hton16(win);t->csum=0;t->urgent=0;
     memcpy_u(seg+20,data,dlen);
     t->csum=hton16(ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+dlen),seg,20+dlen));
     end_ip(seg,20+dlen,IP_PROTO_TCP);
 }
 
+/* Send buffered data that fits in the current peer window. */
+static void tcp_xmit_pending(tcp_conn_t *c){
+    uint32_t in_flight=c->snd_nxt-c->snd_una;
+    if(in_flight>=c->peer_win||c->snd_used<=in_flight)return;
+    uint32_t n=c->snd_used-in_flight;
+    uint32_t room=c->peer_win-in_flight;
+    if(n>room)n=room;
+    if(n>TCP_MSS)n=TCP_MSS;
+    tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,
+                c->sndb+in_flight,n);
+    c->snd_nxt+=n;
+    tcp_rto_arm(c);
+}
+
 socket_t *tcp_listen(uint16_t port){
     tcp_conn_t *c=tcp_conn_find_free();if(!c)return NULL;
-    c->used=true;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;c->rxn=0;
+    c->used=true;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;
+    c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;
     for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_socks[i].type){tcp_socks[i].type=SOCK_TCP_LISTEN;tcp_socks[i].tcp.conn=c;break;}
     kputs("[NET] TCP listen :");kput_dec(port);kputs("\n");
     return &tcp_socks[0];
@@ -317,20 +348,20 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     if(hlen<20||hlen>seglen)return;
     const uint8_t *data=seg+hlen;uint32_t dlen=seglen-hlen;
 
-    /* 1. 找既有连接 */
+    /* 0. 找既有连接；没有则看 listen */
     tcp_conn_t *c=tcp_conn_find_peer(src_ip,sport);
     if(!c){
-        /* 2. 没有则查 listen 端口 */
         tcp_conn_t *l=tcp_conn_find_listen(dport);
         if((flags&TCP_FLAG_SYN)&&l){
             c=tcp_conn_find_free();
             if(!c){kputs("[NET] TCP conn table full, RST\n");return;}
-            c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;
-            c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;
+            c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
+            c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
             c->rcv_isn=seq;c->rcv_nxt=seq+1;
-            c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;
+            c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;c->snd_una=c->snd_nxt;
             kputs("[NET] TCP SYN :");kput_dec(dport);kputs(" <- ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs(" -> SYN-ACK\n");
             tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);
+            tcp_rto_arm(c);                    /* SYN-ACK 需要重传保护 */
             return;
         }
         kputs("[NET] TCP :");kput_dec(dport);kputs(" no listener, RST\n");
@@ -347,25 +378,42 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         return;
     }
 
-    /* 3. 既有连接的状态机 */
+    /* 1. 记录对端窗口 */
+    c->peer_win=ntoh16(h->window);
+
+    /* 2. 通用 ACK 处理：推进 snd_una，回收发送缓冲（Linux tcp_ack） */
+    if(flags&TCP_FLAG_ACK){
+        if(ack>c->snd_una&&ack<=c->snd_nxt){
+            uint32_t acked=ack-c->snd_una;
+            if(acked>c->snd_used)acked=c->snd_used;
+            c->snd_una=ack;
+            if(acked){memcpy_u(c->sndb,c->sndb+acked,c->snd_used-acked);c->snd_used-=acked;}
+            c->rto_backoff=0;                   /* 收到新 ACK，重置退避 */
+            kputs("[NET] TCP ack=");kput_dec(ack);kputs(" una=");kput_dec(c->snd_una);kputs(" sndb=");kput_dec(c->snd_used);kputs("\n");
+            tcp_xmit_pending(c);
+            if(c->snd_nxt==c->snd_una)c->rto_deadline=0;
+            else if(!c->rto_deadline)tcp_rto_arm(c);
+        }
+    }
+
+    /* 3. RST 处理 */
+    if(flags&TCP_FLAG_RST){kputs("[NET] TCP RST -> CLOSED\n");c->used=false;c->state=TCP_CLOSED;return;}
+
+    /* 4. 按状态机推进 */
     switch(c->state){
     case TCP_SYN_RECEIVED:
-        if(flags&TCP_FLAG_ACK&&ack==c->snd_nxt){
+        if((flags&TCP_FLAG_ACK)&&ack==c->snd_nxt){
             c->state=TCP_ESTABLISHED;
+            c->rto_deadline=0;
             kputs("[NET] TCP ESTABLISHED ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs("\n");
         }
-        if(dlen){if(seq==c->rcv_nxt){c->rcv_nxt+=dlen;tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);}else tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);}
+        if(dlen){if(seq==c->rcv_nxt){if(c->rxn+dlen<=TCP_BUF_SIZE){memcpy_u(&c->rxb[c->rxn],data,dlen);c->rxn+=dlen;}c->rcv_nxt+=dlen;}tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);}
         return;
     case TCP_ESTABLISHED:
-        if(flags&TCP_FLAG_FIN){
-            kputs("[NET] TCP FIN -> CLOSE\n");
-            c->rcv_nxt+=1;
-            tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
-            tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt,c->rcv_nxt,NULL,0);
-            c->snd_nxt+=1;
-            c->used=false;c->state=TCP_CLOSED;
-            return;
-        }
+    case TCP_FIN_WAIT_1:
+    case TCP_FIN_WAIT_2:
+    case TCP_CLOSE_WAIT:
+    case TCP_CLOSING:
         if(dlen){
             if(seq==c->rcv_nxt){
                 if(c->rxn+dlen<=TCP_BUF_SIZE){memcpy_u(&c->rxb[c->rxn],data,dlen);c->rxn+=dlen;}
@@ -376,9 +424,72 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             }
             tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
         }
+        if((flags&TCP_FLAG_FIN)&&seq+dlen==c->rcv_nxt){
+            kputs("[NET] TCP FIN <- ");net_ip_print(src_ip);kputs("\n");
+            c->rcv_nxt+=1;
+            tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+            if(c->state==TCP_FIN_WAIT_1){ /* simultaneous close if our FIN is unacked */
+                if(c->snd_una>=c->snd_nxt){
+                    c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;
+                }else c->state=TCP_CLOSING;
+            }else if(c->state==TCP_FIN_WAIT_2||c->state==TCP_CLOSING){
+                c->state=TCP_TIME_WAIT;c->tw_until=ticks+200; /* 2s */
+            }else if(c->state==TCP_CLOSE_WAIT){ /* 已关过，忽略重复 FIN */
+            }else{ /* ESTABLISHED：进 CLOSE_WAIT，应用 close 时发 FIN；无人接管则自动回关 */
+                c->state=TCP_CLOSE_WAIT;
+                tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+                c->snd_nxt+=1;
+                c->state=TCP_LAST_ACK;tcp_rto_arm(c);
+                kputs("[NET] TCP FIN-ACK sent\n");
+            }
+            return;
+        }
+        if(flags&TCP_FLAG_FIN)tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+        /* 主动关闭方状态推进 */
+        if(c->state==TCP_FIN_WAIT_1&&(flags&TCP_FLAG_ACK)&&c->snd_una>=c->snd_nxt){c->state=TCP_FIN_WAIT_2;c->rto_deadline=0;kputs("[NET] TCP FIN_WAIT_2\n");}
+        if(c->state==TCP_CLOSING&&(flags&TCP_FLAG_ACK)&&c->snd_una>=c->snd_nxt){c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;}
+        return;
+    case TCP_LAST_ACK:
+        if((flags&TCP_FLAG_ACK)&&ack>=c->snd_nxt){
+            kputs("[NET] TCP LAST_ACK done -> CLOSED\n");
+            c->used=false;c->state=TCP_CLOSED;c->rto_deadline=0;
+        }
+        return;
+    case TCP_TIME_WAIT:
         return;
     default:
         return;
+    }
+}
+
+/* 每 tick 处理：RTO 重传 + TIME_WAIT 到期释放（Linux tcp_retransmit_timer 简化版） */
+static void tcp_tick(void){
+    for(int i=0;i<TCP_MAX_CONNS;i++){
+        tcp_conn_t *c=&tcp_conns[i];if(!c->used)continue;
+        if(c->state==TCP_TIME_WAIT){if(c->tw_until&&(int32_t)(ticks-c->tw_until)>=0){c->used=false;c->state=TCP_CLOSED;}continue;}
+        if(c->rto_deadline&&(int32_t)(ticks-c->rto_deadline)>=0){
+            if(c->state==TCP_SYN_RECEIVED){
+                kputs("[NET] TCP RTO: re-SYN-ACK\n");
+                tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);
+                tcp_rto_retry(c);
+            }else if(c->state==TCP_LAST_ACK){
+                kputs("[NET] TCP RTO: re-FIN\n");
+                tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt-1,c->rcv_nxt,NULL,0);
+                tcp_rto_retry(c);
+            }else if((c->state==TCP_FIN_WAIT_1||c->state==TCP_CLOSING)&&!c->snd_used){
+                kputs("[NET] TCP RTO: re-FIN\n");
+                tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt-1,c->rcv_nxt,NULL,0);
+                tcp_rto_retry(c);
+            }else if(c->snd_used){
+                uint32_t in_flight=c->snd_nxt-c->snd_una;
+                if(in_flight>c->snd_used)in_flight=c->snd_used;
+                kputs("[NET] TCP RTO: re-xmit ");kput_dec(in_flight);kputs("B\n");
+                tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,in_flight);
+                tcp_rto_retry(c);
+            }else{
+                c->rto_deadline=0;
+            }
+        }
     }
 }
 
@@ -402,8 +513,11 @@ int tcp_send(socket_t *s,const uint8_t *data,uint32_t len){
     if(!s||s->type!=SOCK_TCP_ESTAB)return -1;
     tcp_conn_t *c=s->tcp.conn;if(!c||c->state!=TCP_ESTABLISHED)return -1;
     if(len>1460)len=1460;
-    tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,data,len);
-    c->snd_nxt+=len;
+    if(len>TCP_BUF_SIZE-c->snd_used)len=TCP_BUF_SIZE-c->snd_used;
+    if(len==0)return 0;
+    memcpy_u(&c->sndb[c->snd_used],data,len);
+    c->snd_used+=len;
+    tcp_xmit_pending(c);
     return (int)len;
 }
 
@@ -422,8 +536,17 @@ void tcp_close(socket_t *s){
     if(!s)return;
     if(s->type==SOCK_TCP_ESTAB&&s->tcp.conn){
         tcp_conn_t *c=s->tcp.conn;
-        tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt,c->rcv_nxt,NULL,0);
-        c->snd_nxt+=1;c->used=false;c->state=TCP_CLOSED;
+        if(c->state==TCP_ESTABLISHED){
+            kputs("[NET] TCP close: FIN_WAIT_1\n");
+            tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+            c->snd_nxt+=1;
+            c->state=TCP_FIN_WAIT_1;tcp_rto_arm(c);
+        }else if(c->state==TCP_CLOSE_WAIT){
+            kputs("[NET] TCP close: LAST_ACK\n");
+            tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+            c->snd_nxt+=1;
+            c->state=TCP_LAST_ACK;tcp_rto_arm(c);
+        }
     }
     s->type=SOCK_CLOSED;
 }
@@ -444,7 +567,7 @@ void net_set_subnet(uint32_t mask){g_mask=mask;}
 
 void net_napi_poll(void){e1000_poll();}
 
-void net_poll(void){e1000_poll();if(dhcp_state!=DHCP_DONE&&dhcp_wait&&ticks-dhcp_last>=dhcp_wait*100u){dhcp_wait=0;if(dhcp_retries++>=6){net_set_ip(hton32(0x0A00020F));net_set_gateway(hton32(0x0A000202));net_set_subnet(hton32(0xFFFFFF00));dhcp_state=DHCP_DONE;kputs("[NET] DHCP failed, fallback static\n");}else{dhcp_xid^=(uint32_t)ip_id+0x9e3779b9u;dhcp_send(1);dhcp_state=DHCP_WAIT_OFFER;dhcp_wait=2;dhcp_last=ticks;}}}
+void net_poll(void){e1000_poll();tcp_tick();if(dhcp_state!=DHCP_DONE&&dhcp_wait&&ticks-dhcp_last>=dhcp_wait*100u){dhcp_wait=0;if(dhcp_retries++>=6){net_set_ip(hton32(0x0A00020F));net_set_gateway(hton32(0x0A000202));net_set_subnet(hton32(0xFFFFFF00));dhcp_state=DHCP_DONE;kputs("[NET] DHCP failed, fallback static\n");}else{dhcp_xid^=(uint32_t)ip_id+0x9e3779b9u;dhcp_send(1);dhcp_state=DHCP_WAIT_OFFER;dhcp_wait=2;dhcp_last=ticks;}}}
 
 void net_init(void){
     e1000_get_mac(g_mac);
