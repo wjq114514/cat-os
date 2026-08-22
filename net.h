@@ -68,16 +68,17 @@ enum tcp_state {
 #define TCP_RX_WINDOW   65535
 #define TCP_MSS         1460
 #define TCP_BUF_SIZE    4096
+#define TCP_TX_SEG_MAX  8
 
 typedef struct tcp_conn tcp_conn_t;
 
 /* ─── Socket API ─── */
-typedef enum { SOCK_CLOSED, SOCK_UDP, SOCK_TCP_LISTEN, SOCK_TCP_ESTAB } sock_type_t;
+typedef enum { SOCK_CLOSED, SOCK_UDP, SOCK_TCP_LISTEN, SOCK_TCP_ESTAB, SOCK_UDP_UNBOUND, SOCK_TCP_UNBOUND } sock_type_t;
 
 typedef struct {
     sock_type_t type;
     union {
-        struct { uint16_t lport; } udp;
+        struct { uint16_t lport; uint8_t slot,owned; } udp;
         struct { tcp_conn_t *conn; } tcp;
     };
 } socket_t;
@@ -106,6 +107,10 @@ int tcp_accept(socket_t *s, uint32_t *remote_ip, uint16_t *remote_port);
 int tcp_send(socket_t *s, const uint8_t *data, uint32_t len);
 int tcp_recv(socket_t *s, uint8_t *buf, uint32_t max_len);
 void tcp_close(socket_t *s);
+socket_t *net_socket_open(uint32_t type);
+int net_socket_bind(socket_t *s,uint16_t port);
+socket_t *tcp_accept_socket(socket_t *s);
+int net_socket_close(socket_t *s);
 
 /* Convenience */
 void net_set_ip(uint32_t ip);

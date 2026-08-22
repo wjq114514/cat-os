@@ -175,12 +175,13 @@ void icmp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
 #define UDP_SLOTS 8
 #define UDP_RXBUF 2048
 typedef struct {
-    bool used,bound;
+    bool used,bound,owned;
     uint16_t lport;
     uint8_t rxb[UDP_RXBUF];      /* 线性包队列: [pkt_len(4)][src_ip(4)][sport(2)]payload... */
     uint32_t head,n;
 } udp_sock_t;
 static udp_sock_t udp_socks[UDP_SLOTS];
+static socket_t udp_handles[UDP_SLOTS];
 static udp_sock_t *udp_sock_by_port(uint16_t port){for(int i=0;i<UDP_SLOTS;i++)if(udp_socks[i].used&&udp_socks[i].bound&&udp_socks[i].lport==port)return &udp_socks[i];return NULL;}
 static udp_sock_t *udp_sock_find_free(void){for(int i=0;i<UDP_SLOTS;i++)if(!udp_socks[i].used)return &udp_socks[i];return NULL;}
 
@@ -242,11 +243,11 @@ void udp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
 
 socket_t *udp_open(uint16_t lport){
     udp_sock_t *s=udp_sock_find_free();if(!s)return NULL;
-    s->used=true;s->bound=true;s->lport=lport;s->head=s->n=0;
-    static socket_t sock;                      /* 单例：演示用，避免指针浮动 */
-    sock.type=SOCK_UDP;sock.udp.lport=lport;
+    s->used=true;s->bound=true;s->owned=false;s->lport=lport;s->head=s->n=0;
+    socket_t *sock=&udp_handles[s-udp_socks];
+    sock->type=SOCK_UDP;sock->udp.lport=lport;sock->udp.slot=(uint8_t)(s-udp_socks);sock->udp.owned=0;
     kputs("[NET] UDP socket open :");kput_dec(lport);kputs("\n");
-    return &sock;
+    return sock;
 }
 
 int udp_sendto(socket_t *s,uint32_t dst_ip,uint16_t dst_port,const uint8_t *data,uint32_t len){
@@ -257,7 +258,7 @@ int udp_sendto(socket_t *s,uint32_t dst_ip,uint16_t dst_port,const uint8_t *data
 
 int udp_recvfrom(socket_t *s,uint32_t *src_ip,uint16_t *src_port,uint8_t *buf,uint32_t max_len){
     if(!s||s->type!=SOCK_UDP)return -1;
-    udp_sock_t *u=udp_sock_by_port(s->udp.lport);if(!u||u->n==0)return -1;
+    udp_sock_t *u=(s->udp.owned&&s->udp.slot<UDP_SLOTS)?&udp_socks[s->udp.slot]:udp_sock_by_port(s->udp.lport);if(!u||u->n==0)return -1;
     uint8_t *r=&u->rxb[0];
     uint32_t dlen=((uint32_t)r[0]<<24)|((uint32_t)r[1]<<16)|((uint32_t)r[2]<<8)|r[3];
     uint32_t total=4+4+2+dlen;
@@ -280,54 +281,243 @@ typedef struct tcp_conn {
     uint16_t peer_port,lport,peer_win; /* peer_win=对端通告窗口 */
     uint8_t rxb[TCP_BUF_SIZE];   /* 接收缓冲 */
     uint32_t rxn;
+    struct { uint32_t seq; uint16_t len; bool used; uint8_t data[TCP_MSS]; } ooo[4];
+    uint32_t ooo_bytes;
+    bool sack_ok;
+    uint32_t sack_left[2],sack_right[2];
+    uint8_t sack_n;
     uint8_t sndb[TCP_BUF_SIZE];  /* 发送缓冲：snd_una..snd_nxt 区间数据 */
     uint32_t snd_used;           /* 缓冲中未确认字节数 */
+    struct {
+        uint32_t seq;
+        uint16_t len;
+        bool used, sacked, lost, retransmitted;
+    } tx[TCP_TX_SEG_MAX];         /* bounded SACK scoreboard */
+    uint8_t tx_n;
     uint32_t rto_deadline;       /* 重传截止时刻(ticks) */
     uint8_t  rto_backoff;        /* 退避指数 0/1/2/... */
+    uint32_t rto_ticks;          /* 动态 RTO，100Hz ticks */
+    uint32_t rtt_stamp;          /* 首个未重传数据段发送时刻 */
+    uint32_t rtt_seq;            /* 该采样段的结束序号 */
+    uint32_t srtt_ticks, rttvar_ticks;
+    bool rtt_pending, rtt_retransmitted;
+    uint32_t cwnd, ssthresh;     /* Reno byte windows */
+    uint32_t dupacks;
+    bool fast_recovery;
+    uint32_t recover_seq;
     uint32_t tw_until;           /* TIME_WAIT 释放时刻(ticks) */
     bool test_sent,test_closed;  /* TCP :81 acceptance path */
 } tcp_conn_t;
 static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 static socket_t  tcp_socks[TCP_MAX_CONNS];
+static socket_t  tcp_handles[TCP_MAX_CONNS];
+static tcp_conn_t *tcp_conn_find_listen(uint16_t port);
+static void tcp_cc_init(tcp_conn_t *c);
+static bool tcp_seq_after(uint32_t a,uint32_t b){return (int32_t)(a-b)>0;}
+static bool tcp_seq_before(uint32_t a,uint32_t b){return (int32_t)(a-b)<0;}
+static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen);
+static void tcp_rto_rearm(tcp_conn_t *c);
+static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn){
+    while(n){uint8_t kind=opt[0];if(kind==0)break;if(kind==1){opt++;n--;continue;}if(n<2||opt[1]<2||opt[1]>n)break;
+        uint8_t olen=opt[1];
+        if(kind==4&&olen==2&&syn)c->sack_ok=true;
+        if(kind==5&&!syn&&c->sack_ok&&olen>=10&&((olen-2u)&7u)==0){uint32_t count=(olen-2u)/8u;c->sack_n=0;for(uint32_t i=0;i<count&&c->sack_n<2;i++){uint32_t l,r;memcpy_u(&l,opt+2+i*8,4);memcpy_u(&r,opt+6+i*8,4);l=ntoh32(l);r=ntoh32(r);if(tcp_seq_before(l,r)&&!tcp_seq_before(l,c->snd_una)&&!tcp_seq_after(r,c->snd_nxt)){c->sack_left[c->sack_n]=l;c->sack_right[c->sack_n++]=r;}}}
+        opt+=olen;n-=olen;
+    }
+}
+static uint32_t tcp_sack_blocks(tcp_conn_t *c){uint32_t n=0;for(int i=0;i<4;i++)if(c->ooo[i].used)n++;return n>2?2:n;}
+static uint32_t tcp_build_opts(tcp_conn_t *c,uint8_t *o,uint8_t flags){
+    uint32_t n=0;
+    if((flags&TCP_FLAG_SYN)&&c->sack_ok){o[n++]=1;o[n++]=1;o[n++]=4;o[n++]=2;}
+    else if((flags&TCP_FLAG_ACK)&&c->sack_ok){uint32_t blocks=tcp_sack_blocks(c);if(blocks){o[n++]=1;o[n++]=1;o[n++]=5;o[n++]=(uint8_t)(2+8*blocks);for(int i=0;i<4&&blocks;i++)if(c->ooo[i].used){uint32_t a=hton32(c->ooo[i].seq),b=hton32(c->ooo[i].seq+c->ooo[i].len);memcpy_u(o+n,&a,4);n+=4;memcpy_u(o+n,&b,4);n+=4;blocks--;}}}
+    while(n&3){o[n++]=1;}return n;
+}
+static void tcp_rx_append(tcp_conn_t *c,const uint8_t *data,uint32_t len){if(c->rxn+len<=TCP_BUF_SIZE){memcpy_u(c->rxb+c->rxn,data,len);c->rxn+=len;}}
+static void tcp_merge_ooo(tcp_conn_t *c){bool again;do{again=false;for(int i=0;i<4;i++)if(c->ooo[i].used&&c->ooo[i].seq==c->rcv_nxt){tcp_rx_append(c,c->ooo[i].data,c->ooo[i].len);c->rcv_nxt+=c->ooo[i].len;c->ooo_bytes-=c->ooo[i].len;c->ooo[i].used=false;again=true;}}while(again);}
+static bool tcp_queue_ooo(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_t len){
+    uint32_t end=seq+len;if(len==0||len>TCP_MSS||c->ooo_bytes+len>TCP_BUF_SIZE)return false;
+    if(!tcp_seq_after(end,c->rcv_nxt))return false;
+    if(!tcp_seq_after(seq,c->rcv_nxt)){uint32_t trim=c->rcv_nxt-seq;seq+=trim;data+=trim;len-=trim;}
+    for(int i=0;i<4;i++)if(c->ooo[i].used&&tcp_seq_before(seq,c->ooo[i].seq+c->ooo[i].len)&&tcp_seq_before(c->ooo[i].seq,seq+len))return false;
+    for(int i=0;i<4;i++)if(!c->ooo[i].used){c->ooo[i].used=true;c->ooo[i].seq=seq;c->ooo[i].len=(uint16_t)len;memcpy_u(c->ooo[i].data,data,len);c->ooo_bytes+=len;return true;}
+    return false;
+}
+static bool tcp_accept_data(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_t len){
+    if(seq==c->rcv_nxt&&len<=TCP_MSS&&c->rxn+len<=TCP_BUF_SIZE){tcp_rx_append(c,data,len);c->rcv_nxt+=len;tcp_merge_ooo(c);return true;}
+    if(tcp_seq_after(seq,c->rcv_nxt))return tcp_queue_ooo(c,seq,data,len);
+    return false;
+}
 
-#define TCP_RTO_INIT   30u   /* 300ms @100Hz */
-#define TCP_RTO_MAX    240u  /* 2.4s */
-static uint32_t rto_now(tcp_conn_t *c){uint32_t r=TCP_RTO_INIT<<c->rto_backoff;if(r>TCP_RTO_MAX)r=TCP_RTO_MAX;return r;}
+static void tcp_tx_reset(tcp_conn_t *c){
+    for(uint32_t i=0;i<TCP_TX_SEG_MAX;i++)c->tx[i].used=false;
+    c->tx_n=0;
+}
+static void tcp_tx_add(tcp_conn_t *c,uint32_t seq,uint32_t len){
+    if(!len||len>TCP_MSS||c->tx_n>=TCP_TX_SEG_MAX)return;
+    c->tx[c->tx_n].seq=seq;c->tx[c->tx_n].len=(uint16_t)len;
+    c->tx[c->tx_n].used=true;c->tx[c->tx_n].sacked=false;
+    c->tx[c->tx_n].lost=false;c->tx[c->tx_n].retransmitted=false;c->tx_n++;
+}
+static void tcp_tx_ack(tcp_conn_t *c,uint32_t ack){
+    uint32_t out=0;
+    for(uint32_t i=0;i<c->tx_n;i++){
+        uint32_t end;
+        if(!c->tx[i].used)continue;
+        end=c->tx[i].seq+c->tx[i].len;
+        if(!tcp_seq_after(end,ack))continue;
+        if(tcp_seq_before(c->tx[i].seq,ack)){
+            c->tx[i].seq=ack;c->tx[i].len=(uint16_t)(end-ack);
+            c->tx[i].sacked=false;c->tx[i].lost=false;c->tx[i].retransmitted=false;
+        }
+        c->tx[out++]=c->tx[i];
+    }
+    c->tx_n=(uint8_t)out;
+    for(;out<TCP_TX_SEG_MAX;out++)c->tx[out].used=false;
+}
+static void tcp_tx_sack(tcp_conn_t *c){
+    uint32_t high=c->snd_una;
+    for(uint32_t b=0;b<c->sack_n;b++)if(tcp_seq_after(c->sack_right[b],high))high=c->sack_right[b];
+    for(uint32_t i=0;i<c->tx_n;i++){
+        uint32_t end;
+        if(!c->tx[i].used)continue;
+        end=c->tx[i].seq+c->tx[i].len;
+        for(uint32_t b=0;b<c->sack_n;b++)
+            if(!tcp_seq_before(c->tx[i].seq,c->sack_left[b])&&
+               !tcp_seq_after(end,c->sack_right[b])){c->tx[i].sacked=true;c->tx[i].lost=false;break;}
+        if(!c->tx[i].sacked&&tcp_seq_before(end,high))c->tx[i].lost=true;
+    }
+}
+static bool tcp_tx_retransmit_lost(tcp_conn_t *c){
+    for(uint32_t i=0;i<c->tx_n;i++)if(c->tx[i].used&&c->tx[i].lost&&!c->tx[i].sacked&&!c->tx[i].retransmitted){
+        uint32_t off=c->tx[i].seq-c->snd_una;
+        if(tcp_seq_before(c->tx[i].seq,c->snd_una)||off+c->tx[i].len>c->snd_used)continue;
+        tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->tx[i].seq,c->rcv_nxt,c->sndb+off,c->tx[i].len);
+        c->tx[i].retransmitted=true;c->rtt_retransmitted=true;tcp_rto_rearm(c);
+        kputs("[NET] TCP SACK: re-xmit ");kput_dec(c->tx[i].len);kputs("B\n");
+        return true;
+    }
+    return false;
+}
+static void tcp_tx_clear_marks(tcp_conn_t *c){
+    for(uint32_t i=0;i<c->tx_n;i++){c->tx[i].sacked=false;c->tx[i].lost=false;c->tx[i].retransmitted=false;}
+}
+
+int net_socket_bind(socket_t *s,uint16_t port){
+    if(!s||port==0)return -22;
+    if(s->type==SOCK_UDP_UNBOUND){
+        udp_sock_t *u=&udp_socks[s->udp.slot];
+        if(!u->used||!u->owned||udp_sock_by_port(port))return -98;
+        u->bound=true;u->lport=port;u->head=u->n=0;s->type=SOCK_UDP;s->udp.lport=port;return 0;
+    }
+    if(s->type==SOCK_TCP_UNBOUND){
+        tcp_conn_t *c=tcp_conn_find_listen(port);
+        if(!c){
+            c=s->tcp.conn;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;
+            c->accepted=false;c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;
+            c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;
+            tcp_tx_reset(c);
+            tcp_cc_init(c);
+        }else{
+            s->tcp.conn->used=false;
+        }
+        s->type=SOCK_TCP_LISTEN;s->tcp.conn=c;return 0;
+    }
+    return -22;
+}
+
+socket_t *tcp_accept_socket(socket_t *s){
+    if(!s||s->type!=SOCK_TCP_LISTEN)return NULL;
+    uint16_t port=s->tcp.conn->lport;
+    for(int i=0;i<TCP_MAX_CONNS;i++){
+        tcp_conn_t *c=&tcp_conns[i];
+        if(c->used&&c->state==TCP_ESTABLISHED&&c->lport==port&&!c->accepted){
+            for(int j=0;j<TCP_MAX_CONNS;j++)if(tcp_handles[j].type==SOCK_CLOSED){
+                c->accepted=true;tcp_handles[j]=(socket_t){SOCK_TCP_ESTAB,{.tcp={c}}};return &tcp_handles[j];
+            }
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+int net_socket_close(socket_t *s){
+    if(!s||s->type==SOCK_CLOSED)return -9;
+    if(s->type==SOCK_UDP){if(s->udp.owned){udp_socks[s->udp.slot].used=false;udp_socks[s->udp.slot].bound=false;}s->type=SOCK_CLOSED;return 0;}
+    if(s->type==SOCK_TCP_ESTAB){tcp_close(s);return 0;}
+    if(s->type==SOCK_TCP_UNBOUND){if(s->tcp.conn)s->tcp.conn->used=false;s->type=SOCK_CLOSED;return 0;}
+    if(s->type==SOCK_TCP_LISTEN){s->type=SOCK_CLOSED;return 0;}
+    return -22;
+}
+
+#define TCP_RTO_INIT   30u   /* 300ms @100Hz, preserved minimum for this PIT */
+#define TCP_RTO_MAX    240u  /* 2.4s, existing stack bound */
+static uint32_t rto_base(tcp_conn_t *c){uint32_t r=c->rto_ticks?c->rto_ticks:TCP_RTO_INIT;return r<TCP_RTO_INIT?TCP_RTO_INIT:r>TCP_RTO_MAX?TCP_RTO_MAX:r;}
+static uint32_t rto_now(tcp_conn_t *c){uint32_t r=rto_base(c)<<c->rto_backoff;return r>TCP_RTO_MAX?TCP_RTO_MAX:r;}
 static void tcp_rto_arm(tcp_conn_t *c){c->rto_deadline=ticks+rto_now(c);c->rto_backoff=0;}
+static void tcp_rto_rearm(tcp_conn_t *c){c->rto_deadline=ticks+rto_now(c);}
 static void tcp_rto_retry(tcp_conn_t *c){
     if(c->rto_backoff<6)c->rto_backoff++;
     c->rto_deadline=ticks+rto_now(c);
+}
+static void tcp_cc_init(tcp_conn_t *c){
+    c->rto_ticks=TCP_RTO_INIT;c->rtt_stamp=0;c->rtt_seq=0;c->srtt_ticks=0;
+    c->rttvar_ticks=0;c->rtt_pending=false;c->rtt_retransmitted=false;
+    c->cwnd=TCP_MSS;c->ssthresh=TCP_BUF_SIZE;c->dupacks=0;c->fast_recovery=false;c->recover_seq=0;
+}
+static void tcp_rtt_sample(tcp_conn_t *c,uint32_t sample){
+    if(!sample)return;
+    if(!c->srtt_ticks){c->srtt_ticks=sample;c->rttvar_ticks=sample/2u;}
+    else {uint32_t d=c->srtt_ticks>sample?c->srtt_ticks-sample:sample-c->srtt_ticks;
+        c->rttvar_ticks=(3u*c->rttvar_ticks+d)/4u;
+        c->srtt_ticks=(7u*c->srtt_ticks+sample)/8u;}
+    uint32_t r=c->srtt_ticks+4u*c->rttvar_ticks;
+    c->rto_ticks=r<TCP_RTO_INIT?TCP_RTO_INIT:r>TCP_RTO_MAX?TCP_RTO_MAX:r;
+    kputs("[NET] TCP RTT sample=");kput_dec(sample);kputs(" RTO=");kput_dec(c->rto_ticks);kputs("\n");
+}
+static void tcp_loss_window(tcp_conn_t *c,uint32_t in_flight){
+    uint32_t half=in_flight/2u;
+    c->ssthresh=half<2u*TCP_MSS?2u*TCP_MSS:half;
+    c->cwnd=TCP_MSS;c->dupacks=0;c->fast_recovery=false;
 }
 
 static tcp_conn_t *tcp_conn_find_free(void){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_peer(uint32_t ip,uint16_t sport){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].peer_ip==ip&&tcp_conns[i].peer_port==sport)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_listen(uint16_t port){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].state==TCP_LISTEN&&tcp_conns[i].lport==port)return &tcp_conns[i];return NULL;}
+socket_t *net_socket_open(uint32_t type){
+    if(type==2){for(int i=0;i<UDP_SLOTS;i++)if(!udp_socks[i].used){udp_socks[i]=(udp_sock_t){0};udp_socks[i].used=true;udp_socks[i].owned=true;udp_handles[i]=(socket_t){SOCK_UDP_UNBOUND,{.udp={(uint16_t)0,(uint8_t)i,1}}};return &udp_handles[i];}return NULL;}
+    if(type==1){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used){tcp_conns[i]=(tcp_conn_t){0};tcp_conns[i].used=true;tcp_conns[i].state=TCP_CLOSED;tcp_handles[i]=(socket_t){SOCK_TCP_UNBOUND,{.tcp={&tcp_conns[i]}}};return &tcp_handles[i];}return NULL;}
+    return NULL;
+}
 static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen){
     uint8_t dmac[6];if(!arp_resolve(c->peer_ip,dmac))return;
     uint8_t *seg=begin_ip(c->peer_ip,IP_PROTO_TCP,dmac);if(!seg)return;
     tcp_hdr_t *t=(tcp_hdr_t*)seg;
     t->src_port=hton16(c->lport);t->dst_port=hton16(c->peer_port);
     t->seq=hton32(seq);t->ack_seq=hton32(ack);
-    t->off_res=0x50;t->flags=flags;
+    uint8_t opts[20];uint32_t olen=tcp_build_opts(c,opts,flags);
+    t->off_res=(uint8_t)(((20u+olen)/4u)<<4);t->flags=flags;
     uint16_t win=(uint16_t)(TCP_BUF_SIZE-c->rxn);              /* 动态通告接收窗口 */
     t->window=hton16(win);t->csum=0;t->urgent=0;
-    memcpy_u(seg+20,data,dlen);
-    t->csum=hton16(ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+dlen),seg,20+dlen));
-    end_ip(seg,20+dlen,IP_PROTO_TCP);
+    memcpy_u(seg+20,opts,olen);memcpy_u(seg+20+olen,data,dlen);
+    t->csum=hton16(ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+olen+dlen),seg,20+olen+dlen));
+    end_ip(seg,20+olen+dlen,IP_PROTO_TCP);
 }
 
 /* Send buffered data that fits in the current peer window. */
 static void tcp_xmit_pending(tcp_conn_t *c){
     uint32_t in_flight=c->snd_nxt-c->snd_una;
-    if(in_flight>=c->peer_win||c->snd_used<=in_flight)return;
+    uint32_t send_win=c->peer_win<c->cwnd?c->peer_win:c->cwnd;
+    if(in_flight>=send_win||c->snd_used<=in_flight)return;
     uint32_t n=c->snd_used-in_flight;
-    uint32_t room=c->peer_win-in_flight;
+    uint32_t room=send_win-in_flight;
     if(n>room)n=room;
     if(n>TCP_MSS)n=TCP_MSS;
     tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,
                 c->sndb+in_flight,n);
+    if(!c->rtt_pending){c->rtt_stamp=ticks;c->rtt_seq=c->snd_nxt+n;c->rtt_pending=true;c->rtt_retransmitted=false;}
     c->snd_nxt+=n;
-    tcp_rto_arm(c);
+    tcp_tx_add(c,c->snd_nxt-n,n);
+    tcp_rto_rearm(c);
 }
 int tcp_send(socket_t *s,const uint8_t *data,uint32_t len);
 void tcp_close(socket_t *s);
@@ -336,6 +526,8 @@ socket_t *tcp_listen(uint16_t port){
     tcp_conn_t *c=tcp_conn_find_free();if(!c)return NULL;
     c->used=true;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;
     c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;
+    tcp_tx_reset(c);
+    tcp_cc_init(c);
     c->test_sent=false;c->test_closed=false;
     for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_socks[i].type){tcp_socks[i].type=SOCK_TCP_LISTEN;tcp_socks[i].tcp.conn=c;break;}
     kputs("[NET] TCP listen :");kput_dec(port);kputs("\n");
@@ -360,7 +552,10 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             c=tcp_conn_find_free();
             if(!c){kputs("[NET] TCP conn table full, RST\n");return;}
             c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
+            tcp_tx_reset(c);
             c->test_sent=false;c->test_closed=false;
+            tcp_cc_init(c);
+            tcp_parse_opts(c,seg+20,hlen-20,true);
             c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
             c->rcv_isn=seq;c->rcv_nxt=seq+1;
             c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;c->snd_una=c->snd_nxt;
@@ -385,19 +580,48 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
 
     /* 1. 记录对端窗口 */
     c->peer_win=ntoh16(h->window);
+    c->sack_n=0;
+    tcp_parse_opts(c,seg+20,hlen-20,false);
 
     /* 2. 通用 ACK 处理：推进 snd_una，回收发送缓冲（Linux tcp_ack） */
     if(flags&TCP_FLAG_ACK){
-        if(ack>c->snd_una&&ack<=c->snd_nxt){
+        uint32_t old_una=c->snd_una,in_flight=c->snd_nxt-c->snd_una;
+        bool sack_retx=false;
+        if(c->sack_n)tcp_tx_sack(c);
+        if(ack==c->snd_una&&in_flight){
+            c->dupacks++;
+            if(c->sack_n)sack_retx=tcp_tx_retransmit_lost(c);
+            if(c->dupacks==3){
+                tcp_loss_window(c,in_flight);
+                c->dupacks=3;c->cwnd=c->ssthresh+3u*TCP_MSS;c->fast_recovery=true;c->recover_seq=c->snd_nxt;
+                kputs("[NET] TCP fast retransmit\n");
+                if(!sack_retx){
+                    if(c->sack_n)sack_retx=tcp_tx_retransmit_lost(c);
+                }
+                if(!sack_retx){
+                    tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,in_flight>TCP_MSS?TCP_MSS:in_flight);
+                    c->rtt_retransmitted=true;tcp_rto_rearm(c);
+                }
+            } else if(c->fast_recovery&&c->dupacks>3){c->cwnd+=TCP_MSS;tcp_xmit_pending(c);}
+        } else if(ack>c->snd_una&&ack<=c->snd_nxt){
             uint32_t acked=ack-c->snd_una;
             if(acked>c->snd_used)acked=c->snd_used;
+            if(c->rtt_pending&&ack>=c->rtt_seq&&!c->rtt_retransmitted){tcp_rtt_sample(c,ticks-c->rtt_stamp);c->rtt_pending=false;}
             c->snd_una=ack;
             if(acked){memcpy_u(c->sndb,c->sndb+acked,c->snd_used-acked);c->snd_used-=acked;}
-            c->rto_backoff=0;                   /* 收到新 ACK，重置退避 */
-            kputs("[NET] TCP ack=");kput_dec(ack);kputs(" una=");kput_dec(c->snd_una);kputs(" sndb=");kput_dec(c->snd_used);kputs("\n");
-            tcp_xmit_pending(c);
+            tcp_tx_ack(c,ack);
+            if(acked){
+                if(c->cwnd<c->ssthresh)c->cwnd+=acked>TCP_MSS?TCP_MSS:acked;
+                else {uint32_t inc=(TCP_MSS*acked)/(c->cwnd?c->cwnd:TCP_MSS);c->cwnd+=inc?inc:1;}
+            }
+            if(c->fast_recovery&&ack>=c->recover_seq){c->cwnd=c->ssthresh;c->fast_recovery=false;}
+            c->dupacks=0;c->rto_backoff=0;
+            kputs("[NET] TCP ack=");kput_dec(ack);kputs(" una=");kput_dec(c->snd_una);kputs(" sndb=");kput_dec(c->snd_used);kputs(" cwnd=");kput_dec(c->cwnd);kputs("\n");
+            if(!c->sack_n||!tcp_tx_retransmit_lost(c))tcp_xmit_pending(c);
             if(c->snd_nxt==c->snd_una)c->rto_deadline=0;
-            else if(!c->rto_deadline)tcp_rto_arm(c);
+            else if(!c->rto_deadline)tcp_rto_rearm(c);
+        } else if(ack<old_una||ack>c->snd_nxt){
+            /* Invalid ACK does not advance send state. */
         }
     }
 
@@ -412,7 +636,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             c->rto_deadline=0;
             kputs("[NET] TCP ESTABLISHED ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs("\n");
         }
-        if(dlen){if(seq==c->rcv_nxt){if(c->rxn+dlen<=TCP_BUF_SIZE){memcpy_u(&c->rxb[c->rxn],data,dlen);c->rxn+=dlen;}c->rcv_nxt+=dlen;}tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);}
+        if(dlen){tcp_accept_data(c,seq,data,dlen);tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);}
         return;
     case TCP_ESTABLISHED:
     case TCP_FIN_WAIT_1:
@@ -420,12 +644,11 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     case TCP_CLOSE_WAIT:
     case TCP_CLOSING:
         if(dlen){
-            if(seq==c->rcv_nxt){
-                if(c->rxn+dlen<=TCP_BUF_SIZE){memcpy_u(&c->rxb[c->rxn],data,dlen);c->rxn+=dlen;}
-                c->rcv_nxt+=dlen;
-                kputs("[NET] TCP data ");kput_dec(dlen);kputs("B <- ");net_ip_print(src_ip);kputs("\n");
+            bool in_order=seq==c->rcv_nxt;bool accepted=tcp_accept_data(c,seq,data,dlen);
+            if(accepted){
+                kputs(in_order?"[NET] TCP data ":"[NET] TCP out-of-order cached ");kput_dec(dlen);kputs("B <- ");net_ip_print(src_ip);kputs("\n");
             }else{
-                kputs("[NET] TCP out-of-order seq, re-ACK\n");
+                kputs(tcp_seq_after(seq,c->rcv_nxt)?"[NET] TCP out-of-order cached\n":"[NET] TCP duplicate/overlap, re-ACK\n");
             }
             tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
         }
@@ -498,6 +721,8 @@ static void tcp_tick(void){
             }else if(c->snd_used){
                 uint32_t in_flight=c->snd_nxt-c->snd_una;
                 if(in_flight>c->snd_used)in_flight=c->snd_used;
+                tcp_tx_clear_marks(c); /* SACK is advisory; peer may renege after RTO. */
+                tcp_loss_window(c,in_flight);c->rtt_retransmitted=true;
                 kputs("[NET] TCP RTO: re-xmit ");kput_dec(in_flight);kputs("B\n");
                 tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,in_flight);
                 tcp_rto_retry(c);
