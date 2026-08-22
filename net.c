@@ -10,6 +10,7 @@
 #include "net.h"
 #include "e1000.h"
 #include "kernel.h"
+#include "interrupts.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,6 +28,13 @@ static uint8_t  g_mac[6];
 static uint32_t g_ip,g_gw,g_mask;   /* 均以网络序存储 */
 static uint16_t ip_id;
 static uint32_t seq_gen=0x12340000; /* 本地 TCP ISN 生成器 */
+static uint32_t dhcp_xid, dhcp_offer, dhcp_server, dhcp_mask, dhcp_gw;
+static uint32_t dhcp_last, dhcp_wait;
+static uint8_t dhcp_state, dhcp_retries;
+#define DHCP_DISCOVER 1
+#define DHCP_WAIT_OFFER 2
+#define DHCP_WAIT_ACK 3
+#define DHCP_DONE 4
 void icmp_handle(const uint8_t *,uint32_t,uint32_t);
 void udp_handle(const uint8_t *,uint32_t,uint32_t);
 void tcp_handle(const uint8_t *,uint32_t,uint32_t);
@@ -37,8 +45,7 @@ typedef struct {uint32_t ip;uint8_t mac[6];} arp_entry_t;
 static arp_entry_t arp_cache[ARP_CACHE_MAX];
 static uint8_t arp_cache_n;
 
-static void net_ip_fmt(char *out,uint32_t ip){uint8_t *b=(uint8_t*)&ip;out[0]='0'+(b[0]/100%10);out[1]='0'+(b[0]/10%10);out[2]='0'+(b[0]%10);out[3]='.';out[4]='0'+(b[1]/100%10);out[5]='0'+(b[1]/10%10);out[6]='0'+(b[1]%10);out[7]='.';out[8]='0'+(b[2]/100%10);out[9]='0'+(b[2]/10%10);out[10]='0'+(b[2]%10);out[11]='.';out[12]='0'+(b[3]/100%10);out[13]='0'+(b[3]/10%10);out[14]='0'+(b[3]%10);out[15]=0;}
-static void net_ip_print(uint32_t ip){char b[16];net_ip_fmt(b,ip);kputs(b);}
+static void net_ip_print(uint32_t ip){uint8_t *b=(uint8_t*)&ip;for(int i=0;i<4;i++){kput_dec(b[i]);if(i<3)kputs(".");}}
 
 static void arp_cache_add(uint32_t ip,const uint8_t mac[6]){
     for(int i=0;i<arp_cache_n;i++)if(arp_cache[i].ip==ip){memcpy6(arp_cache[i].mac,mac);return;}
@@ -58,6 +65,7 @@ static void arp_request(uint32_t ip){
 }
 
 bool arp_resolve(uint32_t ip,uint8_t mac[6]){
+    if(ip==0xFFFFFFFFu){memset6(mac);for(int i=0;i<6;i++)mac[i]=0xFF;return true;}
     for(int i=0;i<arp_cache_n;i++)if(arp_cache[i].ip==ip){memcpy6(mac,arp_cache[i].mac);return true;}
     arp_request(ip);
     return false;
@@ -122,7 +130,7 @@ static bool end_ip(uint8_t *seg,uint32_t seglen,uint8_t proto){
     (void)proto;
     ip_hdr_t *h=(ip_hdr_t*)(seg-20);
     h->tot_len=hton16((uint16_t)(20+seglen));
-    h->hdr_csum=ip_checksum(h,20);
+    h->hdr_csum=hton16(ip_checksum(h,20));
     return e1000_tx_submit(14+20+seglen)==0;
 }
 
@@ -159,7 +167,7 @@ void icmp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     memcpy_u(out,seg,seglen);
     icmp_hdr_t *r=(icmp_hdr_t*)out;
     r->type=ICMP_TYPE_ECHO_REPLY;r->code=0;r->csum=0;
-    r->csum=ip_checksum(out,seglen);
+    r->csum=hton16(ip_checksum(out,seglen));
     if(end_ip(out,seglen,IP_PROTO_ICMP)){kputs("[NET] ICMP echo reply -> ");net_ip_print(src_ip);kputs(" (");kput_dec(seglen-8);kputs("B)\n");}
 }
 
@@ -185,12 +193,34 @@ static bool udp_send(uint32_t dst_ip,uint16_t dst_port,uint16_t src_port,const u
     return end_ip(seg,8+len,IP_PROTO_UDP);
 }
 
+static void dhcp_send(uint8_t type){
+    uint8_t b[548],*o;                           /* 对齐 Linux bootp_pkt: 236 固定 + exten[312]，RFC2131 最小 300B */
+    for(uint32_t i=0;i<548;i++)b[i]=0;
+    b[0]=1;b[1]=1;b[2]=6;b[3]=0;*(uint32_t*)(b+4)=hton32(dhcp_xid);
+    *(uint16_t*)(b+8)=0;*(uint16_t*)(b+10)=hton16(0x8000);memcpy_u(b+28,g_mac,6);
+    o=b+236;o[0]=99;o[1]=130;o[2]=83;o[3]=99;o+=4;o[0]=53;o[1]=1;o[2]=type;o+=3;
+    if(type==3){o[0]=54;o[1]=4;memcpy_u(o+2,&dhcp_server,4);o+=6;o[0]=50;o[1]=4;memcpy_u(o+2,&dhcp_offer,4);o+=6;}
+    o[0]=55;o[1]=3;o[2]=1;o[3]=3;o[4]=6;o+=5;o[0]=255;
+    udp_send(0xFFFFFFFFu,67,68,b,548);          /* 发完整 548B，剩余 pad 0 */
+    kputs("[NET] DHCP ");kputs(type==1?"DISCOVER\n":"REQUEST\n");
+}
+
+static void dhcp_handle(const uint8_t *d,uint32_t n){
+    if(n<240||d[0]!=2||d[1]!=1||d[2]!=6||ntoh32(*(const uint32_t*)(d+4))!=dhcp_xid)return;
+    if(d[28]!=g_mac[0]||d[29]!=g_mac[1]||d[30]!=g_mac[2]||d[31]!=g_mac[3]||d[32]!=g_mac[4]||d[33]!=g_mac[5])return;
+    if(d[236]!=99||d[237]!=130||d[238]!=83||d[239]!=99)return;
+    uint8_t mt=0;uint32_t i=240;while(i<n&&d[i]!=255){if(d[i]==0){i++;continue;}if(i+1>=n||i+2+d[i+1]>n)break;uint8_t l=d[i+1];if(d[i]==53&&l)mt=d[i+2];else if(d[i]==54&&l==4)memcpy_u(&dhcp_server,d+i+2,4);else if(d[i]==1&&l==4)memcpy_u(&dhcp_mask,d+i+2,4);else if(d[i]==3&&l>=4)memcpy_u(&dhcp_gw,d+i+2,4);i+=2+l;}
+    if(mt==2&&dhcp_state==DHCP_WAIT_OFFER){dhcp_offer=*(const uint32_t*)(d+16);dhcp_state=DHCP_WAIT_ACK;dhcp_send(3);dhcp_last=ticks;dhcp_wait=2;return;}
+    if(mt==5&&dhcp_state==DHCP_WAIT_ACK){dhcp_offer=*(const uint32_t*)(d+16);net_set_ip(dhcp_offer);net_set_gateway(dhcp_gw);net_set_subnet(dhcp_mask);dhcp_state=DHCP_DONE;kputs("[NET] DHCP ACK ip=");net_ip_print(g_ip);kputs(" gw=");net_ip_print(g_gw);kputs(" mask=");net_ip_print(g_mask);kputs("\n");}
+}
+
 void udp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     if(seglen<8)return;
     const udp_hdr_t *u=(const udp_hdr_t*)seg;
     uint16_t dport=ntoh16(u->dst_port),sport=ntoh16(u->src_port);
     uint32_t plen=ntoh16(u->len);if(plen>seglen)plen=seglen;
     const uint8_t *data=seg+8;uint32_t dlen=plen-8;
+    if(dport==68&&sport==67){dhcp_handle(data,dlen);return;}
     udp_sock_t *s=udp_sock_by_port(dport);
     if(!s){
         kputs("[NET] UDP :");kput_dec(dport);kputs(" no listener\n");
@@ -265,7 +295,7 @@ static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,co
     t->seq=hton32(seq);t->ack_seq=hton32(ack);
     t->off_res=0x50;t->flags=flags;t->window=hton16(TCP_RX_WINDOW);t->csum=0;t->urgent=0;
     memcpy_u(seg+20,data,dlen);
-    t->csum=ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+dlen),seg,20+dlen);
+    t->csum=hton16(ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+dlen),seg,20+dlen));
     end_ip(seg,20+dlen,IP_PROTO_TCP);
 }
 
@@ -310,7 +340,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
                 t->src_port=hton16(dport);t->dst_port=hton16(sport);
                 t->seq=hton32(seq+dlen);t->ack_seq=0;
                 t->off_res=0x50;t->flags=TCP_FLAG_RST;t->window=0;t->csum=0;t->urgent=0;
-                t->csum=ip_checksum_pseudo(g_ip,src_ip,IP_PROTO_TCP,20,seg2,20);
+                t->csum=hton16(ip_checksum_pseudo(g_ip,src_ip,IP_PROTO_TCP,20,seg2,20));
                 end_ip(seg2,20,IP_PROTO_TCP);
             }
         }
@@ -414,16 +444,14 @@ void net_set_subnet(uint32_t mask){g_mask=mask;}
 
 void net_napi_poll(void){e1000_poll();}
 
-void net_poll(void){e1000_poll();}
+void net_poll(void){e1000_poll();if(dhcp_state!=DHCP_DONE&&dhcp_wait&&ticks-dhcp_last>=dhcp_wait*100u){dhcp_wait=0;if(dhcp_retries++>=6){net_set_ip(hton32(0x0A00020F));net_set_gateway(hton32(0x0A000202));net_set_subnet(hton32(0xFFFFFF00));dhcp_state=DHCP_DONE;kputs("[NET] DHCP failed, fallback static\n");}else{dhcp_xid^=(uint32_t)ip_id+0x9e3779b9u;dhcp_send(1);dhcp_state=DHCP_WAIT_OFFER;dhcp_wait=2;dhcp_last=ticks;}}}
 
 void net_init(void){
     e1000_get_mac(g_mac);
-    net_set_ip(hton32(0x0A00020F));   /* 10.0.2.15 */
-    net_set_gateway(hton32(0x0A000202));/* 10.0.2.2 */
-    net_set_subnet(hton32(0xFFFFFF00));
+    net_set_ip(0);net_set_gateway(0);net_set_subnet(0);
     kputs("[NET] up ip=");net_ip_print(g_ip);kputs(" gw=");net_ip_print(g_gw);kputs(" mask=");net_ip_print(g_mask);kputs("\n");
     /* 探测网关 MAC（无回应也不阻塞，收包路径会自行补缓存） */
-    uint8_t m[6];arp_resolve(g_gw,m);
+    dhcp_xid=0x12340000u^ip_id;dhcp_retries=0;dhcp_wait=2;dhcp_state=DHCP_DISCOVER;dhcp_send(1);dhcp_last=ticks;dhcp_state=DHCP_WAIT_OFFER;
     /* 演示服务: TCP :80 监听 + UDP :7 echo */
     tcp_listen(80);
     udp_open(7);

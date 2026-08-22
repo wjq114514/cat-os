@@ -2,6 +2,7 @@
 #define CATOS_INTERRUPTS_H
 #include <stdint.h>
 #include <stdbool.h>
+extern volatile uint32_t ticks;
 typedef bool (*irq_handler_t)(uint8_t irq, void *arg);
 void interrupts_init(void);
 void interrupt_dispatch(uint32_t *frame);
