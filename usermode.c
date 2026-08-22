@@ -1,0 +1,13 @@
+#include "user.h"
+#include "kernel.h"
+#include <stdint.h>
+#include "paging.h"
+#include "interrupts.h"
+typedef struct {uint32_t prev,esp0,ss0,esp1,ss1,esp2,ss2,cr3,eip,eflags,eax,ecx,edx,ebx,esp,ebp,esi,edi,es,cs,ss,ds,fs,gs,ldt,trap,bitmap;} __attribute__((packed)) tss_t;
+static tss_t tss __attribute__((aligned(16))); static uint64_t gdt[6] __attribute__((aligned(8)));
+extern void arch_load_gdt(const void *);
+extern void arch_load_tss(uint16_t);
+static void setg(int i,uint32_t b,uint32_t lim,uint8_t a){uint64_t f=0xC;gdt[i]=((uint64_t)(lim&0xFFFF))|((uint64_t)(b&0xFFFFFF)<<16)|((uint64_t)(lim&0xF0000)<<32)|((uint64_t)a<<40)|((uint64_t)f<<52)|((uint64_t)(b>>24)<<56);}
+void usermode_init(void){tss.ss0=0x10;tss.esp0=0xC010C000;tss.bitmap=sizeof(tss);setg(0,0,0,0);setg(1,0,0xfffff,0x9A);setg(2,0,0xfffff,0x92);setg(3,0,0xfffff,0xFA);setg(4,0,0xfffff,0xF2);setg(5,(uint32_t)&tss,sizeof(tss)-1,0x89);struct{uint16_t l;uint32_t b;}__attribute__((packed)) r={(uint16_t)(sizeof(gdt)-1),(uint32_t)gdt};arch_load_gdt(&r);__asm__ volatile("ljmp $0x08, $1f\n\t1:\n\tmovw $0x10, %%ax\n\t movw %%ax, %%ds\n\t movw %%ax, %%es\n\t movw %%ax, %%fs\n\t movw %%ax, %%gs\n\t movw %%ax, %%ss\n" ::: "eax","memory");arch_load_tss(0x28);interrupts_post_gdt_update();kputs("[OK] GDT+user segments loaded\n[OK] TSS loaded\n");}
+static void e8(uint8_t **p,uint8_t v){*(*p)++=v;} static void e32(uint8_t **p,uint32_t v){for(int i=0;i<4;i++)e8(p,(uint8_t)(v>>(8*i)));} static void movi(uint8_t **p,uint8_t r,uint32_t v){e8(p,0xB8+r);e32(p,v);} static void syscall3(uint8_t **p,uint32_t nr,uint32_t a,uint32_t b,uint32_t c){movi(p,0,nr);movi(p,3,a);movi(p,1,b);movi(p,2,c);e8(p,0xCD);e8(p,0x80);} 
+void enter_usermode(void){enum{PATH_NULL=0x1100,PATH_CONSOLE=0x1200,MSG_CONSOLE=0x1300,BUF=0x1400,BAD_PTR=0x2000};uintptr_t cp=pmm_alloc_page(),sp=pmm_alloc_page(),vp=pmm_alloc_page();if(!cp||!sp||!vp||map_page(0x1000,cp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x700000,sp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0xB8000,vp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER))panic("user mapping failed");uint8_t *u=(uint8_t*)phys_to_virt(cp),*p=u;syscall3(&p,5,PATH_NULL,2,0);e8(&p,0x89);e8(&p,0xC3);syscall3(&p,0,3,BUF,8);syscall3(&p,6,3,0,0);syscall3(&p,5,PATH_CONSOLE,1,0);e8(&p,0x89);e8(&p,0xC3);syscall3(&p,1,3,MSG_CONSOLE,16);syscall3(&p,6,3,0,0);syscall3(&p,1,3,BAD_PTR,4);e8(&p,0xEB);e8(&p,0xFE);const char n[]="/dev/null",c[]="/dev/console",m[]="user console ok\n";for(unsigned i=0;i<sizeof(n);i++)u[PATH_NULL-0x1000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)u[PATH_CONSOLE-0x1000+i]=c[i];for(unsigned i=0;i<sizeof(m);i++)u[MSG_CONSOLE-0x1000+i]=m[i];kputs("[OK] entering ring3\n");__asm__ volatile("pushl $0x23; pushl $0x700FFC; pushl $0x202; pushl $0x1B; pushl $0x1000; iret");}

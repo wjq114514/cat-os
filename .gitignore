@@ -1,0 +1,17 @@
+# 内核源码参考（2.1G，不入库）
+linux-ref/
+
+# 构建产物
+*.o
+*.bin
+*.elf
+*.img
+iso/
+*.iso
+
+# Python
+__pycache__/
+*.pyc
+
+# QEMU 日志 / 调试
+*.log

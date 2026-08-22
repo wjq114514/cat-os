@@ -1,0 +1,8 @@
+#include "ide.h"
+#include "kernel.h"
+#include <stdint.h>
+static inline void ob(uint16_t p,uint8_t v){__asm__ volatile("outb %0,%1"::"a"(v),"Nd"(p));}static inline uint8_t ib(uint16_t p){uint8_t v;__asm__ volatile("inb %1,%0":"=a"(v):"Nd"(p));return v;}static inline void ins(uint16_t p,void*d){__asm__ volatile("rep insw"::"d"(p),"D"(d),"c"(256):"memory");}static inline void outs(uint16_t p,const void*d){__asm__ volatile("rep outsw"::"d"(p),"S"(d),"c"(256));}
+static uint32_t identify28(uint8_t dr){uint16_t b=dr?0x170:0x1f0;uint16_t w[256];ob(b+6,0xA0|((dr&1)<<4));ob(b+7,0xEC);for(volatile int i=0;i<10000;i++);if(!ib(b+7))return 0;ins(b,w);return (uint32_t)w[60]|((uint32_t)w[61]<<16);}
+static int rw(uint8_t dr,uint32_t l,uint8_t n,void*b,int wr){uint16_t base=dr?0x170:0x1f0;ob(base+6,0xE0|((dr&1)<<4)|((l>>24)&15));ob(base+2,n);ob(base+3,l);ob(base+4,l>>8);ob(base+5,l>>16);ob(base+7,wr?0x30:0x20);for(uint8_t s=0;s<n;s++){uint8_t st;do st=ib(base+7);while(st&0x80);if(!(st&8))return -1;if(wr)outs(base,b);else ins(base,b);b=(uint8_t*)b+512;}return 0;}
+int ide_read_sectors(uint8_t d,uint32_t l,uint8_t n,void*b){return rw(d,l,n,b,0);}int ide_write_sectors(uint8_t d,uint32_t l,uint8_t n,const void*b){return rw(d,l,n,(void*)b,1);}
+void ide_init(void){uint8_t id[512] __attribute__((aligned(2)));uint32_t sectors=identify28(0);if(ide_read_sectors(0,0,1,id)==0){kputs("[OK] IDE primary master detected sectors=");kput_dec(sectors);kputs(" size=");kput_dec((sectors*512u)/(1024u*1024u));kputs(" MB\n");uint8_t x[512],y[512];for(int i=0;i<512;i++)x[i]=(uint8_t)(i^0x5a);ide_write_sectors(0,1,1,x);ide_read_sectors(0,1,1,y);int ok=1;for(int i=0;i<512;i++)if(x[i]!=y[i])ok=0;if(ok)kputs("[OK] IDE sector R/W OK\n");}else kputs("[OK] IDE primary master absent\n");}
