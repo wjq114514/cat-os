@@ -47,3 +47,52 @@ nginx 移植是最终验证目标（master/worker + 事件循环模型，热路�
 - 自动审批：60 秒超时兜底自动批准（用户接受，不动插件源码）
 - 用户常新开对话省上下文，重要进度要记长期记忆
 - 审批通知发送失败问题：HAPI 通知发到 event.unified_msg_origin，当前会话 event.send 可能失效，需用户在 QQ 群 /hapi bind
+
+## 网络协议栈进度（2026-08-22）
+
+### 已完成
+- e1000 TX/RX DMA ring，QEMU socket 注入和 user/slirp 网络验证
+- ARP、IPv4、ICMP Echo、UDP Echo
+- TCP 基础监听、三次握手、按序接收、ACK 和 FIN 处理
+- DHCP 客户端：`DISCOVER → OFFER → REQUEST → ACK`
+  - 对照 Linux `linux-ref/net/ipv4/ipconfig.c`
+  - 548 字节 BOOTP/DHCP payload、xid、chaddr、magic cookie、选项解析
+  - QEMU user/slirp 实测获取：`10.0.2.15`，网关 `10.0.2.2`，掩码 `255.255.255.0`
+  - 无 DHCP 服务器时重试并 fallback 到静态 `10.0.2.15`
+- 修复 IP/ICMP/TCP 校验和写入时的网络字节序问题；对照抓包和 libslirp 校验定位
+- TCP 第一阶段增强：
+  - 每连接发送缓冲与 ACK 回收
+  - `snd_una` / `snd_nxt` 跟踪
+  - 对端窗口记录和动态接收窗口通告
+  - RTO 超时重传与指数退避，实测 SYN-ACK 间隔约 `0.30s / 0.60s / 1.20s`
+  - `FIN_WAIT_1`、`FIN_WAIT_2`、`CLOSE_WAIT`、`LAST_ACK`、`CLOSING`、`TIME_WAIT`
+  - 乱序 FIN 防护、TIME_WAIT 槽位回收
+- **本端数据 RTO 重传（TCP :81 测试入口）**：已端到端验证
+  - 真实调用 `tcp_send()` 发送 `TCP-RTO-REAL`，ACK 不回复触发重传
+  - 实测重传间隔：`0.01s(首次) / 0.31s(首次重传) / 0.91s(第二次重传)`，间隔约 300ms/600ms
+  - 串口日志：`TCP test send 12B` → `TCP RTO: re-xmit 12B` ×2
+- **主动关闭完整路径 `FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → 超时释放`**：已端到端验证
+  - 串口日志完整记录：`FIN_WAIT_2` → `TIME_WAIT entered` → `TIME_WAIT expired`
+- **TIME_WAIT 槽位复用**：已验证，TIME_WAIT 到期后用同一端口 (`41001`) 重新建立连接成功
+
+### 已验证
+- `tools/net-test.py` 回归：ARP、ICMP、UDP、TCP handshake/data、TCP FIN 均 PASS
+- 编译通过，0 warning、0 error
+- SYN-ACK RTO 专项：PASS，真实串口日志出现多次 `TCP RTO: re-SYN-ACK`
+- 本端数据 RTO 重传专项：PASS（实测间隔 300ms/600ms）
+- 主动关闭/TIME_WAIT 专项：PASS（串口日志完整路径 + 同端口 SYN-ACK 复用）
+- 代码审查依据：Linux `net/ipv4/tcp_input.c`、`tcp_output.c`、`tcp_minisocks.c`；DHCP 依据 `net/ipv4/ipconfig.c`
+
+### 尚未完成 / 证据缺口
+- 尚未实现完整 TCP 拥塞控制（慢启动、拥塞避免、Reno/CUBIC/BBR）、SACK、RTT/RTO 精确估算和乱序缓存
+- 尚未实现面向用户态的 socket API
+- DHCP 租约续期、DNS 配置应用尚未完成
+
+### 代码与提交状态
+- GitHub：<https://github.com/wjq114514/cat-os>
+- 已推送提交：
+  - `5126dba`：ARP/IP/ICMP/UDP/TCP 阶段验收
+  - `e10c82b`：DHCP、校验和字节序、显示格式修复
+  - `74a52f5`：TCP 发送确认与重传状态机
+- 当前工作树：`net.c` 有未提交修改（TCP :81 测试入口 + TIME_WAIT 日志增强）
+- 当前 Codex/HAPI session：`21c58f8e`（用户配置为 5.6 luna max；HAPI 状态页显示模型为 `default`，未能独立确认底层模型名）

@@ -285,6 +285,7 @@ typedef struct tcp_conn {
     uint32_t rto_deadline;       /* 重传截止时刻(ticks) */
     uint8_t  rto_backoff;        /* 退避指数 0/1/2/... */
     uint32_t tw_until;           /* TIME_WAIT 释放时刻(ticks) */
+    bool test_sent,test_closed;  /* TCP :81 acceptance path */
 } tcp_conn_t;
 static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 static socket_t  tcp_socks[TCP_MAX_CONNS];
@@ -328,11 +329,14 @@ static void tcp_xmit_pending(tcp_conn_t *c){
     c->snd_nxt+=n;
     tcp_rto_arm(c);
 }
+int tcp_send(socket_t *s,const uint8_t *data,uint32_t len);
+void tcp_close(socket_t *s);
 
 socket_t *tcp_listen(uint16_t port){
     tcp_conn_t *c=tcp_conn_find_free();if(!c)return NULL;
     c->used=true;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;
     c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;
+    c->test_sent=false;c->test_closed=false;
     for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_socks[i].type){tcp_socks[i].type=SOCK_TCP_LISTEN;tcp_socks[i].tcp.conn=c;break;}
     kputs("[NET] TCP listen :");kput_dec(port);kputs("\n");
     return &tcp_socks[0];
@@ -356,6 +360,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             c=tcp_conn_find_free();
             if(!c){kputs("[NET] TCP conn table full, RST\n");return;}
             c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
+            c->test_sent=false;c->test_closed=false;
             c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
             c->rcv_isn=seq;c->rcv_nxt=seq+1;
             c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;c->snd_una=c->snd_nxt;
@@ -430,10 +435,10 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
             if(c->state==TCP_FIN_WAIT_1){ /* simultaneous close if our FIN is unacked */
                 if(c->snd_una>=c->snd_nxt){
-                    c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;
+                    c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;kputs("[NET] TCP TIME_WAIT entered\n");
                 }else c->state=TCP_CLOSING;
             }else if(c->state==TCP_FIN_WAIT_2||c->state==TCP_CLOSING){
-                c->state=TCP_TIME_WAIT;c->tw_until=ticks+200; /* 2s */
+                c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;kputs("[NET] TCP TIME_WAIT entered\n"); /* 2s */
             }else if(c->state==TCP_CLOSE_WAIT){ /* 已关过，忽略重复 FIN */
             }else{ /* ESTABLISHED：进 CLOSE_WAIT，应用 close 时发 FIN；无人接管则自动回关 */
                 c->state=TCP_CLOSE_WAIT;
@@ -447,7 +452,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         if(flags&TCP_FLAG_FIN)tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
         /* 主动关闭方状态推进 */
         if(c->state==TCP_FIN_WAIT_1&&(flags&TCP_FLAG_ACK)&&c->snd_una>=c->snd_nxt){c->state=TCP_FIN_WAIT_2;c->rto_deadline=0;kputs("[NET] TCP FIN_WAIT_2\n");}
-        if(c->state==TCP_CLOSING&&(flags&TCP_FLAG_ACK)&&c->snd_una>=c->snd_nxt){c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;}
+        if(c->state==TCP_CLOSING&&(flags&TCP_FLAG_ACK)&&c->snd_una>=c->snd_nxt){c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;kputs("[NET] TCP TIME_WAIT entered\n");}
         return;
     case TCP_LAST_ACK:
         if((flags&TCP_FLAG_ACK)&&ack>=c->snd_nxt){
@@ -466,7 +471,17 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
 static void tcp_tick(void){
     for(int i=0;i<TCP_MAX_CONNS;i++){
         tcp_conn_t *c=&tcp_conns[i];if(!c->used)continue;
-        if(c->state==TCP_TIME_WAIT){if(c->tw_until&&(int32_t)(ticks-c->tw_until)>=0){c->used=false;c->state=TCP_CLOSED;}continue;}
+        if(c->state==TCP_TIME_WAIT){if(c->tw_until&&(int32_t)(ticks-c->tw_until)>=0){c->used=false;c->state=TCP_CLOSED;kputs("[NET] TCP TIME_WAIT expired\n");}continue;}
+        if(c->state==TCP_ESTABLISHED&&c->lport==81){
+            socket_t ts={SOCK_TCP_ESTAB,{.tcp={c}}};
+            static const uint8_t test_data[]="TCP-RTO-REAL";
+            if(!c->test_sent){
+                int n=tcp_send(&ts,test_data,sizeof(test_data)-1);
+                if(n==(int)(sizeof(test_data)-1)){c->test_sent=true;kputs("[NET] TCP test send 12B\n");}
+            }else if(!c->test_closed&&c->snd_used==0&&c->snd_nxt==c->snd_una){
+                tcp_close(&ts);c->test_closed=true;kputs("[NET] TCP test close requested\n");
+            }
+        }
         if(c->rto_deadline&&(int32_t)(ticks-c->rto_deadline)>=0){
             if(c->state==TCP_SYN_RECEIVED){
                 kputs("[NET] TCP RTO: re-SYN-ACK\n");
@@ -575,7 +590,8 @@ void net_init(void){
     kputs("[NET] up ip=");net_ip_print(g_ip);kputs(" gw=");net_ip_print(g_gw);kputs(" mask=");net_ip_print(g_mask);kputs("\n");
     /* 探测网关 MAC（无回应也不阻塞，收包路径会自行补缓存） */
     dhcp_xid=0x12340000u^ip_id;dhcp_retries=0;dhcp_wait=2;dhcp_state=DHCP_DISCOVER;dhcp_send(1);dhcp_last=ticks;dhcp_state=DHCP_WAIT_OFFER;
-    /* 演示服务: TCP :80 监听 + UDP :7 echo */
+    /* 演示服务: TCP :80 监听 + UDP :7 echo; TCP :81 is acceptance-only. */
     tcp_listen(80);
+    tcp_listen(81);
     udp_open(7);
 }
