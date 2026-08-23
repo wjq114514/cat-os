@@ -36,19 +36,20 @@ void enter_usermode(void){
     syscall3(&p,5,PATH_NULL,2,0);steax(&p,FD);syscall3(&p,0,3,BUF,8);syscall3(&p,6,3,0,0);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_CONSOLE,16);syscall3(&p,6,3,0,0);syscall3(&p,1,3,BAD_PTR,4);
     /* ring3 /dev/kbd probe. Diagnostics are written through the real console fd
-     * (saved in FD) so writes never target /dev/kbd (read-only). open() returns
-     * the actual fd; read returns <0 = error, 0 = empty queue (ok), >0 = bytes read.
-     * Only negative read skips the diagnostic; empty queue is not an error.
+     * (saved in FD) so writes never target /dev/kbd (read-only). open() return
+     * is captured in KBD_FD (separate from FD so console stays valid). read()
+     * returns <0 = error (skip diagnostic), 0 = empty queue (ok), >0 = bytes
+     * read (ok). Only the negative case skips the kbd diagnostic.
      * No shell, no blocking read. */
     syscall3(&p,5,PATH_KBD,0,0);steax(&p,KBD_FD);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);
     v[0]=FD;v[1]=MSG_KBDOPEN;v[2]=17;syscall5(&p,1,v,1);
     v[0]=KBD_FD;v[1]=KDBUF;v[2]=16;syscall5(&p,0,v,1);steax(&p,LEN);
-    cmpimm(&p,0);uint32_t kbd_neg=(uint32_t)((uint8_t*)jl(&p)-u);
+    cmpzero(&p);uint32_t kbd_ok=(uint32_t)((uint8_t*)jl(&p)-u);
     v[0]=FD;v[1]=MSG_KBDREAD;v[2]=13;syscall5(&p,1,v,1);
     v[0]=FD;v[1]=KDBUF;v[2]=4;syscall5(&p,1,v,1);
-    uint32_t kbd_neg_lbl=0x1000u+(uint32_t)(p-u);patch(u,kbd_neg,kbd_neg_lbl);
-    v[0]=KBD_FD;syscall5(&p,6,v,1);v[0]=FD;syscall5(&p,6,v,1);
+    uint32_t kbd_ok_lbl=0x1000u+(uint32_t)(p-u);patch(u,kbd_ok,kbd_ok_lbl);
+    v[0]=KBD_FD;syscall5(&p,6,v,1);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);
     v[0]=99;syscall5(&p,23,v,0);cmpimm(&p,(uint32_t)-CATOS_EBADF);errj[errn++]=(uint32_t)((uint8_t*)jne(&p)-u);
     syscall3(&p,5,PATH_NULL,2,0);steax(&p,FD);v[0]=FD;syscall5(&p,23,v,1);cmpimm(&p,(uint32_t)-CATOS_ENOTSOCK);errj[errn++]=(uint32_t)((uint8_t*)jne(&p)-u);v[0]=FD;syscall5(&p,6,v,1);v[0]=FD;syscall5(&p,6,v,1);cmpimm(&p,(uint32_t)-CATOS_EBADF);errj[errn++]=(uint32_t)((uint8_t*)jne(&p)-u);
