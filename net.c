@@ -486,7 +486,7 @@ int net_socket_close(socket_t *s){
     if(s->type==SOCK_UDP){if(s->udp.owned){udp_socks[s->udp.slot].used=false;udp_socks[s->udp.slot].bound=false;}s->type=SOCK_CLOSED;return 0;}
     if(s->type==SOCK_TCP_ESTAB){tcp_close(s);return 0;}
     if(s->type==SOCK_TCP_UNBOUND){if(s->tcp.conn)s->tcp.conn->used=false;s->type=SOCK_CLOSED;return 0;}
-    if(s->type==SOCK_TCP_LISTEN){s->type=SOCK_CLOSED;return 0;}
+    if(s->type==SOCK_TCP_LISTEN){if(s->tcp.conn)s->tcp.conn->used=false;s->type=SOCK_CLOSED;return 0;}
     return -22;
 }
 
@@ -524,6 +524,15 @@ static void tcp_loss_window(tcp_conn_t *c,uint32_t in_flight){
 static tcp_conn_t *tcp_conn_find_free(void){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_peer(uint32_t ip,uint16_t sport){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].peer_ip==ip&&tcp_conns[i].peer_port==sport)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_listen(uint16_t port){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].state==TCP_LISTEN&&tcp_conns[i].lport==port)return &tcp_conns[i];return NULL;}
+static void tcp_send_rst_ack(uint32_t dst_ip,uint16_t src_port,uint16_t dst_port,uint32_t seq,uint8_t in_flags,uint32_t dlen){
+    uint8_t dmac[6];if(!arp_resolve(dst_ip,dmac))return;
+    uint8_t *seg=begin_ip(dst_ip,IP_PROTO_TCP,dmac);if(!seg)return;
+    tcp_hdr_t *t=(tcp_hdr_t*)seg;t->src_port=hton16(src_port);t->dst_port=hton16(dst_port);
+    if(in_flags&TCP_FLAG_ACK){t->seq=hton32(seq);t->ack_seq=0;t->flags=TCP_FLAG_RST;}
+    else{t->seq=0;t->ack_seq=hton32(seq+dlen+((in_flags&(TCP_FLAG_SYN|TCP_FLAG_FIN))?1u:0u));t->flags=TCP_FLAG_RST|TCP_FLAG_ACK;}
+    t->off_res=0x50;t->window=0;t->csum=0;t->urgent=0;
+    t->csum=hton16(ip_checksum_pseudo(g_ip,dst_ip,IP_PROTO_TCP,20,seg,20));end_ip(seg,20,IP_PROTO_TCP);
+}
 socket_t *net_socket_open(uint32_t type){
     if(type==2){for(int i=0;i<UDP_SLOTS;i++)if(!udp_socks[i].used){udp_socks[i]=(udp_sock_t){0};udp_socks[i].used=true;udp_socks[i].owned=true;udp_handles[i]=(socket_t){SOCK_UDP_UNBOUND,{.udp={(uint16_t)0,(uint8_t)i,1}}};return &udp_handles[i];}return NULL;}
     if(type==1){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used){tcp_conns[i]=(tcp_conn_t){0};tcp_conns[i].used=true;tcp_conns[i].state=TCP_CLOSED;tcp_handles[i]=(socket_t){SOCK_TCP_UNBOUND,{.tcp={&tcp_conns[i]}}};return &tcp_handles[i];}return NULL;}
@@ -591,7 +600,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         tcp_conn_t *l=tcp_conn_find_listen(dport);
         if((flags&TCP_FLAG_SYN)&&l){
             c=tcp_conn_find_free();
-            if(!c){kputs("[NET] TCP conn table full, RST\n");return;}
+            if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);return;}
             c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
             tcp_tx_reset(c);
             c->test_sent=false;c->test_closed=false;
@@ -617,6 +626,12 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             }
         }
         return;
+    }
+
+    /* RFC 793 duplicate SYN handling: keep the half-open state and repeat
+       the SYN-ACK so a lost control reply does not strand the peer. */
+    if(c->state==TCP_SYN_RECEIVED&&(flags&TCP_FLAG_SYN)&&seq==c->rcv_isn){
+        tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);tcp_rto_arm(c);return;
     }
 
     /* 1. 记录对端窗口 */
@@ -719,12 +734,16 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         if(c->state==TCP_CLOSING&&(flags&TCP_FLAG_ACK)&&c->snd_una>=c->snd_nxt){c->state=TCP_TIME_WAIT;c->tw_until=ticks+200;kputs("[NET] TCP TIME_WAIT entered\n");}
         return;
     case TCP_LAST_ACK:
+        if((flags&TCP_FLAG_FIN)&&seq+dlen+1u==c->rcv_nxt){
+            tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);return;
+        }
         if((flags&TCP_FLAG_ACK)&&ack>=c->snd_nxt){
             kputs("[NET] TCP LAST_ACK done -> CLOSED\n");
             c->used=false;c->state=TCP_CLOSED;c->rto_deadline=0;
         }
         return;
     case TCP_TIME_WAIT:
+        if((flags&TCP_FLAG_FIN)||dlen)tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
         return;
     default:
         return;
