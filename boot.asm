@@ -33,6 +33,7 @@ multiboot_header:
 
 section .text
 global _start
+global kernel_stack_top
 extern kernel_main
 extern __kernel_phys_start
 extern __kernel_phys_load_end

@@ -8,8 +8,9 @@ typedef struct {uint32_t prev,esp0,ss0,esp1,ss1,esp2,ss2,cr3,eip,eflags,eax,ecx,
 static tss_t tss __attribute__((aligned(16))); static uint64_t gdt[6] __attribute__((aligned(8)));
 extern void arch_load_gdt(const void *);
 extern void arch_load_tss(uint16_t);
+extern uint8_t kernel_stack_top[];
 static void setg(int i,uint32_t b,uint32_t lim,uint8_t a){uint64_t f=0xC;gdt[i]=((uint64_t)(lim&0xFFFF))|((uint64_t)(b&0xFFFFFF)<<16)|((uint64_t)(lim&0xF0000)<<32)|((uint64_t)a<<40)|((uint64_t)f<<52)|((uint64_t)(b>>24)<<56);}
-void usermode_init(void){tss.ss0=0x10;tss.esp0=0xC010C000;tss.bitmap=sizeof(tss);setg(0,0,0,0);setg(1,0,0xfffff,0x9A);setg(2,0,0xfffff,0x92);setg(3,0,0xfffff,0xFA);setg(4,0,0xfffff,0xF2);setg(5,(uint32_t)&tss,sizeof(tss)-1,0x89);struct{uint16_t l;uint32_t b;}__attribute__((packed)) r={(uint16_t)(sizeof(gdt)-1),(uint32_t)gdt};arch_load_gdt(&r);__asm__ volatile("ljmp $0x08, $1f\n\t1:\n\tmovw $0x10, %%ax\n\t movw %%ax, %%ds\n\t movw %%ax, %%es\n\t movw %%ax, %%fs\n\t movw %%ax, %%gs\n\t movw %%ax, %%ss\n" ::: "eax","memory");arch_load_tss(0x28);interrupts_post_gdt_update();kputs("[OK] GDT+user segments loaded\n[OK] TSS loaded\n");}
+void usermode_init(void){tss.ss0=0x10;tss.esp0=(uint32_t)kernel_stack_top;tss.bitmap=sizeof(tss);setg(0,0,0,0);setg(1,0,0xfffff,0x9A);setg(2,0,0xfffff,0x92);setg(3,0,0xfffff,0xFA);setg(4,0,0xfffff,0xF2);setg(5,(uint32_t)&tss,sizeof(tss)-1,0x89);struct{uint16_t l;uint32_t b;}__attribute__((packed)) r={(uint16_t)(sizeof(gdt)-1),(uint32_t)gdt};arch_load_gdt(&r);__asm__ volatile("ljmp $0x08, $1f\n\t1:\n\tmovw $0x10, %%ax\n\t movw %%ax, %%ds\n\t movw %%ax, %%es\n\t movw %%ax, %%fs\n\t movw %%ax, %%gs\n\t movw %%ax, %%ss\n" ::: "eax","memory");arch_load_tss(0x28);interrupts_post_gdt_update();kputs("[OK] GDT+user segments loaded\n[OK] TSS loaded\n");}
 static void e8(uint8_t **p,uint8_t v){*(*p)++=v;}
 static void e32(uint8_t **p,uint32_t v){for(int i=0;i<4;i++)e8(p,(uint8_t)(v>>(8*i)));}
 static void movi(uint8_t **p,uint8_t r,uint32_t v){e8(p,0xB8+r);e32(p,v);}
