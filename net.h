@@ -95,6 +95,9 @@ bool ip_send(uint32_t dst, uint8_t proto, const uint8_t *data, uint32_t len);
 
 /* ARP */
 bool arp_resolve(uint32_t ip, uint8_t mac[6]);
+bool net_parse_ipv4(const char *text,uint32_t *out);
+int net_ping(uint32_t dst,uint16_t id,uint16_t seq,char *out,uint32_t out_len);
+int net_ping_stats(char *out,uint32_t out_len);
 
 /* UDP */
 socket_t *udp_open(uint16_t lport);

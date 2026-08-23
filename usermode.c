@@ -9,5 +9,41 @@ extern void arch_load_gdt(const void *);
 extern void arch_load_tss(uint16_t);
 static void setg(int i,uint32_t b,uint32_t lim,uint8_t a){uint64_t f=0xC;gdt[i]=((uint64_t)(lim&0xFFFF))|((uint64_t)(b&0xFFFFFF)<<16)|((uint64_t)(lim&0xF0000)<<32)|((uint64_t)a<<40)|((uint64_t)f<<52)|((uint64_t)(b>>24)<<56);}
 void usermode_init(void){tss.ss0=0x10;tss.esp0=0xC010C000;tss.bitmap=sizeof(tss);setg(0,0,0,0);setg(1,0,0xfffff,0x9A);setg(2,0,0xfffff,0x92);setg(3,0,0xfffff,0xFA);setg(4,0,0xfffff,0xF2);setg(5,(uint32_t)&tss,sizeof(tss)-1,0x89);struct{uint16_t l;uint32_t b;}__attribute__((packed)) r={(uint16_t)(sizeof(gdt)-1),(uint32_t)gdt};arch_load_gdt(&r);__asm__ volatile("ljmp $0x08, $1f\n\t1:\n\tmovw $0x10, %%ax\n\t movw %%ax, %%ds\n\t movw %%ax, %%es\n\t movw %%ax, %%fs\n\t movw %%ax, %%gs\n\t movw %%ax, %%ss\n" ::: "eax","memory");arch_load_tss(0x28);interrupts_post_gdt_update();kputs("[OK] GDT+user segments loaded\n[OK] TSS loaded\n");}
-static void e8(uint8_t **p,uint8_t v){*(*p)++=v;} static void e32(uint8_t **p,uint32_t v){for(int i=0;i<4;i++)e8(p,(uint8_t)(v>>(8*i)));} static void movi(uint8_t **p,uint8_t r,uint32_t v){e8(p,0xB8+r);e32(p,v);} static void syscall3(uint8_t **p,uint32_t nr,uint32_t a,uint32_t b,uint32_t c){movi(p,0,nr);movi(p,3,a);movi(p,1,b);movi(p,2,c);e8(p,0xCD);e8(p,0x80);} 
-void enter_usermode(void){enum{PATH_NULL=0x1100,PATH_CONSOLE=0x1200,MSG_CONSOLE=0x1300,BUF=0x1400,BAD_PTR=0x2000};uintptr_t cp=pmm_alloc_page(),sp=pmm_alloc_page(),vp=pmm_alloc_page();if(!cp||!sp||!vp||map_page(0x1000,cp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x700000,sp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0xB8000,vp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER))panic("user mapping failed");uint8_t *u=(uint8_t*)phys_to_virt(cp),*p=u;syscall3(&p,5,PATH_NULL,2,0);e8(&p,0x89);e8(&p,0xC3);syscall3(&p,0,3,BUF,8);syscall3(&p,6,3,0,0);syscall3(&p,5,PATH_CONSOLE,1,0);e8(&p,0x89);e8(&p,0xC3);syscall3(&p,1,3,MSG_CONSOLE,16);syscall3(&p,6,3,0,0);syscall3(&p,1,3,BAD_PTR,4);e8(&p,0xEB);e8(&p,0xFE);const char n[]="/dev/null",c[]="/dev/console",m[]="user console ok\n";for(unsigned i=0;i<sizeof(n);i++)u[PATH_NULL-0x1000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)u[PATH_CONSOLE-0x1000+i]=c[i];for(unsigned i=0;i<sizeof(m);i++)u[MSG_CONSOLE-0x1000+i]=m[i];kputs("[OK] entering ring3\n");__asm__ volatile("pushl $0x23; pushl $0x700FFC; pushl $0x202; pushl $0x1B; pushl $0x1000; iret");}
+static void e8(uint8_t **p,uint8_t v){*(*p)++=v;}
+static void e32(uint8_t **p,uint32_t v){for(int i=0;i<4;i++)e8(p,(uint8_t)(v>>(8*i)));}
+static void movi(uint8_t **p,uint8_t r,uint32_t v){e8(p,0xB8+r);e32(p,v);}
+static void movm(uint8_t **p,uint8_t r,uint32_t a){e8(p,0x8B);e8(p,(uint8_t)(0x05|(r<<3)));e32(p,a);}
+static void steax(uint8_t **p,uint32_t a){e8(p,0xA3);e32(p,a);}
+static void syscall3(uint8_t **p,uint32_t nr,uint32_t a,uint32_t b,uint32_t c){movi(p,0,nr);movi(p,3,a);movi(p,1,b);movi(p,2,c);e8(p,0xCD);e8(p,0x80);}
+static void syscall5(uint8_t **p,uint32_t nr,uint32_t *v,uint8_t mem){static const uint8_t r[5]={3,1,2,6,7};movi(p,0,nr);for(uint8_t i=0;i<5;i++)if(mem&(1u<<i))movm(p,r[i],v[i]);else movi(p,r[i],v[i]);e8(p,0xCD);e8(p,0x80);}
+static void user_segments(uint8_t **p){movi(p,0,0x23);e8(p,0x8E);e8(p,0xD8);e8(p,0x8E);e8(p,0xC0);}
+static uint32_t jl(uint8_t **p){e8(p,0x0F);e8(p,0x8C);uint32_t x=(uint32_t)(*p);e32(p,0);return x;}
+static void patch(uint8_t *base,uint32_t at,uint32_t dst){int32_t d=(int32_t)(dst-(0x1000u+at+4));for(int i=0;i<4;i++)base[at+i]=(uint8_t)((uint32_t)d>>(8*i));}
+static void cmpzero(uint8_t **p){e8(p,0x83);e8(p,0xF8);e8(p,0);}
+void enter_usermode(void){
+    enum{PATH_NULL=0x2100,PATH_CONSOLE=0x2200,MSG_CONSOLE=0x2300,BUF=0x2400,SRCIP=0x2540,SRCPORT=0x2544,FD=0x2600,LEN=0x2604,LISTENFD=0x2608,MSG_UDP=0x2700,MSG_TCP=0x2710,TARGET=0x2800,PINGOUT=0x2900,PINGSTAT=0x2A00,BAD_TARGET=0x2B00,BAD_PTR=0x3000};
+    uintptr_t cp=pmm_alloc_page(),dp=pmm_alloc_page(),sp=pmm_alloc_page(),vp=pmm_alloc_page();
+    if(!cp||!dp||!sp||!vp||map_page(0x1000,cp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x2000,dp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x700000,sp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0xB8000,vp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER))panic("user mapping failed");
+    uint8_t *u=(uint8_t*)phys_to_virt(cp),*p=u;uint32_t v[5],a1,a2,a3;
+    user_segments(&p);
+    syscall3(&p,5,PATH_NULL,2,0);steax(&p,FD);syscall3(&p,0,3,BUF,8);syscall3(&p,6,3,0,0);
+    syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_CONSOLE,16);syscall3(&p,6,3,0,0);syscall3(&p,1,3,BAD_PTR,4);
+    syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);
+    v[0]=TARGET;v[1]=PINGOUT;v[2]=128;v[3]=0xCA70;v[4]=1;syscall5(&p,29,v,0);steax(&p,LEN);v[0]=FD;v[1]=PINGOUT;v[2]=LEN;syscall5(&p,1,v,5);
+    v[0]=TARGET;v[1]=PINGOUT;v[2]=128;v[3]=0xCA70;v[4]=2;syscall5(&p,29,v,0);steax(&p,LEN);v[0]=FD;v[1]=PINGOUT;v[2]=LEN;syscall5(&p,1,v,5);
+    v[0]=TARGET;v[1]=PINGOUT;v[2]=128;v[3]=0xCA70;v[4]=3;syscall5(&p,29,v,0);steax(&p,LEN);v[0]=FD;v[1]=PINGOUT;v[2]=LEN;syscall5(&p,1,v,5);
+    v[0]=PINGSTAT;v[1]=128;syscall5(&p,30,v,0);steax(&p,LEN);v[0]=FD;v[1]=PINGSTAT;v[2]=LEN;syscall5(&p,1,v,5);
+    v[0]=BAD_TARGET;v[1]=PINGOUT;v[2]=128;v[3]=0xCA70;v[4]=4;syscall5(&p,29,v,0);steax(&p,LEN);v[0]=FD;v[1]=PINGOUT;v[2]=LEN;syscall5(&p,1,v,5);
+    v[0]=FD;syscall5(&p,28,v,1);
+    v[0]=2;v[1]=0;v[2]=0;v[3]=0;v[4]=0;syscall5(&p,20,v,0);steax(&p,FD);
+    v[0]=FD;v[1]=7000;syscall5(&p,21,v,1);
+    uint32_t udp_loop=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;v[3]=SRCIP;v[4]=SRCPORT;syscall5(&p,25,v,1);cmpzero(&p);a1=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);
+    v[0]=FD;v[1]=BUF;v[2]=LEN;v[3]=SRCIP;v[4]=SRCPORT;syscall5(&p,24,v,1|4|8|16);v[0]=FD;syscall5(&p,28,v,1);syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_UDP,16);syscall3(&p,6,3,0,0);
+    v[0]=1;v[1]=0;v[2]=0;v[3]=0;v[4]=0;syscall5(&p,20,v,0);steax(&p,LISTENFD);v[0]=LISTENFD;v[1]=80;syscall5(&p,21,v,1);v[0]=LISTENFD;v[1]=1;syscall5(&p,22,v,1);
+    uint32_t acc_loop=0x1000u+(uint32_t)(p-u);v[0]=LISTENFD;syscall5(&p,23,v,1);cmpzero(&p);a2=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,FD);
+    uint32_t tcp_loop=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;syscall5(&p,27,v,1);cmpzero(&p);a3=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);
+    v[0]=FD;v[1]=BUF;v[2]=LEN;syscall5(&p,26,v,5);v[0]=FD;syscall5(&p,28,v,1);v[0]=LISTENFD;syscall5(&p,28,v,1);syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_TCP,16);syscall3(&p,6,3,0,0);e8(&p,0xEB);e8(&p,0xFE);
+    patch(u,a1,udp_loop);patch(u,a2,acc_loop);patch(u,a3,tcp_loop);
+    const char n[]="/dev/null",c[]="/dev/console",t[]="10.0.2.2",bt[]="300.1.1.1",m[]="user console ok\n",um[]="user UDP PASS\n",tm[]="user TCP PASS\n";uint8_t *d=(uint8_t*)phys_to_virt(dp);for(unsigned i=0;i<sizeof(n);i++)d[PATH_NULL-0x2000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)d[PATH_CONSOLE-0x2000+i]=c[i];for(unsigned i=0;i<sizeof(t);i++)d[TARGET-0x2000+i]=t[i];for(unsigned i=0;i<sizeof(bt);i++)d[BAD_TARGET-0x2000+i]=bt[i];for(unsigned i=0;i<sizeof(m);i++)d[MSG_CONSOLE-0x2000+i]=m[i];for(unsigned i=0;i<sizeof(um);i++)d[MSG_UDP-0x2000+i]=um[i];for(unsigned i=0;i<sizeof(tm);i++)d[MSG_TCP-0x2000+i]=tm[i];
+    kputs("[OK] entering ring3\n");__asm__ volatile("pushl $0x23; pushl $0x700FFC; pushl $0x202; pushl $0x1B; pushl $0x1000; iret");
+}

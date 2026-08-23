@@ -24,10 +24,15 @@ isr_%1:
  jmp isr_common
 %endmacro
 %assign n 0
-%rep 32
+%rep 14
 I n
 %assign n n+1
 %endrep
+; #PF already pushes an error code before entering the stub.
+global isr_14
+isr_14:
+ push dword 14
+ jmp isr_common_error
 %assign n 32
 %rep 16
 I n
@@ -41,5 +46,14 @@ isr_common:
  add esp,4
  popa
  add esp,8
+ iretd
+isr_common_error:
+ pusha
+ push esp
+ call interrupt_dispatch
+ add esp,4
+ popa
+ add esp,8
+ add esp,4
  iretd
 section .note.GNU-stack noalloc noexec nowrite progbits
