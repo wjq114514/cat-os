@@ -17,4 +17,4 @@ int vfs_socket_install(void *sock){static file_t fs[VFS_MAX_FD];for(int fd=3;fd<
 void *vfs_socket_get(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_SOCKET)return 0;return fds[fd]->private;}
 int vfs_socket_close(int fd){if(!vfs_socket_get(fd))return -9;fds[fd]=0;return 0;}
 int vfs_fd_exists(int fd){return fd>=0&&fd<VFS_MAX_FD&&fds[fd]!=0;}
-int32_t vfs_syscall(uint32_t nr,const uint32_t*a){if(nr==5){if(!user_access_ok(a[0],1,0))return -14;return vfs_open((const char*)a[0],a[1]);}if(nr==6)return vfs_close(a[0]);if(nr==3)return vfs_close(a[0]);if(nr==0)return vfs_read(a[0],(void*)a[1],a[2]);if(nr==1)return vfs_write(a[0],(const void*)a[1],a[2]);return -38;}
+int32_t vfs_syscall(uint32_t nr,const uint32_t*a){if(nr==5){if(!user_access_ok(a[0],1,0))return -14;uint32_t sl=1;while(sl<256&&user_access_ok(a[0]+sl,1,0)&&((char*)a[0])[sl]!=0)sl++;if(sl>=256)return -14;return vfs_open((const char*)a[0],a[1]);}if(nr==6)return vfs_close(a[0]);if(nr==3)return vfs_close(a[0]);if(nr==0)return vfs_read(a[0],(void*)a[1],a[2]);if(nr==1)return vfs_write(a[0],(const void*)a[1],a[2]);return -38;}
