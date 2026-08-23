@@ -1,136 +1,77 @@
-# cat-OS higher-half i686 kernel
+# Cat-OS
 
-This tree boots as a 32-bit Multiboot1 kernel and moves the C kernel into the
-higher half at `0xC0000000`.  The flat boot image is still loaded by GRUB at physical
-`1MiB`; the linker places `.text` at virtual `0xC0100000`, i.e.
-`KERNEL_VIRT_BASE + KERNEL_PHYS_LOAD`.
+Cat-OS 是一个面向操作系统和网络协议栈学习的教学型 i686 内核项目，运行
+在 freestanding/nostdlib 环境中，使用 GRUB 启动并在 QEMU 中验证。项目重点
+是理解启动、分页、中断、驱动、网络协议和用户态系统调用之间的连接，不是
+完整的 POSIX 操作系统。
 
-## Boot sequence
+## 当前已验证
 
-1. GRUB loads the Multiboot raw image at physical `0x00100000` using the
-   address fields in the Multiboot header, then enters
-   `_start_phys = _start - 0xC0000000` with paging disabled.  `cat-os.elf` is
-   kept as a symbol/debug artifact; `cat-os.bin` is the booted flat image.
-2. `boot.asm` saves the Multiboot magic and info pointer, initializes COM1, and
-   uses a temporary low stack.
-3. `boot.asm` builds a bootstrap page directory with two 4MiB PDEs:
-   - `0x00000000..0x003fffff -> 0x00000000..0x003fffff` for the current low EIP;
-   - `0xC0000000..0xC03fffff -> 0x00000000..0x003fffff` for the kernel alias.
-4. It enables `CR4.PSE`, loads `CR3`, sets `CR0.PG`, then performs an absolute
-   jump to the higher-half label.
-5. The higher-half entry switches to a higher-half stack and calls
-   `kernel_main(magic, mbi_phys)`.  All C code executes at high virtual
-   addresses.
-6. `paging_init()` parses the Multiboot memory map, initializes a tiny
-   bitmap/next-fit physical page allocator, creates the final kernel page
-   directory, and reloads `CR3`.  The final map keeps a Linux-like `3G/1G`
-   layout: physical RAM is directly mapped at `0xC0000000`, while the low
-   identity map is removed.
-7. `ioremap()` uses normal 4KiB page tables under `0xF0000000` for MMIO.  The
-   VGA text buffer is mapped through this window as an early smoke test.
+当前代码和已有真实 QEMU、串口、脚本证据确认了以下能力：
 
-## Memory-management interfaces
+- 内核启动、高地址内核映射、GDT/IDT、PIT，以及进入 ring3 用户态。
+- e1000 虚拟网卡上的 ARP、IPv4、ICMP Echo、UDP 和 TCP 基础收发。
+- 用户态 `ping 10.0.2.2`：3 个 Echo Request 得到 3 个 Reply，统计为 0% 丢包；
+  非法地址路径输出 `ping: invalid address`。
+- 最小用户态 socket 接口的 UDP echo 和 TCP echo，串口/测试输出均有
+  `UDP echo PASS`、`TCP echo PASS`。
+- TCP Reno 拥塞控制、动态 RTT/RTO、接收端乱序缓存和 SACK，以及发送端
+  SACK scoreboard/选择性重传已有对应回归或专项证据。
 
-- Page-table flags use Linux-style names such as `_PAGE_PRESENT`, `_PAGE_RW`,
-  `_PAGE_USER`, `_PAGE_PWT`, `_PAGE_PCD`, `_PAGE_PSE`, and `_PAGE_GLOBAL`.
-- `map_page(virt, phys, flags)` creates 4KiB mappings on demand and allocates
-  page-table pages via the PMM.
-- `pmm_alloc_page()` returns normal page frames from Multiboot usable memory.
-- `pmm_alloc_dma_page()` is constrained to the ISA/DMA-safe `<16MiB` zone, a
-  placeholder for later NIC descriptor/ring allocation policies.
-- `ioremap(phys, size, flags)` reserves virtual space in the MMIO window and
-  maps uncached device memory.
+这些项目不是对完整协议或完整 API 的承诺。特别是部分极端边界压力测试、
+真实物理网卡和完整用户态网络工具链仍未完成。
 
-The current implementation is intentionally single-core i686 and compact.  It
-uses 4MiB PSE leaves for the kernel direct map, and 4KiB page tables for dynamic
-mappings, leaving room to evolve toward buddy zones, per-CPU caches, DMA pools,
-and low-latency network-buffer allocation.
+## 构建
 
-## Build and run
-
-The current stage adds freestanding interfaces for GDT/IDT exception entry,
-native and Linux-shim syscall dispatch (unsupported calls return `-ENOSYS`), a
-minimal process/address-space object, and a fixed-size shared network queue
-with submit/complete indices, doorbell and busy-poll fields.  The Linux shim
-does not claim mmap/futex/epoll/sendmmsg/recvmmsg support yet.
-
-Interrupt setup now loads the kernel IDT with `lidt`. Because the final page
-directory removes GRUB's low identity mapping, the boot GDT is copied verbatim
-to higher-half resident memory and reloaded with `lgdt`; its descriptors and
-runtime `CS` selector are preserved rather than guessed or replaced. The
-8259A is remapped to IRQ vectors `0x20-0x2F`; all lines except timer IRQ0 are
-masked. PIT channel 0 is programmed for 100 Hz. IRQ delivery remains an early
-integration point. QEMU verification covers a recoverable `int3` and PIT IRQ0
-delivery through vector 32, including the first three 100 Hz ticks. Additional
-device IRQs, spurious IRQ7/15 handling, SMP/APIC and user-mode TSS switching are
-not implemented yet.
+依赖 32 位 GCC/ld、NASM、GRUB 工具和 QEMU：
 
 ```sh
-make clean
-make
-make check   # runs QEMU for 8s and accepts timeout as success
-make run     # interactive serial log on stdio
+make clean && make
 ```
 
-## IRQ and PCI foundations
-
-## VFS
-
-The VFS layer provides `inode`/`file` objects, per-process-style fd tables,
-`file_ops` read/write/close callbacks, and a devfs node set: `/dev/null`,
-`/dev/console`, `/dev/kbd`, `/dev/zero`, and `/dev/urandom`. Linux syscall
-numbers 5/3/0/1 are routed through the VFS shim. Filesystem registration and
-tmpfs-style flat-name storage remain extension points; current fd tables are
-kernel-global until process objects gain ownership.
-
-Legacy IRQs use a 16-entry callback table. Drivers call
-`irq_register_handler(irq, handler, arg)` and `irq_unregister_handler(irq)`;
-handlers return `true` when handled. Unhandled lines warn once. IRQ7/IRQ15 are
-checked against the 8259A ISR so spurious interrupts are not dispatched. The
-100 Hz PIT is the first table-driven handler.
-
-PCI mechanism #1 is available through `pci_read_config()`,
-`pci_write_config()`, and `pci_find_class()`. Boot scans buses 0-2, handles
-multifunction devices, and prints identity, class, and BAR resources. QEMU uses
-`-netdev user,id=net0 -device e1000,netdev=net0`; its `8086:100e` BAR0 is sized
-and mapped with `ioremap`. Limitations are legacy config I/O, no recursive
-bridge scan, MSI/MSI-X, 64-bit BAR pairing, resource allocation, or NIC reset.
-
-## e1000 bring-up
-
-`e1000.c` now performs the 82540EM reset/link setup, EERD MAC read, PCI bus
-master enable, fixed 8-entry RX/TX rings, 2 KiB receive buffers, RCTL/TCTL
-programming, and IRQ11 registration. Descriptor and buffer pages come from the
-PMM and device-visible fields contain physical addresses; the polling path
-recycles completed RX buffers without per-packet allocation. QEMU is launched
-with `-netdev user,id=net0 -device e1000,netdev=net0`.
-
-The current smoke test verifies MAC, ring, link and PIT stability. A guest IP
-stack/ARP responder is not present yet, so host `ping 10.0.2.15` cannot be
-answered by the kernel and RX completion requires externally injected traffic.
-The next step is a minimal ARP request/reply path followed by TX descriptor
-completion and an IRQ-driven RX drain.
-
-The minimal ARP path is now present in `e1000.c`: Ethernet ARP requests for
-10.0.2.15 are decoded from the fixed RX pool and a 42-byte Ethernet/ARP reply
-is submitted through the next preallocated TX descriptor. The TX path uses
-the descriptor command `EOP|IFCS|RS` and advances TDT. A full QEMU user-mode
-network requires an externally injected packet; the kernel has no general IP
-stack or DHCP client yet.
-
-For deterministic RX/TX verification, use QEMU's socket backend instead of
-slirp (which handles ARP internally):
+生成的 `os.iso` 可用 `make run` 或类似下面的命令启动：
 
 ```sh
-qemu-system-i386 -cdrom os.iso -m 128M -display none -serial stdio \
-  -no-reboot -no-shutdown \
-  -netdev socket,id=net0,listen=127.0.0.1:12345 \
-  -device e1000,netdev=net0
-python3 tools/inject.py
+qemu-system-i386 -cdrom os.iso -m 128M -display none \
+  -serial stdio -no-reboot -no-shutdown \
+  -netdev user,id=net0 -device e1000,netdev=net0
 ```
 
-The injector sends a length-prefixed 42-byte ARP request from
-`52:54:00:aa:bb:cc` / `192.168.1.1` for `10.0.2.15`. The guest consumes the RX
-descriptor, recycles its fixed buffer, and submits an ARP reply through TX.
-QEMU's e1000 model does not implement MAC loopback via `RCTL.LBM`, so loopback
-is deliberately not part of the test path.
+## 网络测试
+
+在 QEMU user/slirp 网络下，用户态启动路径会通过 DHCP 获取通常为
+`10.0.2.15` 的地址，并可执行：
+
+```text
+ping 10.0.2.2
+```
+
+原始网络回归脚本为：
+
+```sh
+python3 tools/net-test.py
+```
+
+该脚本适合 QEMU socket backend 的注入式 ARP/IP 测试，但 socket backend 不
+提供 slirp 的 DHCP 服务；启动路径还包含 DHCP fallback 和用户态测试时序，
+因此必须按实际启动状态等待或注入。不能把 socket backend 下因 DHCP/时序
+导致的超时当成协议 PASS。临时专项脚本和日志放在 `/tmp`，不属于仓库内容。
+
+ICMP 实现遵循 RFC 791 的 IPv4 头校验、RFC 792 的 Echo 类型/code、标识和
+序号字段，并参考 RFC 1122 的主机 Echo 行为。Linux 对照源码主要是
+`linux-ref/net/ipv4/icmp.c`、`ip_output.c`、`route.c`、`net/socket.c` 和
+`net/ipv4/af_inet.c`；本项目只采用适合静态池和简化 syscall ABI 的必要部分。
+
+## 当前限制与后续计划
+
+- 用户态 socket ABI 是最小实验接口，不是完整 POSIX socket；阻塞、并发进程
+  FD 隔离、DNS、poll/select 等能力仍有限或未实现。
+- TCP 高级恢复路径、重复/重叠/双缺口等部分边界压力测试还需要更稳定的
+  可重复注入覆盖。
+- 当前主要在 QEMU e1000 上验证，真实网卡、MSI/MSI-X、PHY 和更完整的 DMA
+  错误恢复尚未完成。
+- 后续计划包括网络工程完整性和性能测量、最小 HTTP 应用验证，以及在基础
+  设施稳定后进行 nginx 移植预研。
+
+本项目当前仍处于实验和教学阶段。日志中的 PASS 只代表对应测试环境和
+测试输入下的真实结果，不代表生产级兼容性或性能保证。
