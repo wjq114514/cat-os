@@ -24,7 +24,7 @@ void enter_usermode(void){
     enum{PATH_NULL=0x2100,PATH_CONSOLE=0x2200,MSG_CONSOLE=0x2300,BUF=0x2400,SRCIP=0x2540,SRCPORT=0x2544,FD=0x2600,LEN=0x2604,LISTENFD=0x2608,MSG_UDP=0x2700,MSG_TCP=0x2710,TARGET=0x2800,PINGOUT=0x2900,PINGSTAT=0x2A00,BAD_TARGET=0x2B00,BAD_PTR=0x3000};
     uintptr_t cp=pmm_alloc_page(),dp=pmm_alloc_page(),sp=pmm_alloc_page(),vp=pmm_alloc_page();
     if(!cp||!dp||!sp||!vp||map_page(0x1000,cp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x2000,dp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x700000,sp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0xB8000,vp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER))panic("user mapping failed");
-    uint8_t *u=(uint8_t*)phys_to_virt(cp),*p=u;uint32_t v[5],a1,a2,a3;
+    uint8_t *u=(uint8_t*)phys_to_virt(cp),*p=u;uint32_t v[5],a1,a2,a3,a4,a5;
     user_segments(&p);
     syscall3(&p,5,PATH_NULL,2,0);steax(&p,FD);syscall3(&p,0,3,BUF,8);syscall3(&p,6,3,0,0);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_CONSOLE,16);syscall3(&p,6,3,0,0);syscall3(&p,1,3,BAD_PTR,4);
@@ -39,11 +39,12 @@ void enter_usermode(void){
     v[0]=FD;v[1]=7000;syscall5(&p,21,v,1);
     uint32_t udp_loop=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;v[3]=SRCIP;v[4]=SRCPORT;syscall5(&p,25,v,1);cmpzero(&p);a1=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);
     v[0]=FD;v[1]=BUF;v[2]=LEN;v[3]=SRCIP;v[4]=SRCPORT;syscall5(&p,24,v,1|4|8|16);v[0]=FD;syscall5(&p,28,v,1);syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_UDP,16);syscall3(&p,6,3,0,0);
-    v[0]=1;v[1]=0;v[2]=0;v[3]=0;v[4]=0;syscall5(&p,20,v,0);steax(&p,LISTENFD);v[0]=LISTENFD;v[1]=80;syscall5(&p,21,v,1);v[0]=LISTENFD;v[1]=1;syscall5(&p,22,v,1);
+    v[0]=1;v[1]=0;v[2]=0;v[3]=0;v[4]=0;syscall5(&p,20,v,0);steax(&p,LISTENFD);v[0]=LISTENFD;v[1]=80;syscall5(&p,21,v,1);v[0]=LISTENFD;v[1]=2;syscall5(&p,22,v,1);
     uint32_t acc_loop=0x1000u+(uint32_t)(p-u);v[0]=LISTENFD;syscall5(&p,23,v,1);cmpzero(&p);a2=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,FD);
-    uint32_t tcp_loop=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;syscall5(&p,27,v,1);cmpzero(&p);a3=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);
-    v[0]=FD;v[1]=BUF;v[2]=LEN;syscall5(&p,26,v,5);v[0]=FD;syscall5(&p,28,v,1);v[0]=LISTENFD;syscall5(&p,28,v,1);syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_TCP,16);syscall3(&p,6,3,0,0);e8(&p,0xEB);e8(&p,0xFE);
-    patch(u,a1,udp_loop);patch(u,a2,acc_loop);patch(u,a3,tcp_loop);
-    const char n[]="/dev/null",c[]="/dev/console",t[]="10.0.2.2",bt[]="300.1.1.1",m[]="user console ok\n",um[]="user UDP PASS\n",tm[]="user TCP PASS\n";uint8_t *d=(uint8_t*)phys_to_virt(dp);for(unsigned i=0;i<sizeof(n);i++)d[PATH_NULL-0x2000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)d[PATH_CONSOLE-0x2000+i]=c[i];for(unsigned i=0;i<sizeof(t);i++)d[TARGET-0x2000+i]=t[i];for(unsigned i=0;i<sizeof(bt);i++)d[BAD_TARGET-0x2000+i]=bt[i];for(unsigned i=0;i<sizeof(m);i++)d[MSG_CONSOLE-0x2000+i]=m[i];for(unsigned i=0;i<sizeof(um);i++)d[MSG_UDP-0x2000+i]=um[i];for(unsigned i=0;i<sizeof(tm);i++)d[MSG_TCP-0x2000+i]=tm[i];
+    uint32_t tcp_loop=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;syscall5(&p,27,v,1);cmpzero(&p);a3=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);v[0]=FD;v[1]=BUF;v[2]=LEN;syscall5(&p,26,v,5);v[0]=FD;syscall5(&p,28,v,1);
+    uint32_t acc_loop2=0x1000u+(uint32_t)(p-u);v[0]=LISTENFD;syscall5(&p,23,v,1);cmpzero(&p);a4=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,FD);
+    uint32_t tcp_loop2=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;syscall5(&p,27,v,1);cmpzero(&p);a5=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);v[0]=FD;v[1]=BUF;v[2]=LEN;syscall5(&p,26,v,5);v[0]=FD;syscall5(&p,28,v,1);v[0]=LISTENFD;syscall5(&p,28,v,1);syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_TCP,20);syscall3(&p,6,3,0,0);e8(&p,0xEB);e8(&p,0xFE);
+    patch(u,a1,udp_loop);patch(u,a2,acc_loop);patch(u,a3,tcp_loop);patch(u,a4,acc_loop2);patch(u,a5,tcp_loop2);
+    const char n[]="/dev/null",c[]="/dev/console",t[]="10.0.2.2",bt[]="300.1.1.1",m[]="user console ok\n",um[]="user UDP PASS\n",tm[]="user TCP MULTI PASS\n";uint8_t *d=(uint8_t*)phys_to_virt(dp);for(unsigned i=0;i<sizeof(n);i++)d[PATH_NULL-0x2000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)d[PATH_CONSOLE-0x2000+i]=c[i];for(unsigned i=0;i<sizeof(t);i++)d[TARGET-0x2000+i]=t[i];for(unsigned i=0;i<sizeof(bt);i++)d[BAD_TARGET-0x2000+i]=bt[i];for(unsigned i=0;i<sizeof(m);i++)d[MSG_CONSOLE-0x2000+i]=m[i];for(unsigned i=0;i<sizeof(um);i++)d[MSG_UDP-0x2000+i]=um[i];for(unsigned i=0;i<sizeof(tm);i++)d[MSG_TCP-0x2000+i]=tm[i];
     kputs("[OK] entering ring3\n");__asm__ volatile("pushl $0x23; pushl $0x700FFC; pushl $0x202; pushl $0x1B; pushl $0x1000; iret");
 }
