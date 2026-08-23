@@ -316,6 +316,7 @@ int udp_recvfrom(socket_t *s,uint32_t *src_ip,uint16_t *src_port,uint8_t *buf,ui
 typedef struct tcp_conn {
     bool used,accepted;
     uint8_t state;
+    uint8_t backlog;             /* bounded pending accept queue */
     uint32_t rcv_isn,rcv_nxt;    /* 对方 ISN / 期望下一序号 */
     uint32_t snd_isn,snd_nxt,snd_una;  /* 本地 ISN / 下一发送 / 最早未确认 */
     uint32_t peer_ip;
@@ -355,6 +356,7 @@ static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 static socket_t  tcp_socks[TCP_MAX_CONNS];
 static socket_t  tcp_handles[TCP_MAX_CONNS];
 static tcp_conn_t *tcp_conn_find_listen(uint16_t port);
+static void tcp_drop_pending(uint16_t port);
 static void tcp_cc_init(tcp_conn_t *c);
 static bool tcp_seq_after(uint32_t a,uint32_t b){return (int32_t)(a-b)>0;}
 static bool tcp_seq_before(uint32_t a,uint32_t b){return (int32_t)(a-b)<0;}
@@ -455,7 +457,7 @@ int net_socket_bind(socket_t *s,uint16_t port){
     if(s->type==SOCK_TCP_UNBOUND){
         tcp_conn_t *c=tcp_conn_find_listen(port);
         if(!c){
-            c=s->tcp.conn;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;
+            c=s->tcp.conn;c->state=TCP_LISTEN;c->backlog=1;c->lport=port;c->peer_ip=0;c->peer_port=0;
             c->accepted=false;c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;
             c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
             tcp_tx_reset(c);
@@ -483,12 +485,30 @@ socket_t *tcp_accept_socket(socket_t *s){
     return NULL;
 }
 
+int tcp_set_backlog(socket_t *s,uint32_t backlog){
+    if(!s||s->type!=SOCK_TCP_LISTEN||!s->tcp.conn)return -22;
+    if(backlog==0)backlog=1;
+    if(backlog>TCP_MAX_CONNS)backlog=TCP_MAX_CONNS;
+    s->tcp.conn->backlog=(uint8_t)backlog;
+    return 0;
+}
+
+void tcp_abort_socket(socket_t *s){
+    if(!s||!s->tcp.conn)return;
+    s->tcp.conn->used=false;s->tcp.conn->state=TCP_CLOSED;
+    s->tcp.conn->rto_deadline=0;s->tcp.conn->persist_deadline=0;
+    s->type=SOCK_CLOSED;
+}
+
 int net_socket_close(socket_t *s){
     if(!s||s->type==SOCK_CLOSED)return -9;
     if(s->type==SOCK_UDP){if(s->udp.owned){udp_socks[s->udp.slot].used=false;udp_socks[s->udp.slot].bound=false;}s->type=SOCK_CLOSED;return 0;}
     if(s->type==SOCK_TCP_ESTAB){tcp_close(s);return 0;}
     if(s->type==SOCK_TCP_UNBOUND){if(s->tcp.conn)s->tcp.conn->used=false;s->type=SOCK_CLOSED;return 0;}
-    if(s->type==SOCK_TCP_LISTEN){if(s->tcp.conn)s->tcp.conn->used=false;s->type=SOCK_CLOSED;return 0;}
+    if(s->type==SOCK_TCP_LISTEN){
+        if(s->tcp.conn){tcp_drop_pending(s->tcp.conn->lport);s->tcp.conn->used=false;}
+        s->type=SOCK_CLOSED;return 0;
+    }
     return -22;
 }
 
@@ -529,6 +549,25 @@ static void tcp_loss_window(tcp_conn_t *c,uint32_t in_flight){
 static tcp_conn_t *tcp_conn_find_free(void){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_peer(uint32_t ip,uint16_t sport){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].peer_ip==ip&&tcp_conns[i].peer_port==sport)return &tcp_conns[i];return NULL;}
 static tcp_conn_t *tcp_conn_find_listen(uint16_t port){for(int i=0;i<TCP_MAX_CONNS;i++)if(tcp_conns[i].used&&tcp_conns[i].state==TCP_LISTEN&&tcp_conns[i].lport==port)return &tcp_conns[i];return NULL;}
+static uint32_t tcp_pending_count(uint16_t port){
+    uint32_t n=0;
+    for(int i=0;i<TCP_MAX_CONNS;i++){
+        tcp_conn_t *c=&tcp_conns[i];
+        if(c->used&&!c->accepted&&c->lport==port&&
+           (c->state==TCP_SYN_RECEIVED||c->state==TCP_ESTABLISHED))n++;
+    }
+    return n;
+}
+static void tcp_drop_pending(uint16_t port){
+    for(int i=0;i<TCP_MAX_CONNS;i++){
+        tcp_conn_t *c=&tcp_conns[i];
+        if(c->used&&!c->accepted&&c->lport==port&&
+           (c->state==TCP_SYN_RECEIVED||c->state==TCP_ESTABLISHED)){
+            c->used=false;c->state=TCP_CLOSED;c->rto_deadline=0;
+            c->persist_deadline=0;c->tw_until=0;
+        }
+    }
+}
 static void tcp_send_rst_ack(uint32_t dst_ip,uint16_t src_port,uint16_t dst_port,uint32_t seq,uint8_t in_flags,uint32_t dlen){
     uint8_t dmac[6];if(!arp_resolve(dst_ip,dmac))return;
     uint8_t *seg=begin_ip(dst_ip,IP_PROTO_TCP,dmac);if(!seg)return;
@@ -581,7 +620,7 @@ void tcp_close(socket_t *s);
 
 socket_t *tcp_listen(uint16_t port){
     tcp_conn_t *c=tcp_conn_find_free();if(!c)return NULL;
-    c->used=true;c->state=TCP_LISTEN;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;
+    c->used=true;c->state=TCP_LISTEN;c->backlog=TCP_MAX_CONNS;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;
     c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
     tcp_tx_reset(c);
     tcp_cc_init(c);
@@ -606,6 +645,11 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     if(!c){
         tcp_conn_t *l=tcp_conn_find_listen(dport);
         if((flags&TCP_FLAG_SYN)&&l){
+            if(tcp_pending_count(dport)>=l->backlog){
+                kputs("[NET] TCP accept queue full, RST\n");
+                tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);
+                return;
+            }
             c=tcp_conn_find_free();
             if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);return;}
             c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
@@ -843,7 +887,10 @@ int tcp_send(socket_t *s,const uint8_t *data,uint32_t len){
 int tcp_recv(socket_t *s,uint8_t *buf,uint32_t max_len){
     if(!s||s->type!=SOCK_TCP_ESTAB)return -1;
     tcp_conn_t *c=s->tcp.conn;if(!c)return -1;
-    if(c->rxn==0)return -1;
+    if(c->rxn==0){
+        if(c->state==TCP_CLOSE_WAIT||c->state==TCP_LAST_ACK||c->state==TCP_TIME_WAIT)return 0;
+        return -1;
+    }
     uint32_t n=c->rxn;if(n>max_len)n=max_len;
     memcpy_u(buf,c->rxb,n);
     if(c->rxn>n)memcpy_u(c->rxb,c->rxb+n,c->rxn-n);

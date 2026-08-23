@@ -113,6 +113,8 @@ void tcp_close(socket_t *s);
 socket_t *net_socket_open(uint32_t type);
 int net_socket_bind(socket_t *s,uint16_t port);
 socket_t *tcp_accept_socket(socket_t *s);
+int tcp_set_backlog(socket_t *s, uint32_t backlog);
+void tcp_abort_socket(socket_t *s);
 int net_socket_close(socket_t *s);
 
 /* Convenience */
