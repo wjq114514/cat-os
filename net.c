@@ -366,7 +366,23 @@ static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn)
     while(n){uint8_t kind=opt[0];if(kind==0)break;if(kind==1){opt++;n--;continue;}if(n<2||opt[1]<2||opt[1]>n)break;
         uint8_t olen=opt[1];
         if(kind==4&&olen==2&&syn)c->sack_ok=true;
-        if(kind==5&&!syn&&c->sack_ok&&olen>=10&&((olen-2u)&7u)==0){uint32_t count=(olen-2u)/8u;c->sack_n=0;for(uint32_t i=0;i<count&&c->sack_n<2;i++){uint32_t l,r;memcpy_u(&l,opt+2+i*8,4);memcpy_u(&r,opt+6+i*8,4);l=ntoh32(l);r=ntoh32(r);if(tcp_seq_before(l,r)&&!tcp_seq_before(l,c->snd_una)&&!tcp_seq_after(r,c->snd_nxt)){c->sack_left[c->sack_n]=l;c->sack_right[c->sack_n++]=r;}}}
+        if(kind==5&&!syn&&c->sack_ok&&olen>=10&&((olen-2u)&7u)==0){
+            /* RFC 2018 §3 块布局；RFC 6675 §6.2：校验并裁剪到本端发送窗口。 */
+            uint32_t count=(olen-2u)/8u;
+            c->sack_n=0;
+            for(uint32_t i=0;i<count&&c->sack_n<2;i++){
+                uint32_t l,r;bool dup=false;
+                memcpy_u(&l,opt+2+i*8,4);memcpy_u(&r,opt+6+i*8,4);
+                l=ntoh32(l);r=ntoh32(r);
+                if(!tcp_seq_before(l,r))continue;             /* 逆序/空块 */
+                if(tcp_seq_after(r,c->snd_nxt))continue;      /* 越过发送前沿 */
+                if(tcp_seq_before(r,c->snd_una))continue;     /* 完全过期(DSACK 区间) */
+                if(tcp_seq_before(l,c->snd_una))l=c->snd_una; /* 前缘裁剪到 snd_una */
+                for(uint32_t j=0;j<c->sack_n;j++)if(c->sack_left[j]==l&&c->sack_right[j]==r){dup=true;break;}
+                if(dup)continue;                              /* 同一报文内重复块不重复登记 */
+                c->sack_left[c->sack_n]=l;c->sack_right[c->sack_n++]=r;
+            }
+        }
         opt+=olen;n-=olen;
     }
 }
@@ -378,7 +394,32 @@ static uint32_t tcp_build_opts(tcp_conn_t *c,uint8_t *o,uint8_t flags){
     while(n&3){o[n++]=1;}return n;
 }
 static void tcp_rx_append(tcp_conn_t *c,const uint8_t *data,uint32_t len){if(c->rxn+len<=TCP_BUF_SIZE){memcpy_u(c->rxb+c->rxn,data,len);c->rxn+=len;}}
-static void tcp_merge_ooo(tcp_conn_t *c){bool again;do{again=false;for(int i=0;i<4;i++)if(c->ooo[i].used&&c->ooo[i].seq==c->rcv_nxt){tcp_rx_append(c,c->ooo[i].data,c->ooo[i].len);c->rcv_nxt+=c->ooo[i].len;c->ooo_bytes-=c->ooo[i].len;c->ooo[i].used=false;again=true;}}while(again);}
+static void tcp_merge_ooo(tcp_conn_t *c){
+    /* 接收侧 OOO 队列整理（对照 Linux tcp_ofo_queue/tcp_data_queue 的 prune）：
+       丢弃完全过期段、裁剪跨越 rcv_nxt 的部分重叠段，再级联交付。 */
+    bool again;
+    do{
+        again=false;
+        for(int i=0;i<4;i++){
+            uint32_t end;
+            if(!c->ooo[i].used)continue;
+            end=c->ooo[i].seq+c->ooo[i].len;
+            if(!tcp_seq_after(end,c->rcv_nxt)){ /* 过期段：整体丢弃，防槽位泄漏 */
+                c->ooo_bytes-=c->ooo[i].len;c->ooo[i].used=false;again=true;continue;
+            }
+            if(tcp_seq_before(c->ooo[i].seq,c->rcv_nxt)){ /* 部分重叠：裁掉已确认前缘 */
+                uint32_t trim=c->rcv_nxt-c->ooo[i].seq;
+                memcpy_u(c->ooo[i].data,c->ooo[i].data+trim,(uint32_t)c->ooo[i].len-trim);
+                c->ooo_bytes-=trim;c->ooo[i].seq=c->rcv_nxt;c->ooo[i].len=(uint16_t)(end-c->rcv_nxt);
+                again=true;
+            }
+            if(c->ooo[i].seq!=c->rcv_nxt)continue;          /* 前方仍有空洞 */
+            if(c->rxn+c->ooo[i].len>TCP_BUF_SIZE)continue;  /* 接收缓冲满：留在缓存等应用读走 */
+            tcp_rx_append(c,c->ooo[i].data,c->ooo[i].len);
+            c->rcv_nxt+=c->ooo[i].len;c->ooo_bytes-=c->ooo[i].len;c->ooo[i].used=false;again=true;
+        }
+    }while(again);
+}
 static bool tcp_queue_ooo(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_t len){
     uint32_t end=seq+len;if(len==0||len>TCP_MSS||c->ooo_bytes+len>TCP_BUF_SIZE)return false;
     if(!tcp_seq_after(end,c->rcv_nxt))return false;
@@ -388,8 +429,10 @@ static bool tcp_queue_ooo(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_
     return false;
 }
 static bool tcp_accept_data(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_t len){
-    if(seq==c->rcv_nxt&&len<=TCP_MSS&&c->rxn+len<=TCP_BUF_SIZE){tcp_rx_append(c,data,len);c->rcv_nxt+=len;tcp_merge_ooo(c);return true;}
-    if(tcp_seq_after(seq,c->rcv_nxt))return tcp_queue_ooo(c,seq,data,len);
+    /* 非按序（过期/重复/部分重叠）统一交给 OOO 队列裁决：
+       过期与重叠被拒后由调用方重发当前 rcv_nxt 的 ACK；跨界段裁剪前缘后缓存。 */
+    if(seq!=c->rcv_nxt)return tcp_queue_ooo(c,seq,data,len);
+    if(len<=TCP_MSS&&c->rxn+len<=TCP_BUF_SIZE){tcp_rx_append(c,data,len);c->rcv_nxt+=len;tcp_merge_ooo(c);return true;}
     return false;
 }
 
@@ -398,7 +441,17 @@ static void tcp_tx_reset(tcp_conn_t *c){
     c->tx_n=0;
 }
 static void tcp_tx_add(tcp_conn_t *c,uint32_t seq,uint32_t len){
-    if(!len||len>TCP_MSS||c->tx_n>=TCP_TX_SEG_MAX)return;
+    if(!len||len>TCP_MSS)return;
+    /* 记分板上限截断（对照 Linux 无上限 retransmit 队列的降级方案）：
+       满时把新段并入尾项而不是丢弃 —— 否则溢出区间脱离跟踪，对端 SACK
+       无法映射到任何条目，选择性重传对该区域永久失效，只能退化到
+       RTO go-back-N（RFC 6675 §4：未确认区间须保持 SACK 可映射）。 */
+    if(c->tx_n>=TCP_TX_SEG_MAX){
+        if(seq==(uint32_t)(c->tx[TCP_TX_SEG_MAX-1].seq+c->tx[TCP_TX_SEG_MAX-1].len)
+           &&(uint32_t)c->tx[TCP_TX_SEG_MAX-1].len+len<=TCP_BUF_SIZE)
+            c->tx[TCP_TX_SEG_MAX-1].len=(uint16_t)(c->tx[TCP_TX_SEG_MAX-1].len+len);
+        return;
+    }
     c->tx[c->tx_n].seq=seq;c->tx[c->tx_n].len=(uint16_t)len;
     c->tx[c->tx_n].used=true;c->tx[c->tx_n].sacked=false;
     c->tx[c->tx_n].lost=false;c->tx[c->tx_n].retransmitted=false;c->tx_n++;
@@ -423,13 +476,20 @@ static void tcp_tx_sack(tcp_conn_t *c){
     uint32_t high=c->snd_una;
     for(uint32_t b=0;b<c->sack_n;b++)if(tcp_seq_after(c->sack_right[b],high))high=c->sack_right[b];
     for(uint32_t i=0;i<c->tx_n;i++){
-        uint32_t end;
+        uint32_t end;bool covered=false;
         if(!c->tx[i].used)continue;
         end=c->tx[i].seq+c->tx[i].len;
+        /* 每包重新裁定 sacked/lost（RFC 6675 §4 以当前 SACK 集为准；对照 Linux
+           tcp_sacktag_walk 同步重算）：对端 renege 撤销先前 SACK 时旧标记不得残留，
+           否则被撤销的段将永远不被选择性重传。 */
         for(uint32_t b=0;b<c->sack_n;b++)
             if(!tcp_seq_before(c->tx[i].seq,c->sack_left[b])&&
-               !tcp_seq_after(end,c->sack_right[b])){c->tx[i].sacked=true;c->tx[i].lost=false;break;}
-        if(!c->tx[i].sacked&&tcp_seq_before(end,high))c->tx[i].lost=true;
+               !tcp_seq_after(end,c->sack_right[b])){covered=true;break;}
+        c->tx[i].sacked=covered;
+        /* RFC 6675: any un-SACKed byte below HighAck => lost. Testing only the entry END
+           missed prefix holes whose end == HighAck (head of entry unacked, tail SACKed),
+           delaying recovery to RTO instead of selective retransmit. */
+        c->tx[i].lost=!covered&&tcp_seq_before(c->tx[i].seq,high);
     }
 }
 static bool tcp_tx_retransmit_lost(tcp_conn_t *c){
@@ -812,10 +872,20 @@ static void tcp_tick(void){
         if(c->state==TCP_TIME_WAIT){if(c->tw_until&&(int32_t)(ticks-c->tw_until)>=0){c->used=false;c->state=TCP_CLOSED;kputs("[NET] TCP TIME_WAIT expired\n");}continue;}
         if(c->state==TCP_ESTABLISHED&&c->lport==81){
             socket_t ts={SOCK_TCP_ESTAB,{.tcp={c}}};
-            static const uint8_t test_data[]="TCP-RTO-REAL";
             if(!c->test_sent){
-                int n=tcp_send(&ts,test_data,sizeof(test_data)-1);
-                if(n==(int)(sizeof(test_data)-1)){c->test_sent=true;kputs("[NET] TCP test send 12B\n");}
+                /* SACK 边界测试入口：一次排队 16x90B=1440B，16 段 > scoreboard
+                   上限 TCP_TX_SEG_MAX(8)，可触发上限截断/ACK 回收/双缺口路径。 */
+                uint8_t buf[90];
+                int ok=0,k,j;
+                for(k=0;k<16;k++){
+                    int n;
+                    for(j=0;j<(int)sizeof(buf);j++)buf[j]=(uint8_t)('A'+(k*(int)sizeof(buf)+j)%26);
+                    n=tcp_send(&ts,buf,sizeof(buf));
+                    if(n!=(int)sizeof(buf))break;
+                    ok++;
+                }
+                c->test_sent=true;
+                kputs("[NET] TCP test send ");kput_dec(ok);kputs("x90B\n");
             }else if(!c->test_closed&&c->snd_used==0&&c->snd_nxt==c->snd_una){
                 tcp_close(&ts);c->test_closed=true;kputs("[NET] TCP test close requested\n");
             }
