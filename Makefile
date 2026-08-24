@@ -11,7 +11,7 @@ LDFLAGS = -m elf_i386 -T linker.ld -nostdlib
 QEMUFLAGS = -cdrom os.iso -m 128M -display none -serial stdio -no-reboot -no-shutdown \
             -netdev user,id=net0 -device e1000,netdev=net0
 
-OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o ide.o rtc.o usermode.o vfs.o net.o
+OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o kbdwait.o ide.o rtc.o usermode.o vfs.o net.o
 
 all: os.iso
 

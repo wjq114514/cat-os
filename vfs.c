@@ -1,12 +1,13 @@
 #include "vfs.h"
 #include "kernel.h"
 #include "keyboard.h"
+#include "kbdwait.h"
 #include "paging.h"
 #include <stdint.h>
 static file_t *fds[VFS_MAX_FD]; static uint32_t rnd=0x12345678;
 static int nullread(struct file*f,void*b,uint32_t n){(void)f;(void)b;(void)n;return 0;} static int nullwrite(struct file*f,const void*b,uint32_t n){(void)f;(void)b;return (int)n;}
 static int conwrite(struct file*f,const void*b,uint32_t n){(void)f;const char*p=b;for(uint32_t i=0;i<n;i++){char c=p[i];if(c) {char s[2]={c,0};kputs(s);}}return n;}
-static int kread(struct file*f,void*b,uint32_t n){(void)f;uint8_t*p=b;uint32_t i=0;while(i<n){int c=keyboard_getchar();if(c<0)break;p[i++]=(uint8_t)c;}return (int)i;}
+static int kread(struct file*f,void*b,uint32_t n){(void)f;uint8_t*p=b;uint32_t i=0;if(!n)return 0;int c=keyboard_getchar_blocking(KBD_BLOCK_TIMEOUT_MS);if(c<0)return 0;p[i++]=(uint8_t)c;while(i<n){c=keyboard_getchar();if(c<0)break;p[i++]=(uint8_t)c;}return (int)i;}
 static int zread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++)((uint8_t*)b)[i]=0;return n;} static int urread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++){rnd=rnd*1664525u+1013904223u;((uint8_t*)b)[i]=(uint8_t)(rnd>>24);}return n;}
 static const file_ops_t noops={nullread,nullwrite,0},conops={0,conwrite,0},kop={kread,0,0},zops={zread,0,0},uops={urread,0,0};
 static inode_t nodes[]={{VFS_CHR,0,"/dev/null",&noops,0},{VFS_CHR,0,"/dev/console",&conops,0},{VFS_CHR,0,"/dev/kbd",&kop,0},{VFS_CHR,0,"/dev/zero",&zops,0},{VFS_CHR,0,"/dev/urandom",&uops,0}};
