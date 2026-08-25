@@ -338,6 +338,7 @@ typedef struct tcp_conn {
     uint8_t tx_n;
     uint32_t rto_deadline;       /* 重传截止时刻(ticks) */
     uint8_t  rto_backoff;        /* 退避指数 0/1/2/... */
+    uint8_t  rto_attempts;       /* M1: 同段连续重传计数(R1/R2 度量)，RFC 9293 §3.8.3(a) */
     uint32_t rto_ticks;          /* 动态 RTO，100Hz ticks */
     uint32_t rtt_stamp;          /* 首个未重传数据段发送时刻 */
     uint32_t rtt_seq;            /* 该采样段的结束序号 */
@@ -515,16 +516,20 @@ int net_socket_bind(socket_t *s,uint16_t port){
         u->bound=true;u->lport=port;u->head=u->n=0;s->type=SOCK_UDP;s->udp.lport=port;return 0;
     }
     if(s->type==SOCK_TCP_UNBOUND){
-        tcp_conn_t *c=tcp_conn_find_listen(port);
-        if(!c){
-            c=s->tcp.conn;c->state=TCP_LISTEN;c->backlog=1;c->lport=port;c->peer_ip=0;c->peer_port=0;
-            c->accepted=false;c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;
-            c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
-            tcp_tx_reset(c);
-            tcp_cc_init(c);
-        }else{
-            s->tcp.conn->used=false;
-        }
+        /* H2/EADDRINUSE：端口已被其他 LISTEN 占用时必须拒绝绑定(-98)。
+           旧实现把自身 conn 标记 unused 后静默附着到既有 LISTEN conn，
+           产生"两个 socket → 同一 TCB"的悬垂共享：任一方 close 都会作废
+           另一方的 conn 指针（use-after-free 形态）。
+           参照同函数 SOCK_UDP_UNBOUND 分支的 udp_sock_by_port() 占用检查；
+           语义依据：RFC 9293 §3.10.7.2 LISTEN 态假定每本地端口一个被动
+           打开的 TCB；错误码遵循 POSIX bind(2) EADDRINUSE。 */
+        if(tcp_conn_find_listen(port))return -98;
+        tcp_conn_t *c=s->tcp.conn;
+        c->state=TCP_LISTEN;c->backlog=1;c->lport=port;c->peer_ip=0;c->peer_port=0;
+        c->accepted=false;c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;
+        c->rto_deadline=0;c->rto_backoff=0;c->rto_attempts=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
+        tcp_tx_reset(c);
+        tcp_cc_init(c);
         s->type=SOCK_TCP_LISTEN;s->tcp.conn=c;return 0;
     }
     return -22;
@@ -574,15 +579,23 @@ int net_socket_close(socket_t *s){
 
 #define TCP_RTO_INIT   30u   /* 300ms @100Hz, preserved minimum for this PIT */
 #define TCP_RTO_MAX    240u  /* 2.4s, existing stack bound */
+/* M1: R2 放弃阈值 —— RFC 9293 §3.8.3(c)「When the number of transmissions of
+   the same segment reaches a threshold R2 greater than R1, close the
+   connection」(MUST-20，继承 RFC 1122 §4.2.3.5 的 R1/R2 模型)。
+   SYN-ACK 是连接建立的唯一赌注(RFC 9293 §3.8.1)，取更紧的 3 次；
+   数据/FIN 重传取 5 次。达到阈值后释放连接槽位，不再无限退避重发。 */
+#define TCP_RTO_RETRY_SYNRCVD 3u
+#define TCP_RTO_RETRY_DATA    5u
 static void tcp_persist_arm(tcp_conn_t *c){if(!c->persist_deadline)c->persist_deadline=ticks+TCP_RTO_INIT;}
 static void tcp_persist_clear(tcp_conn_t *c){c->persist_deadline=0;c->persist_backoff=0;}
 static void tcp_persist_retry(tcp_conn_t *c){if(c->persist_backoff<6)c->persist_backoff++;uint32_t d=TCP_RTO_INIT<<c->persist_backoff;if(d>TCP_RTO_MAX)d=TCP_RTO_MAX;c->persist_deadline=ticks+d;}
 static uint32_t rto_base(tcp_conn_t *c){uint32_t r=c->rto_ticks?c->rto_ticks:TCP_RTO_INIT;return r<TCP_RTO_INIT?TCP_RTO_INIT:r>TCP_RTO_MAX?TCP_RTO_MAX:r;}
 static uint32_t rto_now(tcp_conn_t *c){uint32_t r=rto_base(c)<<c->rto_backoff;return r>TCP_RTO_MAX?TCP_RTO_MAX:r;}
-static void tcp_rto_arm(tcp_conn_t *c){c->rto_deadline=ticks+rto_now(c);c->rto_backoff=0;}
+static void tcp_rto_arm(tcp_conn_t *c){c->rto_deadline=ticks+rto_now(c);c->rto_backoff=0;c->rto_attempts=0;}
 static void tcp_rto_rearm(tcp_conn_t *c){c->rto_deadline=ticks+rto_now(c);}
 static void tcp_rto_retry(tcp_conn_t *c){
     if(c->rto_backoff<6)c->rto_backoff++;
+    c->rto_attempts++;               /* M1: 记入 R2 计数，见 TCP_RTO_RETRY_* 与 RFC 9293 §3.8.3(a) */
     c->rto_deadline=ticks+rto_now(c);
 }
 static void tcp_cc_init(tcp_conn_t *c){
@@ -702,6 +715,26 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
 
     /* 0. 找既有连接；没有则看 listen */
     tcp_conn_t *c=tcp_conn_find_peer(src_ip,sport);
+    /* 0.1 旧化身回收（tcp80 二次连接超时根因）：同一 4 元组上残留于关闭中/
+       关闭后状态(FIN_WAIT_1, FIN_WAIT_2, CLOSING, LAST_ACK, CLOSE_WAIT,
+       TIME_WAIT) 的旧 TCB 会遮蔽监听者 —— 新 SYN 落到旧 TCB 后既无 SYN 分支
+       也无响应，客户端只能干等超时。收到纯 SYN(无 ACK)时按"TIME-WAIT 化身替换"
+       语义回收旧槽位，让下方 LISTEN 分支重建全新连接。
+       依据：RFC 9293 §3.10.7.4 第四步要求对同步态上的裸 SYN 至少回应
+       <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>（旧代码连回包都没有，违反
+       "MUST respond"精神）；进一步采用 RFC 1337 讨论过、Linux
+       tcp_minisocks.c tcp_timewait_state_process() 同款的化身替换策略，
+       以满足本阶段"端口复用/多连接 accept"目标。 */
+    if(c&&(flags&TCP_FLAG_SYN)&&!(flags&TCP_FLAG_ACK)&&
+       (c->state==TCP_TIME_WAIT||c->state==TCP_LAST_ACK||c->state==TCP_CLOSE_WAIT||
+        c->state==TCP_CLOSING||c->state==TCP_FIN_WAIT_1||c->state==TCP_FIN_WAIT_2)){
+        kputs("[NET] TCP stale conn (");kput_dec(c->state);
+        kputs(") recycled for new SYN\n");
+        c->used=false;c->state=TCP_CLOSED;c->rto_deadline=0;
+        c->persist_deadline=0;c->tw_until=0;
+        c=NULL;   /* 注意：若应用仍持有该 conn 的 ESTAB 句柄，后续调用由
+                     state!=ESTABLISHED 守卫拒绝（与 RST/close 路径既有语义一致） */
+    }
     if(!c){
         tcp_conn_t *l=tcp_conn_find_listen(dport);
         if((flags&TCP_FLAG_SYN)&&l){
@@ -726,16 +759,14 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             return;
         }
         kputs("[NET] TCP :");kput_dec(dport);kputs(" no listener, RST\n");
-        uint8_t dmac[6];if(arp_resolve(src_ip,dmac)){
-            uint8_t *seg2=begin_ip(src_ip,IP_PROTO_TCP,dmac);if(seg2){
-                tcp_hdr_t *t=(tcp_hdr_t*)seg2;
-                t->src_port=hton16(dport);t->dst_port=hton16(sport);
-                t->seq=hton32(seq+dlen);t->ack_seq=0;
-                t->off_res=0x50;t->flags=TCP_FLAG_RST;t->window=0;t->csum=0;t->urgent=0;
-                t->csum=hton16(ip_checksum_pseudo(g_ip,src_ip,IP_PROTO_TCP,20,seg2,20));
-                end_ip(seg2,20,IP_PROTO_TCP);
-            }
-        }
+        /* RST:no_listener —— 复用 tcp_send_rst_ack（与 backlog 满/表满路径同源）。
+           旧实现手搓裸 RST(无 ACK 标志,ack_seq=0,seq=对端SYN序号)，违反
+           RFC 9293 §3.10.7.4 step4：对无 ACK 的 SYN 应回
+           <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>。
+           BSD 派生栈（含 QEMU slirp）在 SYN_SENT 态要求 RST 带 ACK 才接受，
+           裸 RST 被静默丢弃 -> slirp 停留 SYN_SENT 重发 SYN -> 宿主侧超时，
+           hostfwd 回不来 RST/EOF（blackbox rst:no_listener FAIL 根因）。 */
+        tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);
         return;
     }
 
@@ -745,14 +776,36 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);tcp_rto_arm(c);return;
     }
 
-    /* 1. 记录对端窗口 */
+    /* 1. RST 处理 —— 必须先于 ACK/数据处理（RFC 9293 §3.10.7.4 事件顺序）。
+       M3 盲收防御，RFC 5961 §3.2.1 / RFC 9293 §3.10.7.4 第二步三检查
+       （原文逐条对应，本栈无 SYN-SENT 态故略去其分支）：
+         (1) RST 且 SEG.SEQ 在接收窗口外          → 静默丢弃；
+         (2) RST 且 SEG.SEQ == RCV.NXT            → MUST 执行复位；
+         (3) RST 窗口内但 != RCV.NXT              → 回 challenge-ACK
+               <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> 后丢弃该段；
+       旧实现无条件接受任意序号的 RST，可被盲注第三方一键拆除连接。 */
+    if(flags&TCP_FLAG_RST){
+        uint32_t rcv_win=(uint32_t)(TCP_BUF_SIZE-c->rxn);
+        if(seq!=c->rcv_nxt&&tcp_seq_after(seq,c->rcv_nxt)&&tcp_seq_before(seq,(uint32_t)(c->rcv_nxt+rcv_win))){
+            kputs("[NET] TCP blind-RST rejected, challenge ACK\n");
+            tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+            return;
+        }
+        if(seq==c->rcv_nxt){kputs("[NET] TCP RST(valid seq) -> CLOSED\n");}
+        else{kputs("[NET] TCP RST out-of-window dropped\n");return;}
+        c->used=false;c->state=TCP_CLOSED;
+        c->rto_deadline=0;c->persist_deadline=0;c->tw_until=0;
+        return;
+    }
+
+    /* 2. 记录对端窗口 */
     uint16_t old_win=c->peer_win;
     c->peer_win=ntoh16(h->window);
     if(c->peer_win)tcp_persist_clear(c);
     c->sack_n=0;
     tcp_parse_opts(c,seg+20,hlen-20,false);
 
-    /* 2. 通用 ACK 处理：推进 snd_una，回收发送缓冲（Linux tcp_ack） */
+    /* 3. 通用 ACK 处理：推进 snd_una，回收发送缓冲（Linux tcp_ack） */
     if(flags&TCP_FLAG_ACK){
         uint32_t old_una=c->snd_una,in_flight=c->snd_nxt-c->snd_una;
         bool sack_retx=false;
@@ -786,7 +839,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
                 else {uint32_t inc=(TCP_MSS*acked)/(c->cwnd?c->cwnd:TCP_MSS);c->cwnd+=inc?inc:1;}
             }
             if(c->fast_recovery&&ack>=c->recover_seq){c->cwnd=c->ssthresh;c->fast_recovery=false;}
-            c->dupacks=0;c->rto_backoff=0;
+            c->dupacks=0;c->rto_backoff=0;c->rto_attempts=0; /* 进度事件：R2 计数按段重置(RFC 9293 §3.8.3(a)) */
             kputs("[NET] TCP ack=");kput_dec(ack);kputs(" una=");kput_dec(c->snd_una);kputs(" sndb=");kput_dec(c->snd_used);kputs(" cwnd=");kput_dec(c->cwnd);kputs("\n");
             if(!c->sack_n||!tcp_tx_retransmit_lost(c))tcp_xmit_pending(c);
             if(c->snd_nxt==c->snd_una)c->rto_deadline=0;
@@ -796,15 +849,18 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         }
     }
 
-    /* 3. RST 处理 */
-    if(flags&TCP_FLAG_RST){kputs("[NET] TCP RST -> CLOSED\n");c->used=false;c->state=TCP_CLOSED;return;}
-
     /* 4. 按状态机推进 */
     switch(c->state){
     case TCP_SYN_RECEIVED:
         if((flags&TCP_FLAG_ACK)&&ack==c->snd_nxt){
             c->state=TCP_ESTABLISHED;
             c->rto_deadline=0;
+            /* R2 计数按"同一段"语义重置（RFC 9293 §3.8.3(a)）：SYN-ACK 段被
+               确认后其重传计数不得泄漏到数据段——否则 SYN 阶段若重传过
+               SYN-ACK，DATA 阶段可用的 R2 额度会被预先吃掉（L3B 实测：SYN
+               阶段 1 次 + DATA 阶段 4 次即触发 give-up，实际只重传 4 次）。 */
+            c->rto_attempts=0;
+            c->rto_backoff=0;
             kputs("[NET] TCP ESTABLISHED ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs("\n");
         }
         if(dlen){tcp_accept_data(c,seq,data,dlen);tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);}
@@ -899,6 +955,15 @@ static void tcp_tick(void){
             }
         }
         if(c->rto_deadline&&(int32_t)(ticks-c->rto_deadline)>=0){
+            /* M1：重传放弃 —— 同段连续重传超过 R2 阈值时释放连接槽位
+               RFC 9293 §3.8.3(c) MUST-20，RFC 1122 §4.2.3.5 R1/R2 模型 */
+            uint8_t r2=(c->state==TCP_SYN_RECEIVED)?TCP_RTO_RETRY_SYNRCVD:TCP_RTO_RETRY_DATA;
+            if(c->rto_attempts>=r2){
+                kputs("[NET] TCP RTO give-up (attempts=");kput_dec(c->rto_attempts);
+                kputs(" >= R2=");kput_dec(r2);kputs("), releasing conn\n");
+                c->used=false;c->state=TCP_CLOSED;c->rto_deadline=0;c->persist_deadline=0;c->tw_until=0;
+                continue;
+            }
             if(c->state==TCP_SYN_RECEIVED){
                 kputs("[NET] TCP RTO: re-SYN-ACK\n");
                 tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);
@@ -1011,8 +1076,11 @@ void net_init(void){
     kputs("[NET] up ip=");net_ip_print(g_ip);kputs(" gw=");net_ip_print(g_gw);kputs(" mask=");net_ip_print(g_mask);kputs("\n");
     /* 探测网关 MAC（无回应也不阻塞，收包路径会自行补缓存） */
     dhcp_xid=0x12340000u^ip_id;dhcp_retries=0;dhcp_wait=2;dhcp_state=DHCP_DISCOVER;dhcp_send(1);dhcp_last=ticks;dhcp_state=DHCP_WAIT_OFFER;
-    /* 演示服务: TCP :80 监听 + UDP :7 echo; TCP :81 is acceptance-only. */
-    tcp_listen(80);
+    /* 演示服务: UDP :7 echo; TCP :81 is acceptance-only.
+       TCP :80 由 ring3 ext_socktest 绑定服务（blackbox 契约）：
+       H2/EADDRINUSE 加固后内核演示监听会令 ring3 bind(:80) 恒返 -98，
+       旧「静默附着」路径已删除，故内核不再占用 :80。 */
+    /* tcp_listen(80); */
     tcp_listen(81);
     udp_open(7);
 }
