@@ -813,12 +813,19 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             }
             c=tcp_conn_find_free();
             if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);return;}
-            c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
+            /* 对端四元组必须最先落位：used=true 到 peer_ip/peer_port 赋值之间存在
+               中断嵌套窗口 —— 若此间 ISR 处理同四元组的重复 SYN（线上重复帧），
+               tcp_conn_find_peer() 匹配不到半初始化 TCB(peer 仍为 0) → 落入监听
+               分支再建一个同四元组 SYN_RCVD 僵尸，此后以其陈旧 rcv_nxt 回 ACK
+               污染数据流（sack_t8 expired-after-wrap ack=[4,base,4] 根因）。
+               RFC 9293 §3.10.7.1：SYN_RECEIVED 上的重复 SYN 只应重发 SYN-ACK。 */
+            c->used=true;c->state=TCP_SYN_RECEIVED;
+            c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
+            c->accepted=false;c->rxn=0;c->snd_used=0;
             tcp_tx_reset(c);
             c->test_sent=false;c->test_closed=false;c->persist_deadline=0;c->persist_backoff=0;c->dead=false;
             tcp_cc_init(c);
             tcp_parse_opts(c,seg+20,hlen-20,true);
-            c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
             c->rcv_isn=seq;c->rcv_nxt=seq+1;
             c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;c->snd_una=c->snd_nxt;
             kputs("[NET] TCP SYN :");kput_dec(dport);kputs(" <- ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs(" -> SYN-ACK\n");
