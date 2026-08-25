@@ -132,8 +132,15 @@ class Wire(object):
                               GUEST_MAC, tpa_req, f[6:12], spa_req)
             self.put(f[6:12] + GUEST_MAC + struct.pack("!H", 0x806) + rep)
 
-    def collect(self, seconds, dp=None):
-        """收集 seconds 秒内的 TCP 段，返回 dict 列表（padding-aware）。"""
+    def collect(self, seconds, dp=None, dport_to=None):
+        """收集 seconds 秒内的 TCP 段，返回 dict 列表（padding-aware）。
+
+        dport_to：线上目的端口（=我方注入 sport）过滤；None 沿用 self.sport
+        （与旧调用完全兼容）；传 False 不过滤目的端口 —— backlog_probe 类
+        多四元组用例据此在单条 Wire 通道上按 dp 字段自行分桶（QEMU
+        socket-netdev listen 只接受一条客户端连接，无法并发开多条 Wire）。
+        返回 dict 额外携带 sp/dp（guest 源/目的端口）。"""
+        my = self.sport if dport_to is None else dport_to
         out = []
         end = time.time() + seconds
         while time.time() < end:
@@ -148,7 +155,7 @@ class Wire(object):
                 continue
             sp_ = struct.unpack("!H", f[34:36])[0]
             dp_ = struct.unpack("!H", f[36:38])[0]
-            if dp is not None and (sp_ != dp or dp_ != self.sport):
+            if dp is not None and (sp_ != dp or (my is not False and dp_ != my)):
                 continue
             seq, ack = struct.unpack("!II", f[38:46])
             off = (f[46] >> 4) * 4
@@ -176,7 +183,7 @@ class Wire(object):
                     break
                 i += n
             out.append(dict(seq=seq, ack=ack, flags=flags, dlen=len(payload),
-                            data=payload, blocks=blocks))
+                            data=payload, blocks=blocks, sp=sp_, dp=dp_))
         return out
 
     def arp(self):

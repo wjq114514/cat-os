@@ -12,7 +12,7 @@
 |---|---|---|
 | `qemu_run.sh` | 统一 QEMU 启动封装：串口落盘、slirp hostfwd / socket-netdev 双模式、参数化、就绪等待、可选执行测试命令并透传退出码 | 合并自 `qemu_run.sh` + `run_sack_edge.sh` + `ox_run_lifecycle.sh` 三套临时封装；新增 `--mode/--hold/--keep/--boot-timeout`、tag 化残留回收、结构化收尾行 |
 | `net_suite.py` | 测试用例整合：blackbox(hostfwd) 全部阶段 + inject(原始帧注入) 核心子集；保留「命令+退出码+串口原文」断言风格；支持 JSON 报告 | blackbox 移植自 `ext_socktest.py`；inject 取 `sack_edge.py` 核心 t1/t2/t5/t8 与 `ox_lifecycle_edge.py` L1 |
-| `wire_lib.py` | 注入套件共享线缆层：帧构造/校验和/SACK 选项、Wire 类、接收状态机、drain() 泵、coalescing-aware 区间工具 | 合并自 `sack_edge.py`(W) 与 `ox_lifecycle_edge.py`(W2)；collect() 采用 **W2 padding-aware 最终形态**（按 IP 总长裁剪 payload，bare challenge-ACK 不再误判为带数据） |
+| `wire_lib.py` | 注入套件共享线缆层：帧构造/校验和/SACK 选项、Wire 类、接收状态机、drain() 泵、coalescing-aware 区间工具 | 合并自 `sack_edge.py`(W) 与 `ox_lifecycle_edge.py`(W2)；collect() 采用 **W2 padding-aware 最终形态**（按 IP 总长裁剪 payload，bare challenge-ACK 不再误判为带数据）；TW/TB 回填新增 `collect(dport_to=)` 多四元组分桶与返回 dict 的 sp/dp 字段（QEMU socket-netdev 单客户端连接限制下的单通道多连接方案，旧调用完全兼容） |
 | `run_all.sh` | 一键编排：语法门禁 → blackbox → inject（每用例新引导）→ 结构化汇总；harness 故障重试≤3、断言失败永不重试 | 替代 `run_all.sh`；不再做 make/ring3 骨架编译（见下「范围外」） |
 | `README.md` | 本文档 | — |
 
@@ -74,6 +74,13 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
 | `sack_t5` | 双空洞同时持有且 ACK 钉住；补洞 1 后 ACK=b+40 且 G2 区间幸存；补洞 2 后 ACK=b+70 | 多 SACK 块并发管理（SACK 加固组） |
 | `sack_t8` | 序号跨 2^32 顺序交付（ACK==4）；回绕后 OOO/SACK=(0x10,0x1A)；过期段拒绝（有符号比较）；回绕前 dup 拒绝；回绕点重叠排队；级联完成 ACK==0x1A | 32 位序号回绕语义（SACK 加固组，含 harness 侧修正注记） |
 | `rst_l1` | 窗内非精确 RST→challenge-ACK 且连接存活；窗上方/窗下方 RST→静默丢弃；精确 seq RST→复位；关闭后数据遇 RST/no-listener | RST 有效性校验三态（移植自 ox_lifecycle_edge.L1，TCP 安全加固组） |
+| `tw_recycle` | 主动关闭完整路径 FIN_WAIT_2→`TIME_WAIT entered`→`TIME_WAIT expired`（串口顺序断言）→同端口三次握手重建成功且重推 banner | TW1/TW2 回填：TIME_WAIT 到期回收 + 端口复用（TW=200 ticks≈2s@100Hz，net.c:982/1019；整例约 8-12s） |
+| `backlog_probe` | 容量模型 listen(1)+A(1)+14 半开=16 槽占满后，第 16 个四元组的 SYN 被 `RST|ACK ack=ISN+1` 拒绝；串口恰一条 `conn table full, RST` 且零条 `accept queue full`（LISTEN TCB 自身占 1 槽 ⇒ pending 上限 15 < backlog 16，队列满分支 fresh-boot 结构性不可达）；既有 ESTABLISHED 连接数据照常被 ACK | TB1 回填：容量硬断言对照 net.h:67、net.c:364/660-668/765-767/816-822/1206（2026-08-25 修正旧模型漏算 listen 占槽）；SYN 分批注入规避 e1000 8 描述符环溢 |
+| `l3b_race` | banner 突发（16×90B 全量入初始 cwnd）后同拍双 ACK：恰好 1 条 `TCP RTT sample=`、样本 ≥1 且 RTO≥30、安静期零补采 | L3B 回填：RTT 采样竞态单次计样（net.c:755/932-938/641-649），样本钳位为 commit 58d55a9 的回归哨兵；守卫窗前移至 banner 等待之前——窗内任何 `TCP RTO: re-xmit`（Karn 抑制必致零采样，含帧在宿主侧迟到 >300ms 的形态）按 harness 故障 rc=5 重试而非断言失败 |
+
+> 历史注记：TW1/TW2（TIME_WAIT 回收与同端口重建）、TB1（SYN backlog）、L3B（采样竞态）
+> 的原型脚本原居 /tmp 已随清理丢失，2026-08-25 以上述三个用例按现框架范式回填入库；
+> 断言全部对照工作树 net.c/net.h 实际行为书写（来源行号见各用例 docstring）。
 
 ### 尚未接线（NOT_TESTED，归属 ring3/shell 方向任务）
 

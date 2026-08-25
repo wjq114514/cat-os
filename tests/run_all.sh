@@ -18,7 +18,7 @@
 # 环境变量:
 #   CATOS_REPO(默认 /home/wjqawa/osdev) CATOS_ISO(默认 $REPO/os.iso)
 #   CATOS_TEST_OUT(默认 /tmp/catos-tests-run-<时间戳>)
-#   CATOS_INJECT_CASES(默认 "sack_t1 sack_t2 sack_t5 sack_t8 rst_l1")
+#   CATOS_INJECT_CASES(默认 "sack_t1 sack_t2 sack_t5 sack_t8 rst_l1 tw_recycle backlog_probe l3b_race")
 #   其余 qemu_run.sh / net_suite.py 的环境变量均透传生效。
 # ============================================================================
 set -u
@@ -104,7 +104,7 @@ RC_BB=$?
 # ---- [3/4] inject ---------------------------------------------------------------
 say "[3/4] inject 套件 (socket-netdev, 每用例独立引导)"
 # shellcheck disable=SC2206
-INJECT_CASES_LIST=(${CATOS_INJECT_CASES:-sack_t1 sack_t2 sack_t5 sack_t8 rst_l1})
+INJECT_CASES_LIST=(${CATOS_INJECT_CASES:-sack_t1 sack_t2 sack_t5 sack_t8 rst_l1 tw_recycle backlog_probe l3b_race})
 for c in "${INJECT_CASES_LIST[@]}"; do
   S_SERIAL="$OUT/inject_${c}.serial"
   S_JSON="$OUT/inject_${c}.json"

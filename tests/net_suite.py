@@ -763,12 +763,348 @@ def case_rst_l1(S):
         w.close()
 
 
+def case_tw_recycle(S):
+    """TW1/TW2 回填：主动关闭进 TIME_WAIT → 等到期回收 → 同端口重新三次握手成功。
+
+    源码依据（工作树 net.c/net.h）：
+    - net.c:979/982/996  进 TIME_WAIT：tw_until=ticks+200，打印
+      "[NET] TCP TIME_WAIT entered"；
+    - net.c:604  TCP_RTO_INIT=30 注释 "300ms @100Hz" ⇒ ticks=100Hz，
+      200 ticks = 2s（net.c:982 行内注释同口径），故等待上限取 8s 冗余；
+    - net.c:1019 tcp_tick() 到期释放 used=false，打印
+      "[NET] TCP TIME_WAIT expired"；
+    - net.c:796-805 同四元组裸 SYN 触发「化身替换」提前回收 —— 第二次握手必须
+      等 "TIME_WAIT expired" 出现在串口之后才发 SYN，才能覆盖真正的到期回收
+      路径而非替换路径（顺序断言 entered < expired < 第二次 SYN 即证明）。
+    时长注记：TW 固定 2s，整例含两次握手/banner 排空约 8-12s，无需缩短路径。
+    """
+    sp = 31021
+    dp = INJECT_DPORT
+    w = wl.Wire(sp)
+    try:
+        w.arp()
+        gs = w.handshake(dp, 730001)
+        base = (gs + 1) & wl.U32
+
+        # 阶段1：排空内核 banner(16x90B=1440B) 并盯 FIN。:81 服务在全部数据
+        # ACK 后于 tcp_tick 自动 close（net.c:1036-1037 → tcp_close 发 FIN，
+        # net.c:1148-1152 FIN_WAIT_1）。自绘泵而不用 wl.drain：drain 会把
+        # dlen==0 的 FIN 帧吸收掉无从回看，FIN 只能等 RTO re-FIN 再见
+        # （net.c:1070-1073），平白拖慢且污染窗口。
+        fin_seq = None
+        contig = base
+        have = {}
+        end = time.time() + 12
+        while time.time() < end and fin_seq is None:
+            for p in w.collect(0.25, dp=dp):
+                if p["flags"] & wl.FIN:
+                    fin_seq = (p["seq"] + p["dlen"]) & wl.U32
+                if p["dlen"]:
+                    have[p["seq"]] = p["data"]
+            moved = True
+            while moved:
+                moved = False
+                if contig in have:
+                    contig = (contig + len(have.pop(contig))) & wl.U32
+                    moved = True
+            ackv = ((fin_seq + 1) & wl.U32) if fin_seq is not None else contig
+            if w.last_ack != (ackv & wl.U32):
+                w.send_ack(dp, ackv)
+        S.check("banner fully delivered (1440B) then kernel FIN",
+                fin_seq is not None and wl.le((base + 1440) & wl.U32, contig),
+                "fin=%s contig=%s" % (hex(fin_seq or 0), hex(contig)))
+        if fin_seq is None:
+            return
+        S.check("serial: FIN_WAIT_2 after we ACK kernel FIN",
+                wait_serial(S, "TCP FIN_WAIT_2", 5), "")
+
+        # 阶段2：我方主动关闭（FIN_WAIT_2 收到对端 FIN → TIME_WAIT，net.c:973/
+        # 981-982），阶段3：等到期回收（200 ticks ≈ 2s @100Hz）
+        w.put(wl.frame(wl.tcp_seg(sp, dp, w.next_seq, (fin_seq + 1) & wl.U32,
+                                  wl.FIN | wl.ACK)))
+        ok_enter = wait_serial(S, "TCP TIME_WAIT entered", 5)
+        ok_expire = wait_serial(S, "TCP TIME_WAIT expired", 8)
+        try:
+            with open(S.serial, errors="replace") as f:
+                txt = f.read()
+            order_ok = (0 <= txt.find("TCP TIME_WAIT entered")
+                        < txt.find("TCP TIME_WAIT expired"))
+        except OSError:
+            order_ok = False
+        S.check("serial: TIME_WAIT entered (active close)",
+                ok_enter, "")
+        S.check("serial: TIME_WAIT expired within 200-tick budget",
+                ok_expire, "")
+        S.check("serial order: entered < expired (true expiry path)",
+                order_ok, "")
+
+        # 阶段4：回收完成后同端口重建。旧 TCB 已 used=false（net.c:1019），
+        # tcp_conn_find_peer 不中 → 走 LISTEN 分支全新建连（net.c:806-835）。
+        isn2 = 740000
+        w.put(wl.frame(wl.tcp_seg(sp, dp, isn2, 0, wl.SYN, opt=wl.MSS_OPT)))
+        gs2 = None
+        end = time.time() + 4
+        while gs2 is None and time.time() < end:
+            for p in w.collect(0.3, dp=dp):
+                if p["flags"] & wl.SYN and p["flags"] & wl.ACK:
+                    gs2 = p["seq"]
+        S.check("same-port 3WHS succeeds after expiry", gs2 is not None,
+                "synack=%s" % hex(gs2 or 0))
+        if gs2 is None:
+            return
+        w.next_seq = (isn2 + 1) & wl.U32
+        w.put(wl.frame(wl.tcp_seg(sp, dp, w.next_seq, (gs2 + 1) & wl.U32,
+                                  wl.ACK)))
+        # 新连接活性：全新 TCB 的 test_sent 已复位，内核重推 banner
+        # （net.c:1020-1035），收到带载数据即证明双向通路可用
+        got = [p for p in w.collect(3.0, dp=dp) if p["dlen"]]
+        S.check("rebuilt conn carries banner data", bool(got),
+                "%d segs" % len(got))
+        S.check("serial: second ESTABLISHED on same port",
+                wl.log_count(S.serial, "TCP ESTABLISHED ") >= 2, "")
+    finally:
+        w.close()
+
+
+def case_backlog_probe(S):
+    """TB1 回填：连接表容量上限 —— 超额 SYN 被 RST|ACK 拒绝，既有连接不受影响。
+
+    容量模型（commit 36fd594 后对照源码修正；首跑 FAIL 根因 = 旧模型漏算
+    listen TCB 自身占槽，实测第 15 条半开即撞 conn-table-full）。源码依据：
+    - net.h:67  TCP_MAX_CONNS=16（tcp_conns[16]，net.c:364）；
+    - net.c:765-767 tcp_listen(:81) 经 tcp_conn_find_free() 取槽并置
+      used=true ⇒ **监听者本身常驻占 1 槽**（net_init net.c:1206 仅此一个
+      TCP listener）；
+    - net.c:660-668 tcp_pending_count() 只统计端口上 !accepted 的
+      SYN_RECEIVED|ESTABLISHED（LISTEN 态不计）⇒ 新引导下 pending 上限
+      =16-1=15 < backlog=16（net.c:767 c->backlog=TCP_MAX_CONNS），
+      故「accept queue full」分支（net.c:816-819）在 fresh-boot 单监听场景
+      结构性不可达：超额 SYN 必然通过队列检查后在连接表分配处被拒
+      （net.c:821-822 "[NET] TCP conn table full, RST"）。两分支各自打日志
+      后立即 return，对单个 SYN 严格互斥 —— 断言据此翻转：窗口内
+      conn-table-full 恰 1 条、accept-queue-full 为 0；
+    - 净容量模型：listen(1)+A(ESTABLISHED 未 accept)(1)+14 半开=16 槽占满，
+      第 16 个四元组（ovf）的裸 SYN 必被拒；两条拒绝路径回包同源于
+      tcp_send_rst_ack（net.c:818/822 → 684）：对无 ACK 的 SYN 回
+      <SEQ=0><ACK=SEG.SEQ+1><RST|ACK>；
+    - net.c:862-866 同四元组重复 SYN 仅重发 SYN-ACK ⇒ 半开连接须用不同源端口；
+    - net.c:876-889 valid-seq RST 即时释放槽位（清理路径依据），不依赖
+      SYN_RECEIVED 的 RTO 放弃（net.c:1069-1079，~0.9s×3 太慢）；
+    - e1000.c:8 RX/TX 环各仅 8 描述符 ⇒ SYN/RST 按 ≤5 一批注入防环溢丢帧。
+    """
+    dp = INJECT_DPORT
+    n_half = 16 - 2          # TCP_MAX_CONNS(net.h:67) - listen 占1(net.c:765-767) - A 占 1
+    sports = [31031 + i for i in range(n_half)]
+    ovf_sport = 31031 + n_half
+    w = wl.Wire(31030)
+    try:
+        w.arp()
+        # A：基线 ESTABLISHED 连接（占 pending 名额，后续作「不受影响」探针）
+        isn_a = 810000
+        gs_a = w.handshake(dp, isn_a)
+        rcv_nxt_a = (isn_a + 1) & wl.U32          # 内核视角我方下一序号
+
+        def collect_bucket(seconds):
+            bk = {}
+            for p in w.collect(seconds, dp=dp, dport_to=False):
+                bk.setdefault(p["dp"], []).append(p)
+            return bk
+
+        # B1..B15：分批发裸 SYN（不回 ACK），钉在 SYN_RECEIVED
+        half_open = {}
+        ok_synack = 0
+        filled = True
+        for i in range(0, n_half, 5):
+            batch = sports[i:i + 5]
+            for sp_ in batch:
+                isn_ = 820000 + sp_
+                w.put(wl.frame(wl.tcp_seg(sp_, dp, isn_, 0, wl.SYN,
+                                          opt=wl.MSS_OPT)))
+                half_open[sp_] = (isn_ + 1) & wl.U32      # 其 rcv_nxt
+            got = set()
+            end = time.time() + 3
+            while len(got) < len(batch) and time.time() < end:
+                bk = collect_bucket(0.25)
+                for sp_ in batch:
+                    if sp_ in got:
+                        continue
+                    if any((p["flags"] & (wl.SYN | wl.ACK)) == (wl.SYN | wl.ACK)
+                           for p in bk.get(sp_, [])):
+                        got.add(sp_)
+            ok_synack += len(got)
+            if len(got) < len(batch):
+                filled = False
+                break
+        S.check("all %d half-open SYNs served SYN-ACK" % n_half,
+                ok_synack == n_half, "%d/%d" % (ok_synack, n_half))
+
+        if filled:
+            # 超额第 16 个四元组：期望 RST|ACK 且 ack=ISN+1（net.c:684/821-822）
+            o_ovf = lsz(S.serial)
+            isn_x = 830001
+            w.put(wl.frame(wl.tcp_seg(ovf_sport, dp, isn_x, 0, wl.SYN,
+                                      opt=wl.MSS_OPT)))
+            rst_pkts = []
+            end = time.time() + 2.5
+            while not rst_pkts and time.time() < end:
+                bk = collect_bucket(0.25)
+                rst_pkts = [p for p in bk.get(ovf_sport, [])
+                            if p["flags"] & wl.RST]
+            S.check("overflow SYN answered RST|ACK ack=ISN+1",
+                    bool(rst_pkts)
+                    and all(p["flags"] & wl.ACK for p in rst_pkts)
+                    and all(p["ack"] == ((isn_x + 1) & wl.U32)
+                            for p in rst_pkts),
+                    "%s" % [(hex(p["ack"]), hex(p["flags"])) for p in rst_pkts])
+            s_ovf = lslice(S.serial, o_ovf)
+            S.check("serial: 'conn table full' logged exactly once (binding constraint)",
+                    s_ovf.count("TCP conn table full, RST") == 1,
+                    "count=%d" % s_ovf.count("TCP conn table full, RST"))
+            S.check("serial: 'accept queue full' NOT hit (pending 15 < backlog 16, net.c:660-668)",
+                    s_ovf.count("TCP accept queue full, RST") == 0, "")
+
+            # 既有连接不受影响：A 上发数据须被正常 ACK 推进（ESTABLISHED 带载
+            # 路径回纯 ACK，net.c:978-986；进度 ack= 日志行 net.c:948）。ack
+            # 字段顺手清空 A 的 banner 在途（auto-close 即使随后发生也在应答
+            # 之后，不影响本断言）。
+            payload = b"STILL-ALIVE"
+            w.send_data(dp, rcv_nxt_a, payload, (gs_a + 1 + 1440) & wl.U32)
+            want_ack = (rcv_nxt_a + len(payload)) & wl.U32
+            rep = []
+            bk = {}
+            end = time.time() + 2.5
+            while not rep and time.time() < end:
+                bk = collect_bucket(0.25)
+                rep = [p for p in bk.get(w.sport, [])
+                       if (p["flags"] & wl.ACK)
+                       and not (p["flags"] & (wl.SYN | wl.FIN | wl.RST))
+                       and p["ack"] == want_ack]
+            S.check("pre-existing conn A unaffected: data ACKed",
+                    bool(rep), "want_ack=%s recent=%s"
+                    % (hex(want_ack),
+                       [(hex(p["ack"]), hex(p["flags"]))
+                        for p in bk.get(w.sport, [])[-4:]]))
+            rcv_nxt_a = want_ack
+
+        # 清理：精确 seq RST 逐条复位（valid-seq 判据 net.c:876-889），同样
+        # 分批防 RX 环溢。尽力而为（INFO）：inject 用例本就 fresh-boot。
+        # 只遍历实际发出的端口（fill 中断时 half_open 键集即真实集合）。
+        o_cln = lsz(S.serial)
+        targets = list(half_open.items())
+        targets.append((w.sport, rcv_nxt_a))
+        for i in range(0, len(targets), 5):
+            for sp_, nxt in targets[i:i + 5]:
+                w.put(wl.frame(wl.tcp_seg(sp_, dp, nxt, 0, wl.RST)))
+            w.collect(0.3, dp=dp, dport_to=False)
+        n_kill = lslice(S.serial, o_cln).count("RST(valid seq) -> CLOSED")
+        S.note("cleanup", "precise-RST freed %d/%d conns" % (n_kill, len(targets)))
+    finally:
+        w.close()
+
+
+def case_l3b_race(S):
+    """L3B 回填：RTT 采样竞态 —— 同一突发的同拍双 ACK 只计 1 个样本
+    （对应 commit 58d55a9「net: clamp sub-tick RTT samples to 1」的采样面契约）。
+
+    源码依据（commit 36fd594 后重核；首跑 FAIL 根因见文末守卫设计）：
+    - net.c:755 tcp_xmit_pending() 仅在 !rtt_pending 时武装 {rtt_stamp,
+      rtt_seq} ⇒ 同一突发无论几段只有首段武装采样点；
+    - 突发形态：tcp_tick（net.c:1036-1049）循环 16 次 tcp_send 各 90B，
+      tcp_send 每次追加后即调 xmit_pending（net.c:1135），初始
+      cwnd=TCP_MSS=1460（net.c:639）恰好容纳 16×90=1440B ⇒ 突发为 16 个
+      90B 段**全量在飞**（rtt_seq=b+90=首段末）；ACK#1 后 in_flight==
+      snd_used ⇒ 无滑动窗续发（net.c:745 break），ACK#2 即全量排空、
+      net.c:947-951 清 rto_deadline，此后结构性无 RTO。故「缩小突发」无从
+      也无需从线侧做——时序硬化 + 守卫前移才是正解。
+    - net.c:932-938 ACK 推进路径：rtt_pending && ack>=rtt_seq 时采样一次并
+      立即清 pending ⇒ 第二个 ACK（即便同 tick 处理）不可能再产生样本；
+    - net.c:641-649 tcp_rtt_sample() 亚 tick 样本钳 >=1 并打印
+      "[NET] TCP RTT sample=<n> RTO=<r>"（58d55a9 起钳位，此前静默 return →
+      本用例将以样本缺失 FAIL，构成对该 commit 的回归哨兵）；
+      net.c:604 TCP_RTO_INIT=30 ticks = 300ms@100Hz，net.c:648 RTO 下限 30；
+    - net.c:1092-1095 RTO 重传打印 "[NET] TCP RTO: re-xmit <n>B" 且置
+      rtt_retransmitted ⇒ 其后到达的 ACK 被 Karn 抑制（net.c:936-937）零采样。
+    守卫设计（首跑 rc=2 复盘）：旧守卫只扫「首个数据帧之后」的串口窗——若
+    致命 RTO 发生在测试看到首帧之前（帧在宿主侧迟到 >300ms），re-xmit 行落
+    在窗外，0 样本直落断言 FAIL。现把守卫窗起点前移到 banner 等待之前
+    （o_pre）：[o_pre, 双 ACK 收集结束) 内出现任何 "TCP RTO: re-xmit" 即抛
+    Fail 按 harness 故障 rc=5 交 runner 重试，不作断言失败。同时检测粒度
+    50ms→20ms、extent 探测 80ms→40ms，正常路径双 ACK 在 RTO 预算前 1/3 内
+    到线。断言核心保留：同拍双 ACK ⇒ `TCP RTT sample=` 恰 1 条、样本值>=1、
+    RTO>=30、安静期零补采。实测（16×90B 全量在飞形态）双 ACK 均为 progress
+    路径且恰产生 1 条样本——「两条 progress ack= 行」不再作硬断言（突发
+    分段形态属内核自由度），降级为 INFO 记录。
+    """
+    dp = INJECT_DPORT
+    w = wl.Wire(31051)
+    try:
+        w.arp()
+        gs = w.handshake(dp, 851000)
+        o0 = lsz(S.serial)   # 守卫窗起点：早于 banner 等待（docstring 守卫设计）
+        # 等 banner 首段到线：细粒度轮询（20ms），少吃 RTO(300ms) 预算
+        first = None
+        end = time.time() + 5
+        while first is None and time.time() < end:
+            for p in w.collect(0.02, dp=dp):
+                if p["dlen"]:
+                    first = p
+                    break
+        if first is None:
+            raise wl.Fail("no banner segment observed")
+        # 极短窗收集实际突发范围（16×90B 连发，40ms 内到齐）；序号空间
+        # ~0x123400xx 远离回绕，普通比较安全
+        extent_end = (first["seq"] + first["dlen"]) & wl.U32
+        deadline = time.time() + 0.04
+        while time.time() < deadline:
+            for p in w.collect(0.02, dp=dp):
+                if p["dlen"]:
+                    e = (p["seq"] + p["dlen"]) & wl.U32
+                    if e > extent_end:
+                        extent_end = e
+
+        ack1 = (first["seq"] + first["dlen"]) & wl.U32   # == rtt_seq：恰好触达采样点
+        w.send_ack(dp, ack1)                             # ACK#1：采样一次并清 pending
+        w.send_ack(dp, extent_end)                       # ACK#2：同拍第二 ACK，必须零采样
+        w.collect(0.3, dp=dp)
+        s0 = lslice(S.serial, o0)
+        if "TCP RTO: re-xmit" in s0:
+            raise wl.Fail("RTT race window missed (RTO re-xmit within "
+                          "pre-banner..post-ACK guard window)")
+        n_sample = s0.count("TCP RTT sample=")
+        n_ackline = s0.count("TCP ack=")
+        S.check("dual-ACK -> exactly ONE RTT sample", n_sample == 1,
+                "samples=%d ack_lines=%d" % (n_sample, n_ackline))
+        S.note("ack progress lines",
+               "%d 条 progress ack= 行（16×90B 全量在飞形态下 ACK#1/ACK#2 "
+              "均为 progress；分段形态属内核自由度，不作硬断言）" % n_ackline)
+        m = re.search(r"TCP RTT sample=(\d+) RTO=(\d+)", s0)
+        S.check("sample clamped >=1 and RTO floor 30 (58d55a9 / net.c:641-649)",
+                bool(m) and int(m.group(1)) >= 1 and int(m.group(2)) >= 30,
+                m.group(0) if m else "unparsable")
+        # 清理：精确 seq RST 释放 TCB（net.c:876-889），掐断 auto-close FIN
+        # （net.c:1050-1052）的 re-FIN 定时器噪声，保证安静窗真正安静；
+        # 本侧从未发数据 ⇒ kernel rcv_nxt 恒为 gs+1，即 valid-seq
+        w.put(wl.frame(wl.tcp_seg(w.sport, dp, (gs + 1) & wl.U32, 0, wl.RST)))
+        w.collect(0.3, dp=dp)
+        # 安静期零补采：pending 已清且无新发送 ⇒ 不得再冒样本——竞态去重的
+        # 反方向证据（缺陷形态即同窗连计多次）
+        o1 = lsz(S.serial)
+        w.collect(0.6, dp=dp)
+        S.check("quiet window: no extra samples",
+                lslice(S.serial, o1).count("TCP RTT sample=") == 0, "")
+    finally:
+        w.close()
+
+
 INJECT_CASES = {
     "sack_t1": case_sack_t1,
     "sack_t2": case_sack_t2,
     "sack_t5": case_sack_t5,
     "sack_t8": case_sack_t8,
     "rst_l1": case_rst_l1,
+    "tw_recycle": case_tw_recycle,
+    "backlog_probe": case_backlog_probe,
+    "l3b_race": case_l3b_race,
 }
 
 
