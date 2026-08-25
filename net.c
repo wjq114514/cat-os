@@ -321,6 +321,10 @@ typedef struct tcp_conn {
     uint32_t snd_isn,snd_nxt,snd_una;  /* 本地 ISN / 下一发送 / 最早未确认 */
     uint32_t peer_ip;
     uint16_t peer_port,lport,peer_win; /* peer_win=对端通告窗口 */
+    uint16_t adv_win;            /* 最近一次实际通告到线上的接收窗口（SWS 后值，
+                                    供 recv() 判断「窗口显著打开→立即 ACK」，对照
+                                    linux tcp.c __tcp_cleanup_rbuf 的 rcv_window_now） */
+    uint16_t peer_mss;           /* 对端 SYN 中宣告的 MSS（0=未知，按 TCP_MSS 兜底） */
     uint8_t rxb[TCP_BUF_SIZE];   /* 接收缓冲 */
     uint32_t rxn;
     struct { uint32_t seq; uint16_t len; bool used; uint8_t data[TCP_MSS]; } ooo[4];
@@ -352,6 +356,10 @@ typedef struct tcp_conn {
     uint32_t persist_deadline;   /* zero-window probe deadline */
     uint8_t persist_backoff;
     bool test_sent,test_closed;  /* TCP :81 acceptance path */
+    bool dead;                   /* 阶段3 E2：合法 RST 复位死亡标记。stale fd 的
+                                    send/recv 据此上报 -ECONNRESET 而非假 EAGAIN；
+                                    复用点 tcp_listen()/SYN 接收路径显式清零，
+                                    net_socket_open() 整体清零，不泄漏到新连接 */
 } tcp_conn_t;
 static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 static socket_t  tcp_socks[TCP_MAX_CONNS];
@@ -367,6 +375,14 @@ static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn)
     while(n){uint8_t kind=opt[0];if(kind==0)break;if(kind==1){opt++;n--;continue;}if(n<2||opt[1]<2||opt[1]>n)break;
         uint8_t olen=opt[1];
         if(kind==4&&olen==2&&syn)c->sack_ok=true;
+        if(kind==2&&olen==4&&syn){
+            /* 阶段3 MSS/窗口边界：记录对端宣告 MSS（RFC 9293 §3.7.1：
+             * "the other side should send no segments larger than the
+             * advertised value"）。0 值非法（RFC 793 规定 MSS 选项最小
+             * 合法值 1），忽略之。发送侧 clamp 见 tcp_xmit_pending()。 */
+            uint16_t m=ntoh16(*(const uint16_t*)(opt+2));
+            if(m)c->peer_mss=m;
+        }
         if(kind==5&&!syn&&c->sack_ok&&olen>=10&&((olen-2u)&7u)==0){
             /* RFC 2018 §3 块布局；RFC 6675 §6.2：校验并裁剪到本端发送窗口。 */
             uint32_t count=(olen-2u)/8u;
@@ -390,6 +406,14 @@ static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn)
 static uint32_t tcp_sack_blocks(tcp_conn_t *c){uint32_t n=0;for(int i=0;i<4;i++)if(c->ooo[i].used)n++;return n>2?2:n;}
 static uint32_t tcp_build_opts(tcp_conn_t *c,uint8_t *o,uint8_t flags){
     uint32_t n=0;
+    if(flags&TCP_FLAG_SYN){
+        /* MSS 选项（kind=2,len=4,值1460）：此前本端从不宣告 MSS，对端只能按
+         * RFC 793 默认 536B 假设（真实链路下浪费带宽），且无从约束其对我们的
+         * 分段尺寸。现随 SYN/SYN-ACK 宣告本机 MSS（RFC 9293 §3.7.1）。
+         * 与 SACK-permitted 同发时共 8B，off_res 由 tcp_put_pkt 按 olen 统一
+         * 计算，20+8=28 ≤ 60 上限。 */
+        o[n++]=2;o[n++]=4;o[n++]=(uint8_t)(TCP_MSS>>8);o[n++]=(uint8_t)TCP_MSS;
+    }
     if((flags&TCP_FLAG_SYN)&&c->sack_ok){o[n++]=1;o[n++]=1;o[n++]=4;o[n++]=2;}
     else if((flags&TCP_FLAG_ACK)&&c->sack_ok){uint32_t blocks=tcp_sack_blocks(c);if(blocks){o[n++]=1;o[n++]=1;o[n++]=5;o[n++]=(uint8_t)(2+8*blocks);for(int i=0;i<4&&blocks;i++)if(c->ooo[i].used){uint32_t a=hton32(c->ooo[i].seq),b=hton32(c->ooo[i].seq+c->ooo[i].len);memcpy_u(o+n,&a,4);n+=4;memcpy_u(o+n,&b,4);n+=4;blocks--;}}}
     while(n&3){o[n++]=1;}return n;
@@ -579,6 +603,17 @@ int net_socket_close(socket_t *s){
 
 #define TCP_RTO_INIT   30u   /* 300ms @100Hz, preserved minimum for this PIT */
 #define TCP_RTO_MAX    240u  /* 2.4s, existing stack bound */
+/* 阶段3：send/recv 错误码区分化（对照 linux-ref/include/uapi/asm-generic/
+ * errno-base.h:11 EAGAIN=11、:104 ECONNRESET=104）。
+ * 语义依据：
+ *   - 缓冲满非阻塞写 → -EAGAIN（Linux tcp_sendmsg 队列满且 O_NONBLOCK，
+ *     linux-ref/net/ipv4/tcp.c:1359 sk_stream_wait_memory 失败路径返回
+ *     -EAGAIN）；
+ *   - 连接被 RST 复位后的 recv/send → -ECONNRESET（Linux tcp_reset() 置
+ *     sk_err=ECONNRESET 并清空接收队列，linux-ref/net/ipv4/tcp_input.c
+ *     tcp_reset()；后续 recv/send 直接上报该错误）。 */
+#define CATOS_EAGAIN      11u
+#define CATOS_ECONNRESET 104u
 /* M1: R2 放弃阈值 —— RFC 9293 §3.8.3(c)「When the number of transmissions of
    the same segment reaches a threshold R2 greater than R1, close the
    connection」(MUST-20，继承 RFC 1122 §4.2.3.5 的 R1/R2 模型)。
@@ -655,6 +690,34 @@ socket_t *net_socket_open(uint32_t type){
     if(type==1){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used){tcp_conns[i]=(tcp_conn_t){0};tcp_conns[i].used=true;tcp_conns[i].state=TCP_CLOSED;tcp_handles[i]=(socket_t){SOCK_TCP_UNBOUND,{.tcp={&tcp_conns[i]}}};return &tcp_handles[i];}return NULL;}
     return NULL;
 }
+/* 阶段3 SWS（silly-window syndrome）避免 + 通告窗口单一出口。
+ * 对照 linux-ref/net/ipv4/tcp_output.c:3314 __tcp_select_window()：
+ *   free_space < full_space>>1 时，若 free_space < min(allowed_space>>4, mss)
+ *   → 通告 0。本栈 full_space=allowed_space=TCP_BUF_SIZE=4096、mss=1460，
+ *   化简为：0 < free < TCP_MSS → 通告 0；其余通告实际剩余空间。
+ * 死锁自检：通告 0 后对端 persist 探测会持续到来；本端应用一旦 recv() 腾出
+ * 缓冲，tcp_recv() 依据 adv_win 检测「显著打开」立即补发窗口更新 ACK
+ * （见 tcp_window_update_ack），无滞留死锁。 */
+static uint32_t tcp_advertise_window(const tcp_conn_t *c){
+    uint32_t free=TCP_BUF_SIZE-c->rxn;
+    if(free&&free<TCP_MSS)return 0;
+    return free;
+}
+/* recv() 腾空接收缓冲后调用：窗口较上次通告「至少翻倍且非零」时立即发
+ * bare ACK 唤醒可能停在零窗口/persist 的对端 —— RFC 793 §3.7 窗口更新
+ * 义务；对照 linux-ref/net/ipv4/tcp.c:1551 __tcp_cleanup_rbuf()：
+ *   new_window >= 2 * rcv_window_now  → time_to_ack = true。
+ * 仅在仍会继续收数据的同步态发送（CLOSE_WAIT 及之后对端已 FIN，同 Linux
+ * RCV_SHUTDOWN 跳过逻辑）。 */
+static void tcp_window_update_ack(tcp_conn_t *c){
+    uint32_t nw;
+    if(c->state!=TCP_ESTABLISHED)return;
+    nw=tcp_advertise_window(c);
+    if(nw&&(uint32_t)c->adv_win<nw&&nw>=2u*(uint32_t)c->adv_win){
+        kputs("[NET] TCP window reopen ACK ");kput_dec(nw);kputs("B\n");
+        tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
+    }
+}
 static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen){
     uint8_t dmac[6];if(!arp_resolve(c->peer_ip,dmac))return;
     uint8_t *seg=begin_ip(c->peer_ip,IP_PROTO_TCP,dmac);if(!seg)return;
@@ -663,7 +726,8 @@ static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,co
     t->seq=hton32(seq);t->ack_seq=hton32(ack);
     uint8_t opts[20];uint32_t olen=tcp_build_opts(c,opts,flags);
     t->off_res=(uint8_t)(((20u+olen)/4u)<<4);t->flags=flags;
-    uint16_t win=(uint16_t)(TCP_BUF_SIZE-c->rxn);              /* 动态通告接收窗口 */
+    uint16_t win=(uint16_t)tcp_advertise_window(c);            /* 动态通告接收窗口（SWS 规则见上） */
+    c->adv_win=win;                                            /* 记录实际通告值供窗口更新 ACK 判定 */
     t->window=hton16(win);t->csum=0;t->urgent=0;
     memcpy_u(seg+20,opts,olen);memcpy_u(seg+20+olen,data,dlen);
     t->csum=hton16(ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+olen+dlen),seg,20+olen+dlen));
@@ -672,28 +736,32 @@ static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,co
 
 /* Send buffered data that fits in the current peer window. */
 static void tcp_xmit_pending(tcp_conn_t *c){
-    uint32_t in_flight=c->snd_nxt-c->snd_una;
     uint32_t send_win=c->peer_win<c->cwnd?c->peer_win:c->cwnd;
-    if(!send_win){if(c->snd_used>in_flight)tcp_persist_arm(c);return;}
-    if(in_flight>=send_win||c->snd_used<=in_flight)return;
-    uint32_t n=c->snd_used-in_flight;
-    uint32_t room=send_win-in_flight;
-    if(n>room)n=room;
-    if(n>TCP_MSS)n=TCP_MSS;
-    tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,
-                c->sndb+in_flight,n);
-    if(!c->rtt_pending){c->rtt_stamp=ticks;c->rtt_seq=c->snd_nxt+n;c->rtt_pending=true;c->rtt_retransmitted=false;}
-    c->snd_nxt+=n;
-    tcp_tx_add(c,c->snd_nxt-n,n);
-    tcp_rto_rearm(c);
-    tcp_persist_clear(c);
+    if(!send_win){if(c->snd_used>c->snd_nxt-c->snd_una)tcp_persist_arm(c);return;}
+    uint32_t eff_mss=c->peer_mss?(uint32_t)c->peer_mss:(uint32_t)TCP_MSS;
+    if(eff_mss>TCP_MSS)eff_mss=TCP_MSS;
+    do{
+        uint32_t in_flight=c->snd_nxt-c->snd_una;
+        if(in_flight>=send_win||c->snd_used<=in_flight)break;
+        uint32_t n=c->snd_used-in_flight;
+        uint32_t room=send_win-in_flight;
+        if(n>room)n=room;
+        if(n>eff_mss)n=eff_mss;
+        tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,
+                    c->sndb+in_flight,n);
+        if(!c->rtt_pending){c->rtt_stamp=ticks;c->rtt_seq=c->snd_nxt+n;c->rtt_pending=true;c->rtt_retransmitted=false;}
+        c->snd_nxt+=n;
+        tcp_tx_add(c,c->snd_nxt-n,n);
+        tcp_rto_rearm(c);
+        tcp_persist_clear(c);
+    }while(1);
 }
 int tcp_send(socket_t *s,const uint8_t *data,uint32_t len);
 void tcp_close(socket_t *s);
 
 socket_t *tcp_listen(uint16_t port){
     tcp_conn_t *c=tcp_conn_find_free();if(!c)return NULL;
-    c->used=true;c->state=TCP_LISTEN;c->backlog=TCP_MAX_CONNS;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;
+    c->used=true;c->state=TCP_LISTEN;c->backlog=TCP_MAX_CONNS;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;c->dead=false;
     c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
     tcp_tx_reset(c);
     tcp_cc_init(c);
@@ -747,7 +815,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);return;}
             c->used=true;c->state=TCP_SYN_RECEIVED;c->accepted=false;c->rxn=0;c->snd_used=0;
             tcp_tx_reset(c);
-            c->test_sent=false;c->test_closed=false;c->persist_deadline=0;c->persist_backoff=0;
+            c->test_sent=false;c->test_closed=false;c->persist_deadline=0;c->persist_backoff=0;c->dead=false;
             tcp_cc_init(c);
             tcp_parse_opts(c,seg+20,hlen-20,true);
             c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
@@ -793,6 +861,8 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         }
         if(seq==c->rcv_nxt){kputs("[NET] TCP RST(valid seq) -> CLOSED\n");}
         else{kputs("[NET] TCP RST out-of-window dropped\n");return;}
+        c->dead=true;   /* E2：死亡标记先于槽位释放 —— conn 存储在被复用前保持
+                           可读，此后对该 fd 的 send/recv 上报 -ECONNRESET */
         c->used=false;c->state=TCP_CLOSED;
         c->rto_deadline=0;c->persist_deadline=0;c->tw_until=0;
         return;
@@ -801,7 +871,18 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     /* 2. 记录对端窗口 */
     uint16_t old_win=c->peer_win;
     c->peer_win=ntoh16(h->window);
-    if(c->peer_win)tcp_persist_clear(c);
+    /* persist 清除需 ACK 门槛（阶段3 A2）：任意来源的段（含乱序数据/重复段）
+       都可能携带非零窗口字段；未经序号/ACK 校验就清除 persist 会让零窗口
+       探测被注入流量干扰停摆。已建立态的对端合法段必带 ACK 标志
+       （RFC 9293 §3.3 表：ESTABLISHED 态所有段均置 ACK）。 */
+    if((flags&TCP_FLAG_ACK)&&c->peer_win)tcp_persist_clear(c);
+    else if(!c->peer_win&&c->snd_used>(uint32_t)(c->snd_nxt-c->snd_una))tcp_persist_arm(c);
+    /* 阶段3 A1：对端在携带数据的段里把窗口降为 0 时（非 dup-ACK 路径），
+       tcp_xmit_pending()（仅在 ACK 推进路径调用）没有机会武装 persist ——
+       此处按「观测到零窗口且尚有未发送数据」直接武装，对照 Linux
+       tcp_ack_update_window()/tcp_send_probe0() 对零窗口状态的持续跟踪
+       （linux-ref/net/ipv4/tcp_timer.c:391 tcp_probe_timer 的触发前提即
+       零窗口 + 写队列非空）。tcp_persist_arm 幂等（deadline 已设则不动）。 */
     c->sack_n=0;
     tcp_parse_opts(c,seg+20,hlen-20,false);
 
@@ -830,7 +911,10 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         } else if(ack>c->snd_una&&ack<=c->snd_nxt){
             uint32_t acked=ack-c->snd_una;
             if(acked>c->snd_used)acked=c->snd_used;
-            if(c->rtt_pending&&ack>=c->rtt_seq&&!c->rtt_retransmitted){tcp_rtt_sample(c,ticks-c->rtt_stamp);c->rtt_pending=false;}
+            if(c->rtt_pending&&ack>=c->rtt_seq){
+                if(!c->rtt_retransmitted){tcp_rtt_sample(c,ticks-c->rtt_stamp);c->rtt_pending=false;}
+                else c->rtt_pending=false; /* Karn: 抑制采样同时清 pending，避免旧时间戳滞留 */
+            }
             c->snd_una=ack;
             if(acked){memcpy_u(c->sndb,c->sndb+acked,c->snd_used-acked);c->snd_used-=acked;}
             tcp_tx_ack(c,ack);
@@ -951,6 +1035,10 @@ static void tcp_tick(void){
             if(c->peer_win||c->snd_used<=in_flight){tcp_persist_clear(c);
             }else{
                 tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,1);
+                /* 阶段3 E3(Karn, RFC 1122 §4.2.2.17)：persist 探测是对未确认
+                   字节的重传，置 rtt_retransmitted 抑制其 ACK 产生虚假 RTT 采样
+                   （与 RTO 重传路径 net.c tcp_rto_retry/fast retransmit 同口径） */
+                c->rtt_retransmitted=true;
                 kputs("[NET] TCP persist probe 1B\n");tcp_persist_retry(c);
             }
         }
@@ -1009,10 +1097,18 @@ int tcp_accept(socket_t *s,uint32_t *remote_ip,uint16_t *remote_port){
 
 int tcp_send(socket_t *s,const uint8_t *data,uint32_t len){
     if(!s||s->type!=SOCK_TCP_ESTAB)return -1;
-    tcp_conn_t *c=s->tcp.conn;if(!c||c->state!=TCP_ESTABLISHED)return -1;
+    tcp_conn_t *c=s->tcp.conn;if(!c)return -1;
+    /* 阶段3 E2：RST 复位后的写 → -ECONNRESET。必须先于 state 判定：
+       RST 处理器已置 state=CLOSED，否则会误入 -1（假 EAGAIN）分支。
+       对照 Linux tcp_reset() 置 sk_err=ECONNRESET 后 sendmsg 直接上报。 */
+    if(c->dead)return -(int)CATOS_ECONNRESET;
+    if(c->state!=TCP_ESTABLISHED)return -1;
+    if(len==0)return 0;                    /* 零长度写保持合法 no-op 返回 0 */
     if(len>1460)len=1460;
     if(len>TCP_BUF_SIZE-c->snd_used)len=TCP_BUF_SIZE-c->snd_used;
-    if(len==0)return 0;
+    if(len==0)return -(int)CATOS_EAGAIN;   /* 缓冲满非阻塞语义，sock_xlate 直通
+                                              （原「收缩到 0 返回 0」歧义消除；
+                                              部分写语义本身不变） */
     memcpy_u(&c->sndb[c->snd_used],data,len);
     c->snd_used+=len;
     tcp_xmit_pending(c);
@@ -1022,6 +1118,9 @@ int tcp_send(socket_t *s,const uint8_t *data,uint32_t len){
 int tcp_recv(socket_t *s,uint8_t *buf,uint32_t max_len){
     if(!s||s->type!=SOCK_TCP_ESTAB)return -1;
     tcp_conn_t *c=s->tcp.conn;if(!c)return -1;
+    /* 阶段3 E2：RST 复位后的读 → -ECONNRESET 而非哨兵 -1（假 EAGAIN）。
+       本栈 RST 不清接收队列，但残留数据随连接作废，直接上报错误。 */
+    if(c->dead)return -(int)CATOS_ECONNRESET;
     if(c->rxn==0){
         if(c->state==TCP_CLOSE_WAIT||c->state==TCP_LAST_ACK||c->state==TCP_TIME_WAIT)return 0;
         return -1;
@@ -1030,6 +1129,8 @@ int tcp_recv(socket_t *s,uint8_t *buf,uint32_t max_len){
     memcpy_u(buf,c->rxb,n);
     if(c->rxn>n)memcpy_u(c->rxb,c->rxb+n,c->rxn-n);
     c->rxn-=n;
+    tcp_window_update_ack(c);   /* SWS 开窗：缓冲显著腾出立即补发 bare ACK
+                                   （tcp_advertise_window 注释中的死锁自检闭环） */
     return (int)n;
 }
 

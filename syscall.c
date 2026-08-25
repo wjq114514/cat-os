@@ -314,16 +314,18 @@ int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
         socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);
         if(s->type!=SOCK_TCP_ESTAB)return -CATOS_ENOTCONN;
         if(bad_user((void*)a[1],a[2],0))return -CATOS_EFAULT;
-        /* tcp_send（net.c:932）是部分写语义：>MSS(1460) 或发送缓冲不足时收缩并
-         * 返回实际接受字节数（类似 write(2)，合法）。隐患注记：缓冲满时可收缩到
-         * 0 并返回 0，调用方无法区分「成功 0 字节」与「缓冲满将忙等」。
-         * TODO(code2): 缓冲满建议返回 -EAGAIN（sock_xlate 直通），返回 0 仅保留
-         * 于对端关闭场景。 */
+        /* tcp_send（net.c）是部分写语义：>MSS(1460) 或发送缓冲不足时收缩并
+         * 返回实际接受字节数（类似 write(2)，合法）。阶段3 code4 已落实错误码
+         * 区分化：缓冲满 → -EAGAIN（非阻塞语义，sock_xlate 直通，零长度写仍
+         * 返回 0）；连接被 RST 复位后 → -ECONNRESET 直通。原 TODO(code2) 就此
+         * 结清。 */
         return sock_xlate(tcp_send(s,(const uint8_t*)a[1],a[2]),-CATOS_EAGAIN);
     }
     /* recv(fd,buf,len)：仅 SOCK_TCP_ESTAB 可用，否则 -ENOTCONN（探针依赖，同 send）。
-     * tcp_recv（net.c:944）契约：无数据且对端已发 FIN（CLOSE_WAIT/LAST_ACK/
-     * TIME_WAIT）→ 0 = EOF；未关闭且 rxn==0 → 哨兵 -1 → 此处译为 -EAGAIN。 */
+     * tcp_recv（net.c）契约：无数据且对端已发 FIN（CLOSE_WAIT/LAST_ACK/
+     * TIME_WAIT）→ 0 = EOF；未关闭且 rxn==0 → 哨兵 -1 → 此处译为 -EAGAIN；
+     * 阶段3 code4 起，连接被 RST 复位 → -ECONNRESET 由 sock_xlate 直通
+     * （不再以假 EAGAIN 掩盖复位事实）。 */
     case CATOS_SYS_RECV:{
         socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);
         if(s->type!=SOCK_TCP_ESTAB)return -CATOS_ENOTCONN;
