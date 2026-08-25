@@ -369,7 +369,7 @@ static void tcp_drop_pending(uint16_t port);
 static void tcp_cc_init(tcp_conn_t *c);
 static bool tcp_seq_after(uint32_t a,uint32_t b){return (int32_t)(a-b)>0;}
 static bool tcp_seq_before(uint32_t a,uint32_t b){return (int32_t)(a-b)<0;}
-static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen);
+static bool tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen); /* 问题1[HIGH]: 改为返回发送成败 */
 static void tcp_rto_rearm(tcp_conn_t *c);
 static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn){
     while(n){uint8_t kind=opt[0];if(kind==0)break;if(kind==1){opt++;n--;continue;}if(n<2||opt[1]<2||opt[1]>n)break;
@@ -718,9 +718,9 @@ static void tcp_window_update_ack(tcp_conn_t *c){
         tcp_put_pkt(c,TCP_FLAG_ACK,c->snd_nxt,c->rcv_nxt,NULL,0);
     }
 }
-static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen){
-    uint8_t dmac[6];if(!arp_resolve(c->peer_ip,dmac))return;
-    uint8_t *seg=begin_ip(c->peer_ip,IP_PROTO_TCP,dmac);if(!seg)return;
+static bool tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,const uint8_t *data,uint32_t dlen){
+    uint8_t dmac[6];if(!arp_resolve(c->peer_ip,dmac))return false;   /* 问题1[HIGH]: 上报解析失败 */
+    uint8_t *seg=begin_ip(c->peer_ip,IP_PROTO_TCP,dmac);if(!seg)return false;   /* 问题1[HIGH]: TX 环耗尽上报失败 */
     tcp_hdr_t *t=(tcp_hdr_t*)seg;
     t->src_port=hton16(c->lport);t->dst_port=hton16(c->peer_port);
     t->seq=hton32(seq);t->ack_seq=hton32(ack);
@@ -731,7 +731,7 @@ static void tcp_put_pkt(tcp_conn_t *c,uint8_t flags,uint32_t seq,uint32_t ack,co
     t->window=hton16(win);t->csum=0;t->urgent=0;
     memcpy_u(seg+20,opts,olen);memcpy_u(seg+20+olen,data,dlen);
     t->csum=hton16(ip_checksum_pseudo(g_ip,c->peer_ip,IP_PROTO_TCP,(uint16_t)(20+olen+dlen),seg,20+olen+dlen));
-    end_ip(seg,20+olen+dlen,IP_PROTO_TCP);
+    return end_ip(seg,20+olen+dlen,IP_PROTO_TCP);   /* 问题1[HIGH]: submit 失败同样上报 */
 }
 
 /* Send buffered data that fits in the current peer window. */
@@ -747,8 +747,11 @@ static void tcp_xmit_pending(tcp_conn_t *c){
         uint32_t room=send_win-in_flight;
         if(n>room)n=room;
         if(n>eff_mss)n=eff_mss;
-        tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,
-                    c->sndb+in_flight,n);
+        /* 问题1[HIGH]: 发送失败(ARP 未解析/TX 环耗尽)时不推进 snd_nxt、不入
+           scoreboard、不重臂 RTO，直接退出填窗循环 —— 数据留在 sndb 待真实
+           重传/续发，杜绝整窗"幻影发送"被 RTO 放弃误杀连接。 */
+        if(!tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_nxt,c->rcv_nxt,
+                    c->sndb+in_flight,n))break;
         if(!c->rtt_pending){c->rtt_stamp=ticks;c->rtt_seq=c->snd_nxt+n;c->rtt_pending=true;c->rtt_retransmitted=false;}
         c->snd_nxt+=n;
         tcp_tx_add(c,c->snd_nxt-n,n);
@@ -764,7 +767,11 @@ socket_t *tcp_listen(uint16_t port){
     c->used=true;c->state=TCP_LISTEN;c->backlog=TCP_MAX_CONNS;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;c->dead=false;
     c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
     tcp_tx_reset(c);
-    tcp_cc_init(c);
+    tcp_cc_init(c);     /* cc_init 不覆盖 rto_attempts/ooo/sack 状态 */
+    c->rto_attempts=0;  /* 问题5[INFO]: 清上一世连接残留 R2 计数 */
+    c->peer_mss=0;c->adv_win=0;c->sack_ok=false;c->sack_n=0;   /* 问题5[INFO]: 清 MSS/通告窗/SACK 协商残留 */
+    for(int i=0;i<4;i++)c->ooo[i].used=false;   /* 问题5[INFO]: 清 OOO 记分板(兼 SACK 块来源) */
+    c->ooo_bytes=0;
     c->test_sent=false;c->test_closed=false;
     for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_socks[i].type){tcp_socks[i].type=SOCK_TCP_LISTEN;tcp_socks[i].tcp.conn=c;break;}
     kputs("[NET] TCP listen :");kput_dec(port);kputs("\n");
@@ -813,21 +820,28 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             }
             c=tcp_conn_find_free();
             if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);return;}
-            /* 对端四元组必须最先落位：used=true 到 peer_ip/peer_port 赋值之间存在
-               中断嵌套窗口 —— 若此间 ISR 处理同四元组的重复 SYN（线上重复帧），
-               tcp_conn_find_peer() 匹配不到半初始化 TCB(peer 仍为 0) → 落入监听
-               分支再建一个同四元组 SYN_RCVD 僵尸，此后以其陈旧 rcv_nxt 回 ACK
-               污染数据流（sack_t8 expired-after-wrap ack=[4,base,4] 根因）。
-               RFC 9293 §3.10.7.1：SYN_RECEIVED 上的重复 SYN 只应重发 SYN-ACK。 */
-            c->used=true;c->state=TCP_SYN_RECEIVED;
-            c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
-            c->accepted=false;c->rxn=0;c->snd_used=0;
-            tcp_tx_reset(c);
-            c->test_sent=false;c->test_closed=false;c->persist_deadline=0;c->persist_backoff=0;c->dead=false;
-            tcp_cc_init(c);
-            tcp_parse_opts(c,seg+20,hlen-20,true);
-            c->rcv_isn=seq;c->rcv_nxt=seq+1;
-            c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;c->snd_una=c->snd_nxt;
+            /* 问题3[MED]: 关中断完成全部字段初始化后，最后单条 used=true 发布
+               （pushfl 保存/恢复原 IF 状态，同 process.c context_switch 惯用法）。
+               取代 df995a8 的"四元组最先落位"缓解 —— 彼案只缩小未闭合：
+               used=true 与 rcv_isn/cc/scoreboard 初始化之间仍有窗口且编译器可
+               重排。IF=0 全程屏蔽重入后，发布序不再敏感；重复 SYN 在 CS 外
+               要么看不到该槽(走本分支 backlog 检查)，要么看到完整 TCB(走
+               :850 duplicate-SYN 重发 SYN-ACK 路径)。 */
+            {
+                uint32_t eflags;
+                __asm__ volatile("pushfl\n\tpopl %0\n\tcli":"=r"(eflags)::"memory");
+                c->state=TCP_SYN_RECEIVED;
+                c->lport=dport;c->peer_ip=src_ip;c->peer_port=sport;c->peer_win=ntoh16(h->window);
+                c->accepted=false;c->rxn=0;c->snd_used=0;
+                tcp_tx_reset(c);
+                c->test_sent=false;c->test_closed=false;c->persist_deadline=0;c->persist_backoff=0;c->dead=false;
+                tcp_cc_init(c);
+                tcp_parse_opts(c,seg+20,hlen-20,true);
+                c->rcv_isn=seq;c->rcv_nxt=seq+1;
+                c->snd_isn=seq_gen++;c->snd_nxt=c->snd_isn+1;c->snd_una=c->snd_nxt;
+                c->used=true;   /* 发布点：此后 find_peer 可见完整 TCB */
+                __asm__ volatile("pushl %0\n\tpopfl"::"r"(eflags):"memory");
+            }
             kputs("[NET] TCP SYN :");kput_dec(dport);kputs(" <- ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs(" -> SYN-ACK\n");
             tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);
             tcp_rto_arm(c);                    /* SYN-ACK 需要重传保护 */
@@ -883,7 +897,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
        探测被注入流量干扰停摆。已建立态的对端合法段必带 ACK 标志
        （RFC 9293 §3.3 表：ESTABLISHED 态所有段均置 ACK）。 */
     if((flags&TCP_FLAG_ACK)&&c->peer_win)tcp_persist_clear(c);
-    else if(!c->peer_win&&c->snd_used>(uint32_t)(c->snd_nxt-c->snd_una))tcp_persist_arm(c);
+    else if((flags&TCP_FLAG_ACK)&&!c->peer_win&&c->snd_used>(uint32_t)(c->snd_nxt-c->snd_una))tcp_persist_arm(c);   /* 问题4[LOW]: arm 加 ACK 门，与上行 clear 对称 */
     /* 阶段3 A1：对端在携带数据的段里把窗口降为 0 时（非 dup-ACK 路径），
        tcp_xmit_pending()（仅在 ACK 推进路径调用）没有机会武装 persist ——
        此处按「观测到零窗口且尚有未发送数据」直接武装，对照 Linux
@@ -915,10 +929,10 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             } else if(c->fast_recovery&&c->dupacks>3){c->cwnd+=TCP_MSS;tcp_xmit_pending(c);}
         } else if(ack==c->snd_una&&c->peer_win>old_win){
             c->dupacks=0;tcp_xmit_pending(c);
-        } else if(ack>c->snd_una&&ack<=c->snd_nxt){
+        } else if(tcp_seq_after(ack,c->snd_una)&&!tcp_seq_after(ack,c->snd_nxt)){   /* 问题2[MED-HIGH]: 回绕安全(原裸 unsigned 比较)；<= 语义保持 */
             uint32_t acked=ack-c->snd_una;
             if(acked>c->snd_used)acked=c->snd_used;
-            if(c->rtt_pending&&ack>=c->rtt_seq){
+            if(c->rtt_pending&&!tcp_seq_before(ack,c->rtt_seq)){   /* 问题2[MED-HIGH]: >= 语义回绕安全化 */
                 if(!c->rtt_retransmitted){tcp_rtt_sample(c,ticks-c->rtt_stamp);c->rtt_pending=false;}
                 else c->rtt_pending=false; /* Karn: 抑制采样同时清 pending，避免旧时间戳滞留 */
             }
