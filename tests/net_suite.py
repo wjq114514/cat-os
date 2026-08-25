@@ -512,12 +512,12 @@ def case_sack_t1(S):
         gs = w.handshake(INJECT_DPORT, 3100)
         base = 3101
         w.send_data(INJECT_DPORT, base, b"ABCDEFGHIJ", gs + 1)
-        acks = [p for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         a1 = max((p["ack"] for p in acks), default=None)
         S.check("in-order D1 ACK base+10", a1 == base + 10, "ack=%s" % a1)
 
         w.send_data(INJECT_DPORT, base, b"ABCDEFGHIJ", base + 10)
-        acks = [p for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         a2 = max((p["ack"] for p in acks), default=None)
         S.check("dup of delivered: ACK unchanged", a2 == base + 10, "ack=%s" % a2)
 
@@ -529,7 +529,7 @@ def case_sack_t1(S):
 
         w.send_data(INJECT_DPORT, g, b"0123456789", base + 10)
         pk = w.collect(0.8, dp=INJECT_DPORT)
-        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         perpkt_dup = any(len(p["blocks"]) != len(set(p["blocks"])) for p in pk)
         blksets = set(tuple(sorted(set(p["blocks"]))) for p in pk if p["blocks"])
         S.check("dup OOO: ACK stays base+10",
@@ -539,7 +539,7 @@ def case_sack_t1(S):
                 "sets=%s" % blksets)
 
         w.send_data(INJECT_DPORT, base + 10, b"KLMNOPQRST", base + 10)
-        acks = [p["ack"] for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         a3 = max(acks, default=None)
         S.check("merge delivers once: ACK base+30", a3 == base + 30, "ack=%s" % a3)
 
@@ -568,7 +568,7 @@ def case_sack_t2(S):
                 (base + 10, base + 20) in bl, "%s" % bl)
 
         w.send_data(INJECT_DPORT, base + 10, b"ZZZZZ", base + 10)
-        acks = [p["ack"] for p in w.collect(0.9, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in w.collect(0.9, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         a = max(acks, default=None)
         S.check("trim+cascade: ACK reaches base+20", a == base + 20, "ack=%s" % a)
 
@@ -576,7 +576,7 @@ def case_sack_t2(S):
         S.check("SACK cleared after merge", all(not p["blocks"] for p in pk), "")
 
         w.send_data(INJECT_DPORT, base + 5, b"XXXXXYYYYYYYYYY", base + 20)
-        acks = [p["ack"] for p in w.collect(0.7, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in w.collect(0.7, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("expired X resend: ACK stable",
                 bool(acks) and all(x == base + 20 for x in acks), "%s" % acks)
 
@@ -602,7 +602,7 @@ def case_sack_t5(S):
         w.send_data(INJECT_DPORT, base + 50, b"E" * 20, base + 10)   # G2（空洞 b+40..b+50）
         pk = w.collect(0.7, dp=INJECT_DPORT)
         bl = set(tuple(b) for p in pk for b in p["blocks"])
-        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("two holes held simultaneously",
                 bl == {(base + 20, base + 40), (base + 50, base + 70)}, "%s" % bl)
         S.check("ACK pinned at base+10",
@@ -611,14 +611,14 @@ def case_sack_t5(S):
         w.send_data(INJECT_DPORT, base + 10, b"F" * 10, base + 10)   # 补洞 1
         pk = w.collect(0.8, dp=INJECT_DPORT)
         bl = set(tuple(b) for p in pk for b in p["blocks"])
-        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("hole1 merged: ACK base+40, G2 survives",
                 max(acks, default=0) == base + 40
                 and bl == {(base + 50, base + 70)},
                 "ack=%s bl=%s" % (max(acks, default=None), bl))
 
         w.send_data(INJECT_DPORT, base + 40, b"G" * 10, base + 40)   # 补洞 2
-        acks = [p["ack"] for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("hole2 merged: ACK base+70",
                 max(acks, default=0) == base + 70,
                 "ack=%s" % max(acks, default=None))
@@ -638,7 +638,7 @@ def case_sack_t8(S):
         w.send_data(INJECT_DPORT, base, b"wrapwrapwrapABC", (gs + 1) & wl.U32)   # 回绕前开场
         w.send_data(INJECT_DPORT, (base + 15) & wl.U32, b"P" * 244,
                     (gs + 1) & wl.U32)                                 # 跨过 2^32，止于 4
-        acks = [p for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p for p in w.collect(0.8, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         a = acks[-1]["ack"] if acks else None                          # 最新 rcv_nxt 优先
         S.check("in-order delivery across wrap: ACK==4", a == 4, "ack=%s" % a)
 
@@ -651,7 +651,7 @@ def case_sack_t8(S):
         # 过期段：数值上巨大但逻辑上低于 rcv_nxt=4
         w.send_data(INJECT_DPORT, 0xFFFFFFF8, b"M" * 4, 4)
         pk = w.collect(0.7, dp=INJECT_DPORT)
-        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         bl = set(tuple(b) for p in pk for b in p["blocks"])
         S.check("expired-after-wrap rejected (signed cmp)",
                 bool(acks) and all(x == 4 for x in acks)
@@ -660,7 +660,7 @@ def case_sack_t8(S):
         # 已交付的回绕前字节重复
         w.send_data(INJECT_DPORT, (base + 10) & wl.U32, b"apA", 4)
         pk = w.collect(0.7, dp=INJECT_DPORT)
-        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in pk if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("pre-wrap dup rejected",
                 bool(acks) and all(x == 4 for x in acks), "%s" % acks)
 
@@ -672,7 +672,7 @@ def case_sack_t8(S):
         S.check("wrap-point overlap queued", any(e == 5 for _, e in bl), "%s" % bl)
 
         w.send_data(INJECT_DPORT, 4, b"O" * 12, 4)
-        acks = [p["ack"] for p in w.collect(1.0, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        acks = [p["ack"] for p in w.collect(1.0, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         a = max(acks, default=0)
         S.check("cascade completes: ACK==0x1A", a == 0x1A, "ack=%s" % a)
 
@@ -713,7 +713,7 @@ def case_rst_l1(S):
                 s0.count("RST(valid seq)") == 0, "")
 
         w.send_data(INJECT_DPORT, rc, b"PING1234", gs + 1)
-        ak = [p["ack"] for p in w.collect(1.0, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        ak = [p["ack"] for p in w.collect(1.0, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("connection still alive: data ACKed rc+8",
                 max(ak, default=0) == rc + 8, "%s" % [hex(x) for x in ak])
         rc += 8
@@ -738,7 +738,7 @@ def case_rst_l1(S):
                 "pkts=%d" % len(pk))
 
         w.send_data(INJECT_DPORT, rc, b"OK", gs + 1)
-        ak = [p["ack"] for p in w.collect(1.0, dp=INJECT_DPORT) if p["flags"] & wl.ACK]
+        ak = [p["ack"] for p in w.collect(1.0, dp=INJECT_DPORT) if p["flags"] & wl.ACK and not (p["flags"] & wl.SYN)]  # 排除 SYN-ACK 重试：其 ack=SEG.SEQ+1，非 rcv_nxt
         S.check("still alive after both OOW RSTs: ACK rc+2",
                 max(ak, default=0) == rc + 2, "%s" % [hex(x) for x in ak])
         rc += 2
