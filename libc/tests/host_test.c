@@ -117,7 +117,7 @@ static void test_printf(void)
     r = printf("i=%d u=%u x=%x c=%c pct=%% s=%s\n", -42, 42u, 0xbeefu, 'Z',
                "ok");
     expect_out("i=-42 u=42 x=beef c=Z pct=% s=ok\n", "printf basic mix");
-    EXPECT(r == 30, "printf return value counts chars");
+    EXPECT(r == 33, "printf return value counts chars");
 
     cap_reset();
     r = printf("[%d]", -2147483647 - 1); /* INT_MIN，不写裸字面量防告警 */
@@ -207,7 +207,9 @@ static void test_malloc_basic(void)
         EXPECT(p != (void *)0, "heap alive after bogus frees");
         free(p);
         free(p); /* 双重释放 → 应被魔数拦截 */
-        EXPECT(malloc(32) != (void *)0, "heap alive after double free");
+        p = malloc(32);
+        EXPECT(p != (void *)0, "heap alive after double free");
+        free(p);    /* 不泄漏：后续耗尽用例依赖全池精确复位 */
     }
 }
 
@@ -283,6 +285,28 @@ static void test_exhaust_and_recover(void)
     big = malloc(60000); /* 全部释放后应能整池级分配 → 合并正确 */
     EXPECT(big != (void *)0, "coalesce restores full-pool block");
     free(big);
+}
+
+int main(void);
+
+/* Linux i386 ABI：nr=4 write / nr=1 exit，退出码 = main 返回值（freestanding 无 crt）。
+ * 捕获缓冲吞掉了全部断言输出，故在此收尾外放：成功打 PASS 行，失败倾倒现场。 */
+__attribute__((noreturn)) void _start(void)
+{
+    static const char ok[] = "host-test PASS (all assertions)\n";
+    int rc = main();
+
+    if (rc == 0)
+        __asm__ volatile("int $0x80"
+                         :: "a"(4u), "b"(1u), "c"(ok), "d"(sizeof(ok) - 1u)
+                         : "memory");
+    else
+        __asm__ volatile("int $0x80"
+                         :: "a"(4u), "b"(2u), "c"(cap_buf), "d"(cap_len)
+                         : "memory");
+    __asm__ volatile("int $0x80" :: "a"(1u), "b"((unsigned int)rc) : "memory");
+    for (;;)
+        ;
 }
 
 int main(void)

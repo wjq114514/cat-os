@@ -40,7 +40,8 @@ typedef struct catos_block {
 
 static unsigned char catos_heap_pool[CATOS_HEAP_POOL_BYTES]
     __attribute__((aligned(CATOS_ALIGN)));
-static catos_block_t *catos_free_head; /* NULL = 尚未初始化 */
+static catos_block_t *catos_free_head; /* NULL = 空闲链空（含耗尽态） */
+static unsigned char catos_heap_ready; /* 初始化哨兵：与耗尽态解耦 */
 
 /* 池内物理块链步进：下一块头地址（块序列连续铺满池的不变量） */
 static catos_block_t *next_block(catos_block_t *b)
@@ -80,13 +81,14 @@ void *malloc(size_t size)
     catos_block_t *b;
     unsigned int req;
 
-    if (catos_free_head == (catos_block_t *)0) {
+    if (catos_heap_ready == 0u) {
         /* 首次调用：整池初始化为单一空闲块 */
         b = (catos_block_t *)(void *)catos_heap_pool;
         b->size = CATOS_HEAP_POOL_BYTES - CATOS_HDR_BYTES;
         b->magic = CATOS_MAGIC_FREE;
         b->next_free = (catos_block_t *)0;
         catos_free_head = b;
+        catos_heap_ready = 1u;
     }
 
     if (size == 0u)
