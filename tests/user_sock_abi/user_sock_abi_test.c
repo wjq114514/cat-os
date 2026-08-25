@@ -183,8 +183,8 @@ static int32_t  kept[40];        /* 资源耗尽用例的 fd 收集器（容量 
 /* 非法指针样本（值本身永不解引用——内核 user_access_ok 预检先行拒绝）：
  *   BAD_LO = 0x100       < 0x1000 低页洞（paging.c user_access_ok 第一判）
  *   BAD_HI = 0xBFC00000  上界哨兵：n > 0xBFC00000-v 算术必拒（v=上界,n≥1）*/
-#define BAD_LO ((const void *)0x100u)
-#define BAD_HI ((const void *)0xBFC00000u)
+#define BAD_LO ((void *)0x100u)
+#define BAD_HI ((void *)0xBFC00000u)
 /* sendto 的目的地址：所有被断言的 sendto 路径均在 EFAULT/EMSGSIZE/EADDRNOTAVAIL
  * 预查处返回、不出网，故该值不影响结果确定性（注释明示防误读）。*/
 #define DST_IP_ANY   0x0A000202u   /* 形似 slirp 网关 10.0.2.2 */
