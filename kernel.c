@@ -241,7 +241,7 @@ void stage4_autorun_tick(void)
 
     if (done)
         return;
-    if (!sock_abi_elf || sock_abi_elf_len == 0u)
+    if (sock_abi_elf_len == 0u)
         return;                     /* 镜像未链接进来：静默跳过 */
     if (ticks < 200u)               /* 延迟 2s：避开启动期日志洪峰 */
         return;

@@ -4,6 +4,7 @@
 #include "vfs.h"
 #include "net.h"
 #include "syscall.h"
+#include "process.h"
 typedef struct{uint16_t limit;uint32_t base;}__attribute__((packed)) desc_ptr_t;
 typedef struct{uint16_t lo,sel;uint8_t zero,type;uint16_t hi;}__attribute__((packed)) gate_t;
 typedef struct{uint32_t edi,esi,ebp,saved_esp,ebx,edx,ecx,eax,vector,error_code,eip,cs,eflags;} interrupt_frame_t;
