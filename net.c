@@ -591,7 +591,7 @@ void tcp_abort_socket(socket_t *s){
 
 int net_socket_close(socket_t *s){
     if(!s||s->type==SOCK_CLOSED)return -9;
-    if(s->type==SOCK_UDP){if(s->udp.owned){udp_socks[s->udp.slot].used=false;udp_socks[s->udp.slot].bound=false;}s->type=SOCK_CLOSED;return 0;}
+    if(s->type==SOCK_UDP||s->type==SOCK_UDP_UNBOUND){if(s->udp.owned){udp_socks[s->udp.slot].used=false;udp_socks[s->udp.slot].bound=false;}s->type=SOCK_CLOSED;return 0;}
     if(s->type==SOCK_TCP_ESTAB){tcp_close(s);return 0;}
     if(s->type==SOCK_TCP_UNBOUND){if(s->tcp.conn)s->tcp.conn->used=false;s->type=SOCK_CLOSED;return 0;}
     if(s->type==SOCK_TCP_LISTEN){
@@ -639,7 +639,7 @@ static void tcp_cc_init(tcp_conn_t *c){
     c->cwnd=TCP_MSS;c->ssthresh=TCP_BUF_SIZE;c->dupacks=0;c->fast_recovery=false;c->recover_seq=0;
 }
 static void tcp_rtt_sample(tcp_conn_t *c,uint32_t sample){
-    if(!sample)return;
+    if(!sample)sample=1; /* RFC 6298 §2.4: 亚tick样本钳到最小值1，不得静默丢弃 */
     if(!c->srtt_ticks){c->srtt_ticks=sample;c->rttvar_ticks=sample/2u;}
     else {uint32_t d=c->srtt_ticks>sample?c->srtt_ticks-sample:sample-c->srtt_ticks;
         c->rttvar_ticks=(3u*c->rttvar_ticks+d)/4u;
