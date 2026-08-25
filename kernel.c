@@ -18,6 +18,7 @@
 #include "vfs.h"
 #include "elf.h"
 #include "shell_bin.h"
+#include "sock_abi_bin.h"   /* stage4: 内嵌 sock_abi 测试 ELF */
 
 #define VGA_W   80u
 #define VGA_H   25u
@@ -215,4 +216,54 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
         net_poll();
         __asm__ volatile("hlt");
     }
+}
+
+
+/* ===========================================================================
+ * stage4: IRQ0 tick 钩子 —— boot 后延迟自动拉起内嵌 sock_abi 测试进程。
+ *
+ * 为什么放 tick 里而不是 kernel_main 顺序执行：enter_usermode() 的 ring3 探针
+ * 以 jmp $ 终态驻留（usermode.c，用户锁定文件），kernel_main 中其后代码不可达；
+ * IRQ0 每 tick 都会进入本钩子（中断驱动），是探针存活期间唯一可靠的内核入口。
+ *
+ * 栈布局：sock_abi 用独立栈底 0x702000（SP=0x703000），与探针栈 0x700000..0x701000
+ * 不重叠 —— elf_load_ex 参数化栈底正是为此而设（PTE 盲写覆盖防护）。
+ * 调度：create_user_process 入队后由 sched_preempt_tick() 的量子轮转接管 CPU，
+ * 与探针进程并存分时；sock_abi exit 后队列回落探针，tcp81 监听不受影响。
+ *
+ * 失败策略：elf_load_ex/create_user_process 任一失败仅打日志不 panic ——
+ * autorun 是增强路径，绝不能拖垮已全绿的 blackbox/inject 回归基线。
+ * =========================================================================== */
+void stage4_autorun_tick(void)
+{
+    static int done;
+    uint32_t entry;
+
+    if (done)
+        return;
+    if (!sock_abi_elf || sock_abi_elf_len == 0u)
+        return;                     /* 镜像未链接进来：静默跳过 */
+    if (ticks < 200u)               /* 延迟 2s：避开启动期日志洪峰 */
+        return;
+    done = 1;
+
+    kputs("[OK] stage4: launching sock_abi test process\n");
+    int segs = elf_load_ex(sock_abi_elf, sock_abi_elf_len, &entry,
+                           CATOS_SOCKABI_STACK_BASE);
+    if (segs < 0) {
+        kputs("[ERR] stage4: sock_abi elf_load_ex failed: ");
+        kput_sdec(segs);
+        kputs("\n");
+        return;
+    }
+    int pid = create_user_process(entry, 0u, CATOS_SOCKABI_USER_SP);
+    if (pid < 0) {
+        kputs("[ERR] stage4: create_user_process(sock_abi) failed\n");
+        return;
+    }
+    kputs("[OK] stage4: sock_abi pid=");
+    kput_dec((uint32_t)pid);
+    kputs(" entry=");
+    kput_hex32(entry);
+    kputs("\n");
 }

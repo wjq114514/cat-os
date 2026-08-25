@@ -48,11 +48,17 @@ extern int create_user_process(uint32_t user_entry, uint32_t page_dir,
 extern void exit_process(int pid);
 extern uint32_t process_current_pid(void);
 
+#include "elf.h"   /* stage4: CATOS_SOCKABI_* 栈布局常量（elf.h） */
+
 /* code2: shell_bin.h 嵌入镜像（weak）。kernel.c 解锁并 #include "shell_bin.h"
  * 后符号生效；在此之前引用处地址为 0，sys_exec 判空回落 VFS 文件分支。
  * 数组名/类型与 xxd -i shell_user.elf 的输出逐字一致（shell_bin.h 头注释）。 */
 extern unsigned char shell_user_elf[] __attribute__((weak));
 extern unsigned int shell_user_elf_len __attribute__((weak));
+/* stage4: 内嵌 sock_abi 测试镜像（kernel.c include "sock_abi_bin.h" 后生效）。
+ * weak 引用与 shell 同款模式：符号缺失时判空回落 VFS 分支，不影响链接。 */
+extern unsigned char sock_abi_elf[] __attribute__((weak));
+extern unsigned int sock_abi_elf_len __attribute__((weak));
 
 /* code2: 与 elf.h 定稿值的本地同步副本（不 include elf.h 所致；改动需双侧同步）
  *   elf.h:31 ELF_USER_STACK_SP = ELF_USER_STACK_BASE+4096 = 0x701000。
@@ -162,6 +168,11 @@ static int sys_exec(const uint32_t *a)
         image = shell_user_elf;
         ilen = shell_user_elf_len;
     }
+    if (&sock_abi_elf != (void *)0 && sock_abi_elf_len > 0u &&
+        sys_streq(path, "/bin/sock_abi")) {
+        image = sock_abi_elf;
+        ilen = sock_abi_elf_len;
+    }
     if (image == (void *)0) {
         int fd = vfs_open(path, O_RDONLY); /* O_RDONLY=0，vfs.h:5 */
         if (fd < 0) return fd;
@@ -183,8 +194,16 @@ static int sys_exec(const uint32_t *a)
     int segs = elf_load(image, ilen, &entry);
     if (segs < 0) return segs;
     /* page_dir=0：共享内核页目录（elf.h 注释确认 paging.c 未暴露独立地址
-     * 空间 API，映射进当前目录低半区）；栈页由 elf_load 映射 @0x700000。 */
-    return create_user_process(entry, 0u, CATOS_EXEC_USER_STACK_SP);
+     * 空间 API，映射进当前目录低半区）。
+     * 栈：stage4 起按镜像选择栈底 —— sock_abi 用独立栈 0x702000 与探针/shell
+     * 并存（elf_load_ex 参数化栈底），其余沿用任务书默认 0x700000。
+     * 注：本分支 image 已知来源，直接按 path 分派 SP，无需二次解析。 */
+    {
+        uint32_t sp = CATOS_EXEC_USER_STACK_SP;
+        if (sys_streq(path, "/bin/sock_abi"))
+            sp = CATOS_SOCKABI_USER_SP;
+        return create_user_process(entry, 0u, sp);
+    }
 }
 
 /* exit(status)：标记当前进程 TERMINATED（exit_process），调度器随即将
@@ -278,8 +297,10 @@ int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
      *   经 sock_xlate → EAGAIN。 */
     case CATOS_SYS_SENDTO:{
         socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);
+        /* EMSGSIZE 先于 EFAULT：len 超协议上限时无需触碰用户缓冲区即可判定
+         * （S5e len=4096 小 iobuf 场景——若先 EFAULT 会因 iobuf 不足 4K 误报） */
+        if(a[2]>CATOS_UDP_PAYLOAD_MAX)return -CATOS_EMSGSIZE;
         if(bad_user((void*)a[1],a[2],0))return -CATOS_EFAULT;
-        if(a[2]>CATOS_UDP_PAYLOAD_MAX)return -CATOS_EMSGSIZE; /* 依据见 CATOS_UDP_PAYLOAD_MAX 定义处 */
         /* 目标语义（阶段4 缺口清单 M2）：未 bind 的 UDP socket 上 sendto
          * → -EADDRNOTAVAIL（经 type 字段在本层可判，net.c 无需配合）。
          * 分歧注记：Linux 对未绑定 UDP 发送会 inet_autobind 分配临时源端口

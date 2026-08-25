@@ -55,9 +55,17 @@ static void arch_set_tss_esp0(uint32_t esp0)
     uint32_t lo = desc[0];
     uint32_t hi = desc[1];
 
-    /* 类型字段校验：0x89 = available 32-bit TSS，与 usermode.c 布局一致才写。 */
-    if (((hi >> 8) & 0xFFu) != 0x89u) {
-        kputs("[WARN] sched: GDT desc5 not a TSS, esp0 not updated\n");
+    /* 类型字段校验（SDM Vol.3 §7.2.3）：0x89 = available 32-bit TSS；
+     * 0x8B = busy 32-bit TSS —— arch_load_tss 的 ltr 执行后 CPU 会自动
+     * 置位描述符 busy 位，因此运行期读到的一定是 0x8B。
+     * [BUGFIX] 原校验只认 0x89，导致 esp0 永不更新、恒为初始 kernel_stack_top；
+     * 用户进程每次 int 0x80 都在 kernel_main 栈上展开中断帧，踩掉 pcb[0].ksp
+     * 保存的现场，exit 切回后 iret 弹垃圾 -> page fault CR2=0x8 死机。 */
+    uint32_t tss_type = (hi >> 8) & 0xFFu;
+    if (tss_type != 0x89u && tss_type != 0x8Bu) {
+        kputs("[WARN] sched: GDT desc5 not a TSS (type=");
+        kput_hex32(tss_type);
+        kputs("), esp0 not updated\n");
         return;
     }
     uint32_t tss_base = (lo >> 16) | ((hi & 0xFFu) << 16) | (hi & 0xFF000000u);
@@ -200,6 +208,15 @@ static process_t *pick_next(void)
     return NULL;
 }
 
+/* pcb[0] idle 循环：队列空时 CPU 停机省电，任何中断（PIT/键盘等）
+ * 将唤醒并重新检查就绪队列。 */
+static void __attribute__((noreturn)) sched_idle(void)
+{
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * 公开 API。
  * ------------------------------------------------------------------------- */
@@ -210,11 +227,25 @@ void process_init(void)
     memset(pcb, 0, sizeof(pcb));
 
     /* pcb[0]：内核/idle 上下文（core.c:3977 idle_task 对应物），
-     * page_dir=0 表示沿用启动页目录。 */
+     * page_dir=0 表示沿用启动页目录。分配独立内核栈页 + 构建 idle 帧，
+     * 修复 exit 后切回 pcb[0] 时栈内容被踩导致的 CR2=0x8 崩溃：*
+     *   - 独立栈：build_initial_frame 不踩内核代码区（phys_to_virt(0)）
+     *   - TSS.esp0 可指向有效栈（pid=0 运行时中断不掉到已回收页）
+     *   - idle 帧 ret 到 sched_idle 停机循环，不依赖易损的 kernel_main 栈 */
     pcb[0].pid = 0u;
     pcb[0].state = PROC_RUNNING;
     pcb[0].ctx_type = PROC_CTX_KERNEL;
     pcb[0].as.page_dir = 0u;
+    {   uintptr_t idle_page = pmm_alloc_page();
+        if (idle_page) {
+            pcb[0].kstack_phys = (uint32_t)idle_page;
+            pcb[0].entry = sched_idle;  /* trampoline 会 ret 到这里 */
+            pcb[0].ksp = 0u;   /* build_initial_frame 将构建帧指向 trampoline */
+            build_initial_frame(&pcb[0]);
+            /* 注意：build_initial_frame 设 eip=process_trampoline，
+             * trampoline 读 p->entry 并调用它 -> sched_idle 循环 */
+        }
+    }
     current = &pcb[0];
     ready_head = ready_tail = NULL;
 
@@ -322,6 +353,37 @@ void sched_yield(void)
     schedule_next();
 }
 
+/* 时钟抢占钩子（stage4）：量子到期且就绪队列非空时轮转一次。
+ * 量子取 100 tick（100Hz PIT => 1s）：单行串口 write 最长 ~224 字符 × ~87µs/字符
+ * ≈ 19ms << 一个时间片，保证测试 marker 行不被抢占撕裂（可 grep）。
+ * pcb[0]（内核/idle 上下文）免重入队：其 ksp 快照即 IRQ 现场本身，
+ * schedule_next() 队列空时自然回落 pcb[0] 续跑 iret 尾声；状态保持 RUNNING
+ * 属良性捷径，与 exit_process 的 idle 兜底路径同构（注释明示防误改）。 */
+#define SCHED_PREEMPT_QUANTUM_TICKS 100u
+static uint32_t preempt_tick_cnt;
+
+void sched_preempt_tick(void)
+{
+    preempt_tick_cnt++;
+    if (preempt_tick_cnt < SCHED_PREEMPT_QUANTUM_TICKS) {
+        return;
+    }
+    preempt_tick_cnt = 0u;
+
+    if (!ready_head) {
+        return;                     /* 就绪队列空：无可轮转 */
+    }
+
+    process_t *prev = current;
+    if (prev && prev != &pcb[0] && prev->state == PROC_RUNNING) {
+        prev->state = PROC_READY;
+        ready_enqueue(prev);
+    } else if (!prev) {
+        return;
+    }
+    schedule_next();
+}
+
 /* 启动调度：把调用者（kernel_main）登记为 pcb[0]，轮转直至就绪队列清空
  * （全部 READY 进程 TERMINATED）后返回 kernel_main 上下文。 */
 void sched_start(void)
@@ -365,7 +427,16 @@ void exit_process(int pid)
             p->kstack_phys = 0u;
         }
     } else {
-        schedule_next();            /* 自行让出，不再入队 */
+        /* 自杀路径：置 TERMINATED 后照常 schedule_next()。
+         * 队列空时 pick_next() 兜底回落 pcb[0] —— 其 ksp 保存的是
+         * 首次抢占时的 IRQ 现场，iret 尾声即恢复 enter_usermode()
+         * 驻留的 ring3 探针，tcp81/串口服务随之复活（stage4 设计语义）。
+         * 历史：曾因 TSS.esp0/GDT 错位导致恢复必崩（CR2≈0x8）而临时
+         * 改为 cli;hlt 停机，但停机会连探针一并杀死（blackbox 5/18 回归实证）；
+         * TSS 修复后恢复路径已验证安全，回归正常调度。 */
+        schedule_next();
+        /* 不可达防御：若调度器异常返回则安全停机，绝不带病续跑 */
+        for(;;){ __asm__ volatile("cli; hlt"); }
     }
 }
 
@@ -385,6 +456,21 @@ static void schedule_next(void)
     process_t *prev = current;
     current = next;
     next->state = PROC_RUNNING;
+
+    /* [DBG-TEMP] 调度切换观测（定位 exit 后 iret 崩溃，诊断完删除） */
+    kputs("[DBG] sw prev="); kput_hex32((uint32_t)(uintptr_t)prev);
+    kputs(" pnxt="); kput_hex32((uint32_t)(uintptr_t)next);
+    kputs(" pksp="); kput_hex32(prev ? prev->ksp : 0u);
+    kputs(" nksp="); kput_hex32(next->ksp);
+    kputs("\n");
+
+    /* stage4 抢占语义：每次切换进程都必须刷新 TSS.esp0 到新进程的私有内核栈，
+     * 否则下一个 int0x80/IRQ 会落到旧进程的内核栈上（已被回收/释放）导致踩踏。
+     * pcb[0] 的 idle 栈在 process_init 中分配，确保这里条件成立。 */
+    if (next->kstack_phys != 0u) {
+        arch_set_tss_esp0((uint32_t)(uintptr_t)phys_to_virt(next->kstack_phys) +
+                          PAGE_SIZE);
+    }
 
     if (next->ksp == 0u) {
         build_initial_frame(next);  /* 首次派发 */

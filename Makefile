@@ -14,7 +14,7 @@ QEMUFLAGS = -cdrom os.iso -m 128M -display none -serial stdio -no-reboot -no-shu
 OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o kbdwait.o ide.o rtc.o usermode.o vfs.o net.o \
       elf.o # elf.o(code2): exec syscall 链接 elf_load 所需（elf.c 属其他代理实现）
 
-all: shell_bin.h os.iso
+all: shell_bin.h sock_abi_bin.h os.iso
 
 os.iso: cat-os.bin grub/grub.cfg
 	rm -rf iso
@@ -35,7 +35,7 @@ boot.o: boot.asm
 arch.o: arch.asm
 	$(AS) -f elf32 -o $@ $<
 
-%.o: %.c kernel.h paging.h multiboot.h net.h e1000.h
+%.o: %.c kernel.h paging.h multiboot.h net.h e1000.h shell_bin.h sock_abi_bin.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 run: os.iso
@@ -47,6 +47,7 @@ check: os.iso
 clean:
 	rm -rf *.o cat-os.elf cat-os.bin os.iso iso
 	rm -f shell_user.elf shell_user.bin shell_bin.h
+	rm -f sock_abi.elf sock_abi.bin sock_abi_bin.h sock_abi.o
 
 # ── code2: ring3 shell（shell_user.elf → shell_user.bin → shell_bin.h）───────
 # 与内核 CFLAGS 同族，另加 -fcf-protection=none：抑制 .note.gnu.property，
@@ -75,6 +76,26 @@ shell_user.bin: shell_user.elf
 shell_bin.h: shell_user.elf shell_user.bin
 	xxd -i shell_user.elf > $@.tmp
 	{ printf '/*\n * shell_bin.h —— 自动生成：ring3 shell 的 ELF32 镜像内嵌数组（code2 · 并行任务）\n * ⚠️ 请勿手改：由 Makefile 目标 shell_bin.h 重新生成。\n *\n * 内容：shell_user.elf 全文（ELF32 i386 LSB ET_EXEC，入口 _start=0x400000），\n * 而非 objcopy -O binary 的扁平镜像 —— 内核侧唯一加载契约是\n * elf_load(const void *image, size_t len, uint32_t *entry_out)（elf.h），\n * 其第一步即校验 \\x7f"ELF" 魔数（elf.c e_ident 检查链），扁平 bin 无法通过。\n * 扁平产物 shell_user.bin 仍由上一目标独立产出（尺寸/烧写用途）。\n *\n * 内核引用方式（kernel.c 解锁后）：#include "shell_bin.h"，之后\n * exec("/bin/shell") 命中 syscall.c sys_exec 的嵌入镜像分支。\n * 在 kernel.c 尚未 include 本头文件期间，syscall.c 以 weak extern 引用，\n * 符号缺失时运行时判空返回 VFS 分支错误码，不影响链接。\n */\n#ifndef CATOS_SHELL_BIN_H\n#define CATOS_SHELL_BIN_H\n#include <stdint.h>\n'; cat $@.tmp; printf '\n#endif /* CATOS_SHELL_BIN_H */\n'; } > $@ && rm -f $@.tmp
+
+# ── stage4: sock_abi 测试程序（tests/user_sock_abi → 内嵌 ELF，模式同 code2）──
+# 与 SHELL_CFLAGS 同族；测试代码含边界用例，定向豁免部分告警。
+SOCKABI_CFLAGS  = $(SHELL_CFLAGS) -Ilibc/include                   -Wno-unused-parameter -Wno-unused-variable                   -Wno-sign-compare -Wno-unused-function
+SOCKABI_LDFLAGS = $(SHELL_LDFLAGS)
+
+sock_abi.o: tests/user_sock_abi/user_sock_abi_test.c
+	$(CC) $(SOCKABI_CFLAGS) -c -o $@ $<
+
+sock_abi.elf: sock_abi.o
+	$(LD) $(SOCKABI_LDFLAGS) -o $@ $<
+
+sock_abi.bin: sock_abi.elf
+	$(OBJCOPY) -O binary $< $@
+
+# 内嵌头：嵌入完整 ELF（xxd 数组名 sock_abi_elf/_len 与 weak extern 逐字一致）
+sock_abi_bin.h: sock_abi.elf sock_abi.bin
+	xxd -i sock_abi.elf > $@.tmp
+	{ printf '/*\n * sock_abi_bin.h —— 自动生成：stage4 sock_abi 测试 ELF32 内嵌数组\n * ⚠️ 请勿手改：由 Makefile 目标 sock_abi_bin.h 重新生成。\n * 内容：sock_abi_test.elf 全文（ELF32 i386 LSB ET_EXEC），加载契约同 shell_bin.h。\n */\n#ifndef CATOS_SOCK_ABI_BIN_H\n#define CATOS_SOCK_ABI_BIN_H\n#include <stdint.h>\n'; cat $@.tmp; printf '\n#endif /* CATOS_SOCK_ABI_BIN_H */\n'; } > $@ && rm -f $@.tmp
+
 
 .PHONY: all run check clean
 

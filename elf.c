@@ -1,3 +1,5 @@
+#include "kernel.h"
+
 /*
  * Cat-OS ELF32 (i386 LSB, ET_EXEC) 急切式加载器。
  *
@@ -94,11 +96,31 @@ static int map_user_page(uintptr_t virt, uintptr_t *phys_out) {
 
 int elf_load(const void *image, size_t len, uint32_t *entry_out)
 {
+    /* stage4: 默认栈基址=任务书 0x700000，行为与原 elf_load 完全兼容。 */
+    return elf_load_ex(image, len, entry_out, ELF_USER_STACK_BASE);
+}
+
+/*
+ * elf_load_ex - elf_load 的参数化栈底版本（stage4）。
+ * stack_base 必须页对齐、落在 [PAGE_SIZE, CATOS_USER_LIMIT-PAGE_SIZE]，
+ * 且不得与本镜像任何段、也不得与已驻留程序（boot 探针 @0x700000 栈）
+ * 的段/栈重叠 —— map_page 对已映射 vaddr 无条件覆盖写 PTE（paging.c），
+ * 重叠即毁先驻程序现场。
+ */
+int elf_load_ex(const void *image, size_t len, uint32_t *entry_out,
+                uintptr_t stack_base)
+{
     const uint8_t *base = (const uint8_t *)image;
 
     if (!image || !entry_out || len < sizeof(elf32_ehdr_t)) {
         return -ENOEXEC;
     }
+    if ((stack_base & (PAGE_SIZE - 1u)) != 0u ||
+        stack_base < PAGE_SIZE ||
+        stack_base > CATOS_USER_LIMIT - PAGE_SIZE) {
+        kputs("[ERR] elf_load_ex: bad stack_base\n");
+        return -EINVAL;
+        }
 
     /* -- 鉴别字段校验（对应 binfmt_elf.c load_elf_binary 开头的
      *    memcmp(ELFMAG)/elf_check_arch/elf_check_type 链）-- */
@@ -194,14 +216,17 @@ int elf_load(const void *image, size_t len, uint32_t *entry_out)
         return -ENOEXEC;
     }
 
-    /* ---- 用户栈：任务书规定 @0x700000 单页，SP=0x700000+4096。
-     * map_page 覆盖旧 PTE（paging.c:322-325），复用旧探针栈页安全。 ---- */
+    /* ---- 用户栈：stage4 起由调用方指定栈底（默认 0x700000 兼容原语义）。 ---- */
     uintptr_t stack_frame = 0;
-    if (map_user_page(ELF_USER_STACK_BASE, &stack_frame) != 0) {
+    if (map_user_page(stack_base, &stack_frame) != 0) {
         return -ENOMEM;
     }
-    kputs("[OK] ELF user stack 0x700000..0x701000 SP=");
-    kput_hex32(ELF_USER_STACK_SP);
+    kputs("[OK] ELF user stack ");
+    kput_hex32((uint32_t)stack_base);
+    kputs("..");
+    kput_hex32((uint32_t)(stack_base + PAGE_SIZE));
+    kputs(" SP=");
+    kput_hex32((uint32_t)(stack_base + PAGE_SIZE));
     kputs("\n");
 
     *entry_out = eh->e_entry;

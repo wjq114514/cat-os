@@ -28,6 +28,11 @@
 #define ELF_USER_STACK_BASE 0x700000u
 #define ELF_USER_STACK_SP   (ELF_USER_STACK_BASE + 4096u)
 
+/* stage4: sock_abi 测试进程专用栈布局 —— 与 boot 探针栈(0x700000..0x701000)
+ * 不重叠；elf_load_ex 参数化栈底正是为此并存场景而设。 */
+#define CATOS_SOCKABI_STACK_BASE 0x702000u
+#define CATOS_SOCKABI_USER_SP    (CATOS_SOCKABI_STACK_BASE + 4096u)
+
 /*
  * elf_load - 解析并装载一个 ET_EXEC ELF32 LSB 镜像到当前页目录用户区。
  * @image:     镜像首地址（内核可读）
@@ -36,5 +41,21 @@
  * 返回值：>0 = 装载的 PT_LOAD 段数；<0 = -errno。
  */
 int elf_load(const void *image, size_t len, uint32_t *entry_out);
+
+/*
+ * elf_load_ex - 同 elf_load，但允许指定用户栈底页（stage4）。
+ * @stack_base: 栈底虚拟地址（必须页对齐、>=0x1000、<=用户区上界-页大小）；
+ *              初始 SP = stack_base + PAGE_SIZE。
+ *
+ * 为什么需要它：map_page() 对已映射 vaddr 是无条件覆盖写 PTE
+ * （paging.c map_page 直接赋值 pt->entries[pti]），而任务书默认栈页
+ * 0x700000 已被 boot 探针/usermode 占用为活动栈。当第二个 ring3 程序
+ * 需要与既有驻留程序并存时（stage4 sock_abi autorun vs boot 探针），
+ * 必须为后来者指定互不重叠的栈基址，否则 elf_load 的固定栈映射会
+ * 把先驻留程序的栈页重映射到新物理帧，造成其现场丢失/数据踩踏。
+ * 调用方负责保证 stack_base 不与任何在驻程序的用户段重叠。
+ */
+int elf_load_ex(const void *image, size_t len, uint32_t *entry_out,
+                uintptr_t stack_base);
 
 #endif /* CATOS_ELF_H */

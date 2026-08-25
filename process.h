@@ -56,6 +56,7 @@ int      create_process(void (*entry)(void), uint32_t page_dir);
 int      create_user_process(uint32_t user_entry, uint32_t page_dir,
                              uint32_t user_esp);
 void     sched_yield(void);
+void     sched_preempt_tick(void);   /* stage4: IRQ0 时钟抢占钩子 */
 void     sched_start(void);
 void     sched_launch(void);
 void     exit_process(int pid);

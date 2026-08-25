@@ -20,7 +20,9 @@ void irq_clear_mask(uint8_t q){uint16_t p=q<8?0x21:0xA1;outb(p,(uint8_t)(inb(p)&
 int irq_register_handler(uint8_t q,irq_handler_t fn,void *arg){if(q>=16||!fn||slots[q].fn)return -1;slots[q].fn=fn;slots[q].arg=arg;slots[q].warned=0;return 0;}
 void irq_unregister_handler(uint8_t q){if(q<16){irq_set_mask(q);slots[q]=(irq_slot_t){0};}}
 static uint16_t pic_isr(void){outb(0x20,0x0B);outb(0xA0,0x0B);return (uint16_t)inb(0x20)|((uint16_t)inb(0xA0)<<8);}
-static bool timer_handler(uint8_t q,void *arg){(void)q;(void)arg;ticks++;net_poll();if(ticks<=3){kputs("[OK] PIT tick=");kput_dec(ticks);kputs(" vector=32\n");}return true;}
+static bool timer_handler(uint8_t q,void *arg){(void)q;(void)arg;ticks++;net_poll();
+    /* stage4: boot 后延迟自动拉起 sock_abi 测试进程 + 时钟抢占轮转 */
+    stage4_autorun_tick();sched_preempt_tick();if(ticks<=3){kputs("[OK] PIT tick=");kput_dec(ticks);kputs(" vector=32\n");}return true;}
 static __attribute__((used)) void irq_dispatch(uint8_t q){if((q==7||q==15)&&!(pic_isr()&(1u<<q))){if(q==15)outb(0x20,0x20);return;}bool done=slots[q].fn&&slots[q].fn(q,slots[q].arg);if(!done&&!slots[q].warned){slots[q].warned=1;kputs("[WARN] unhandled IRQ ");kput_dec(q);kputs(" (further warnings suppressed)\n");}if(q>=8)outb(0xA0,0x20);outb(0x20,0x20);}
 static void pic_init(void){outb(0x20,0x11);outb(0xA0,0x11);outb(0x21,0x20);outb(0xA1,0x28);outb(0x21,4);outb(0xA1,2);outb(0x21,1);outb(0xA1,1);outb(0x21,0xFF);outb(0xA1,0xFF);kputs("[OK] PIC remapped IRQ0-15 -> vectors 0x20-0x2F; spurious IRQ7/15 detection active\n");}
 static void pit_init(void){uint32_t d=1193182u/100u;outb(0x43,0x36);outb(0x40,d);outb(0x40,d>>8);irq_register_handler(0,timer_handler,0);irq_clear_mask(0);kputs("[OK] PIT registered on IRQ0 at 100Hz\n");}
