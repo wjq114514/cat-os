@@ -16,6 +16,8 @@
 #include "rtc.h"
 #include "user.h"
 #include "vfs.h"
+#include "elf.h"
+#include "shell_bin.h"
 
 #define VGA_W   80u
 #define VGA_H   25u
@@ -164,7 +166,29 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
     vfs_init();
     interrupts_enable();kputs("[OK] pre-enter_usermode\n");
     enter_usermode();
-    __asm__ volatile("int3");
+    /* Old inline tests done. Load and launch the ring3 shell via ELF loader. */
+    {
+        uint32_t entry;
+        int rc = elf_load(shell_user_elf, shell_user_elf_len, &entry);
+        if (rc < 0) {
+            kputs("[ERR] shell ELF load failed: ");
+            kput_sdec(rc);
+            kputs("\n");
+        } else {
+            kputs("[OK] shell ELF loaded, entry=");
+            kput_hex32(entry);
+            kputs("\n");
+            int pid = create_user_process(entry, 0, ELF_USER_STACK_SP);
+            if (pid < 0) {
+                kputs("[ERR] create_user_process failed\n");
+            } else {
+                kputs("[OK] shell process pid=");
+                kput_dec((uint32_t)pid);
+                kputs(", launching scheduler\n");
+                sched_launch();
+            }
+        }
+    }
 
     vga_init_via_ioremap();
     kputs("cat-OS higher-half paging online\n");
