@@ -104,3 +104,33 @@
 ## 最终目标
 
 形成可启动、可进入用户态、能执行 `ping`、能通过 UDP/TCP socket API，并逐步具备运行真实网络应用（最终目标为 nginx）的 Cat-OS 网络系统。
+
+## 2026-08-25 Round1 推进记录（orchestrator 授权回填）
+
+### 已落地 commit（db5ec07..70f6965）
+
+| commit | 内容 |
+|--------|------|
+| 70f6965 | kernel 告警修复 |
+| 1a77c6e | libc host_test 入口 + heap-ready 解耦 |
+| 36fd594 | net TCP 五缺陷修复（幻影发送·序号回绕ACK·SYN竞态cli/sti闭合·persist ACK门·listen槽位残留） |
+| 453818f | input 键盘 break码+E0状态机+Tab/Backspace |
+| f4173ce | test const |
+| db5ec07 | test 三新用例（tw_recycle/backlog_probe/l3b_race）+ docs/TEST_MATRIX.md |
+
+### 验证证据
+
+- `make clean && make`：0 warning
+- `run_all`：全绿，含三新用例（backlog_probe 容量模型修正为 listen 占槽后 14 半开）
+- `make check user_sock_abi`：81 PASS / 0 FAIL / 4 skip
+- 键盘 QMP 注入：5/5（ab1A 回归 + Tab + Backspace + break不重复 + E0箭头无垃圾字节）
+
+### 遗留与下一步
+
+- 阶段5 顺序：统计计数器(nr32) → DNS(nr31) → ARP老化 → DHCP续期（net.c 串行）
+- 审查遗留：MED 悬垂 fd → TCB 架构问题未修
+- usermode.c 用户区改动中发现 kbd_done/kbd_empty 跳转别名问题（只报告不改动，等用户处理）
+
+---
+
+本节由 orchestrator 回填，原始协议条款不变。
