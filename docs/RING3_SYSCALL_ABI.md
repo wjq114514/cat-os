@@ -1,5 +1,7 @@
 # Cat-OS Ring3 `int 0x80` 系统调用 ABI 文档
 
+> **修订记录（2026-08-26 · fork/waitpid/kill 波次，HEAD=`611b080`）**：新增**进程控制组 nr=33/34/35**（fork / waitpid / kill，nginx M1 三件套），编号已锁定；**poll 及后续扩展自 nr≥36 预留**。详见 §3.4。同波次 `syscall.h` 迁入 `CATOS_SYS_EXEC/EXIT/WAIT(11/12/13)` 与 errno 家族（EPERM/ESRCH/ENOENT/E2BIG/ECHILD），数值不变；`exit(status)` 的 status 自此被记录并经 waitpid 收割（Linux wait-status 编码）。nr=13 wait 保持恒 `-ECHILD` stub 行为不变。
+
 > **修订记录（2026-08-26）**：依据 commit **289e9ce**（"kernel: remove nr==3 close alias — read(fd=3) no longer silently closes"；核对时工作区 HEAD=`fcc386e`）完成 L8 别名拆除的语义跟进——**nr==3 一律 read；close 仅保留 nr==6（VFS）/ nr==28（socket）**；另对照 `syscall.h` 核实 `CATOS_SYS_RESOLVE=31`、`CATOS_SYS_NET_STATS=32` 编号无误，本文档 §3.2 条目无缺漏。
 
 > **版本说明**：本文档基于 **HEAD=`0d4b58342a1350d81eef82eb128c0c6fcd9df27c`**（"input: blocking read for /dev/kbd with timeout"）**+ 工作区未提交变更**（`git status` 显示 `net.c`/`paging.c`/`syscall.c`/`vfs.c`/`usermode.c`/`OSDEV_PROJECT_NOTES.md` 存在未提交修改，其中 `syscall.c`/`vfs.c`/`paging.c` 的改动内容已包含进本文依据）整理。
@@ -16,6 +18,7 @@
   - [3.1 VFS 组（nr < 20，委托 vfs_syscall）](#31-vfs-组-nr--20委托-vfs_syscall)
   - [3.2 网络/Socket 组（nr ≥ 20，syscall_dispatch 直辖）](#32-网络socket-组-nr--20syscall_dispatch-直辖)
   - [3.3 close 的两条路径与 L8 别名拆除记录](#33-close-的两条路径与-l8-别名拆除记录)
+  - [3.4 进程控制组（nr=33/34/35，编号已锁定；poll 预留 nr≥36）](#34-进程控制组nr334435编号已锁定poll-预留-nr36)
 - [4. 参数寄存器约定](#4-参数寄存器约定)
 - [5. 返回码约定](#5-返回码约定)
 - [6. 用户指针校验规则（user_access_ok 语义）](#6-用户指针校验规则user_access_ok-语义)
@@ -149,6 +152,29 @@ ring3 read（nr==0 或 nr==3）────────────────�
 | 移除计划 | **已执行**：原「属 ABI 变更、超出锁内授权、留协调者裁决」事项由 289e9ce 终结（对应两处源码 TODO 注释的清理现状未逐一复核） | commit 289e9ce |
 | 既有审计附注 | `net_socket_close` 对已 SOCK_CLOSED 型返回 `-EBADF(-9)` 且不释放 fd，存在理论上的描述符滞留窗口（TODO(code2)：幂等释放或本层兜底，二选一） | syscall.c:184-187；net.c:554 |
 
+### 3.4 进程控制组（nr=33/34/35，编号已锁定；poll 预留 nr≥36）
+
+> **编号锁定声明（2026-08-26）**：`CATOS_SYS_FORK=33`、`CATOS_SYS_WAITPID=34`、`CATOS_SYS_KILL=35` 归 nginx M1（master/worker 硬阻塞三件套）任务专属；**poll 及后续扩展自 nr=36 起预留**，其他任务不得占用。分发路由：`syscall_dispatch` 前置拦截 `(11..13 || 33..35)` → `proc_syscall`，与 VFS 兼容层（<20）及 socket 表（20..32）无重叠。常量定义于 `syscall.h`。
+
+| nr | 名称 | 参数（a[i]） | 关键前置校验（按判定顺序） | 行为 | 返回 |
+|---|---|---|---|---|---|
+| 33 | fork | 无 | pcb[0]/idle 或内核例程上下文 → `-1`（该场景应直调内核 API `process_fork()`）；进程表满 / PMM 耗尽 → `-ENOMEM(-12)`；int80 中断帧签名扫描失败 → `-1`（绝不凭猜测克隆） | 在 int80 中断帧上 COW 克隆：子得私有页目录（可写用户页父子共享 RO+COW、ref=2，写缺页走 ISR14 已接线路径）+ 私有内核栈；fd_table 沿全局单例浅共享（见下） | **父=子 pid（>0），子=0**，负值=-errno |
+| 34 | waitpid | a[0]=pid(int32), a[1]=status*(int32*, 可 NULL), a[2]=options | options≠0 / pid==0 / pid<-1 → `-EINVAL(-22)`；status 非 NULL 且不可写 4B → `-EFAULT(-14)`；无匹配子女 → `-ECHILD(-10)` | 阻塞至目标子女 TERMINATED 并收割其编码化退出码（阻塞原语 = PCB 置 `PROC_BLOCKED` 后让出，被 `exit_process_code` 唤醒重扫；零忙等）。多子女竞争唤醒安全（落败者 rescan 重阻塞） | 子 pid / `-EINVAL`/`-EFAULT`/`-ECHILD` |
+| 35 | kill | a[0]=pid(u32), a[1]=sig(u32) | pid==0 / pid≥32 → `-EINVAL`；sig ∉ {0, 9, 15, 17} → `-EINVAL`（白名单外一律拒绝，含 >31 无位图位）；目标不存在 → `-ESRCH(-3)` | **SIGKILL(9)**：直接终止目标（外部路径即时回收内核栈；自杀路径即本调用不返回），wait-status 编码 `9`；**SIGTERM(15)/SIGCHLD(17)**：仅置目标 PCB pending 位即返回 0，投递点 = 目标下次任意 syscall 返回前（SIGTERM 默认动作终止、编码 15；SIGCHLD 默认忽略清位）；**sig==0**：存在性探活 | 0 / `-EINVAL`/`-ESRCH` |
+
+**fork 返回的寄存器布置**（对照 Linux fork 语义）：父进程经既有 int80 popa/iretd 原样还原全部 gp 寄存器、eax 写回子 pid；子进程首次派发经 `fork_user_resume_stub` 重装 ds/es/fs/gs=0x23 后按父被陷时的 pusha 快照逆序弹回全部 gp 寄存器（**eax 强制 0**）并 iretd 回到 `int $0x80` 下一条指令、同一 user ESP/EFLAGS —— 子进程视角即「fork() 返回了 0」，其余寄存器与父逐一相同（ring3 封装若依赖 int80 不 clobber 寄存器——如 sock_abi 的 `sc5()`——父子两侧均成立）。
+
+**wait-status 编码**（Linux wait(2) 兼容，`*status` 原样透传 PCB `exit_code` 字段）：
+
+| 进程结局 | status 字 | ring3 解码 |
+|---|---|---|
+| 正常退出 `exit(code)` / 例程自然返回 | `(code & 0xFF) << 8` | `WIFEXITED(s)` ⇔ `(s & 0x7F)==0`；`WEXITSTATUS(s)` ⇔ `(s>>8) & 0xFF` |
+| 被 SIGKILL/SIGTERM 终止（含投递点默认动作） | `sig & 0x7F` | `WIFSIGNALED(s)` ⇔ 低 7 位非零；`WTERMSIG(s)` ⇔ `s & 0x7F` |
+
+**fd_table 继承语义**（按 `process.h process_fork` 契约注释落实）：本内核 VFS fd 表是全局单例（vfs.c `fds[VFS_MAX_FD]`，PCB 无 per-process 字段），fork 取**浅共享**——零拷贝零引用计数，父子的打开文件集合即全体进程共享的同一张表，任一 close 全体可见；无独立 fd 空间/close 传播语义。每进程 fd 表涉及禁区 vfs.c 改动，留待后续统一规划。
+
+**信号数据面设计要点**：PCB 新增 `ppid / exit_code / sig_pending(uint32 位图) / wait_target` 四字段；固定编号 `CATOS_SIGKILL=9 / CATOS_SIGTERM=15 / CATOS_SIGCHLD=17`（process.h）。子进程终止时自动给存活父置 SIGCHLD pending（默认动作忽略，真实收割走 waitpid 扫描）；濒死进程的孤儿子女做 zombie 预收割或摘链（`ppid=0`，不重父 init 的最小语义）。已知限制：① fork 后未触碰的 COW 页 RW=0，写意图 syscall 缓冲区（recv/read 等 w=1 校验）落在其上会先得 `-EFAULT`——waitpid 的 status 出参已做 **COW 感知豁免**（PTE 带 `_PAGE_COW` 即视为写缺页可解，逐页走表校验，真只读段仍拒绝），其余写意图路径需先以一次用户态写触发私有化规避；② 长 sti 轮询型内核调用（resolve/ping）期间到达的 SIGTERM 延迟到该次返回时投递；③ 纯用户态自旋进程只有 SIGKILL 能即时终止；④ nr=13 wait 保持恒 `-ECHILD` stub，新代码一律用 nr=34。
+
 ---
 
 ## 4. 参数寄存器约定
@@ -234,6 +260,9 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | ping_stats(30) | 字节数 / `-EFAULT` |
 | resolve(31) | 0（写 *out_ip）/ `-EFAULT`(name/out 审计) / `-EINVAL`(域名非法·长度>64·响应畸形) / `-ENETUNREACH`(未配置 resolver) / `-ETIMEDOUT` / `-ECONNREFUSED`(rcode!=0) |
 | net_stats(32) | 条目数(≤13，cap 截断后直通) / `-EFAULT` / cap==0 → 0（不触碰用户内存） |
+| fork(33) | 子 pid / 0（子）/ `-12`(ENOMEM：表满或 PMM 耗尽) / `-1`(pcb[0]/内核例程上下文/帧扫描失败) |
+| waitpid(34) | 子 pid / `-EINVAL`(options≠0·pid==0·pid<-1) / `-EFAULT`(status 不可写) / `-ECHILD`(无匹配子女；含目标非我子女) |
+| kill(35) | 0 / `-EINVAL`(pid==0·pid≥32·sig 白名单外) / `-ESRCH`(目标不存在)；SIGKILL 自杀路径不返回 |
 
 ---
 
@@ -311,6 +340,8 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | N6 | vfs.c:46-64 `[VFS-FD] selftest` | 代码内置自检，本任务未复跑 | 断言逻辑见 vfs.c:46-64，输出标记 `[VFS-FD] selftest PASS ...` |
 | N7 | L1（listen 自动绑定）、H2（bind 同端口）、M 族错误码区分等加固 | 未修复/进行中 | 缺口编号登记见 `docs/SOCKET_API.md` §6；本文档如实记录现状行为 |
 | N8 | nr=32 `net_stats`（阶段5 任务1 新增） | NOT_TESTED（运行时） | 副本编译自检通过；ring3 实测入口为 shell 内建 `netstat`，计数器写入点均为既有行为路径旁的单条 u32 自增 |
+| N9 | nr=33/34/35 fork/waitpid/kill（2026-08-26 新增） | 见副本验收记录 | 契约见 §3.4；副本内已完成内核态冒烟（fork→COW 写缺页→waitpid 收割退出码）与 sock_abi 式 ring3 自证（F 族断言），主仓运行时复验归 orchestrator；已知限制四条见 §3.4 末 |
+| N10 | nr≥36 预留（poll 等） | 锁定声明 | 编号锁定见 §3.4 头注；任何任务不得占用 |
 
 ---
 

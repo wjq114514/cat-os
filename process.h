@@ -15,13 +15,16 @@
 
 #include <stdint.h>
 
-/* 五态模型（任务书规定）：语义对照 Linux TASK_* 位集。 */
+/* 五态模型（任务书规定）：语义对照 Linux TASK_* 位集。PROC_BLOCKED 自
+ * fork/waitpid/信号里程碑起具备真实睡眠/唤醒语义：进入 = process_wait_block()
+ * （置态后 sched_yield 不回队），唤醒 = exit_process_code() 扫描匹配等待者改
+ * READY 并重新入队（对照 Linux TASK_UNINTERRUPTIBLE + try_to_wake_up 裁剪版）。 */
 typedef enum {
-    PROC_CREATED = 0,   /* 已分配 PCB，栈未就绪 */
+    PROC_CREATED = 0,   /* 已分配 PCB，栈未就绪（空槽 memset 态） */
     PROC_READY,         /* 在就绪队列中等待调度 */
     PROC_RUNNING,       /* 当前 CPU 正在此上下文上执行 */
-    PROC_BLOCKED,       /* 等待事件（本 milestone 仅定义，无睡眠/唤醒原语）*/
-    PROC_TERMINATED     /* 已退出，待回收 */
+    PROC_BLOCKED,       /* 阻塞等待事件（waitpid；唤醒源见 exit_process_code）*/
+    PROC_TERMINATED     /* 已退出，待 wait 收割（zombie）或惰性回收 */
 } proc_state_t;
 
 /* 地址空间句柄：沿用旧版 process.h 字段布局保证兼容。
@@ -40,6 +43,15 @@ typedef enum { PROC_CTX_KERNEL = 0, PROC_CTX_USER } proc_ctx_t;
  * sched_preempt_tick 注释）；就绪队列空时仍由 schedule_next() 兜底回落。 */
 #define MAX_PROCESSES 32u
 
+/* ── 信号最小集固定编号（Linux x86 对齐；nginx M1 数据面，无 handler 框架）──
+ * pending 位图为 PCB 内 uint32_t 位图（bit<<sig），仅本三号 + sig==0 探活受
+ * 支持；其余编号 kill 层直接 -EINVAL。默认动作：SIGKILL/SIGTERM=终止，
+ * SIGCHLD=忽略留待 wait 收割（投递点 = 目标进程下次 int80 返回前）。 */
+#define CATOS_SIGKILL    9u   /* linux-ref include/uapi/asm-generic/signal-defs.h 族 */
+#define CATOS_SIGTERM   15u
+#define CATOS_SIGCHLD   17u
+#define CATOS_SIGNAL_MAX 31u /* pending 位图容量上界（uint32_t） */
+
 typedef struct process {
     uint32_t        pid;
     proc_state_t    state;
@@ -51,6 +63,13 @@ typedef struct process {
     uint32_t        kstack_phys;    /* 内核栈物理页；0=未分配/已回收 */
     uint32_t        ksp;            /* context_switch 后的内核 ESP 快照 */
     struct process *next_ready;     /* 就绪队列单向链指针 */
+    /* ── 进程家族/退出/信号数据面（fork/waitpid/kill 里程碑）──────────── */
+    uint32_t        ppid;           /* 父 pid；0=内核直系（不可被 wait）*/
+    int32_t         exit_code;      /* TERMINATED 后有效：正常退出=(code&0xFF)<<8，
+                                     * 信号致死=sig&0x7F（Linux wait status 编码）*/
+    uint32_t        sig_pending;    /* 信号 pending 位图，bit (1u<<sig) */
+    uint32_t        wait_target;    /* BLOCKED 等待者：目标子 pid / -1=任意子；
+                                     * 仅 state==PROC_BLOCKED 期间有意义 */
 } process_t;
 
 extern process_t pcb[MAX_PROCESSES];
@@ -64,7 +83,31 @@ void     sched_preempt_tick(void);   /* stage4: IRQ0 时钟抢占钩子 */
 void     sched_start(void);
 void     sched_launch(void);
 void     exit_process(int pid);
+/* 带退出码的终止（waitpid 数据面）：exit_process(pid) 等价 exit_process_code(pid,0)。
+ * code 传入时即按 Linux wait status 编码：正常退出调用方传 (code&0xFF)<<8；
+ * 信号致死路径传 sig&0x7F。副作用：记录 exit_code、唤醒匹配的 BLOCKED 等待父、
+ * 给存活父置 SIGCHLD pending、对濒死进程的孤儿子女做摘链/zombie 预收割。 */
+void     exit_process_code(int pid, int code);
 uint32_t process_current_pid(void);
+
+/* ── waitpid 内核原语（syscall.c sys_waitpid 以三段循环组装阻塞语义）──────── */
+/* 单次扫描：在 current 的子女（ppid==current->pid 且槽位在用）中找 target
+ * （-1=任意）已 TERMINATED 者。命中返回子 pid 并经 *code_out 带出编码化
+ * exit_code（不收割，收割由 process_wait_reap 完成）；有活子但无 zombie 返回 0；
+ * 无匹配子女返回 -ECHILD。单核无抢占窗口内 scan+copy-out+reap 天然原子。 */
+int      process_wait_scan(int target, int32_t *code_out);
+/* 阻塞原语：current 置 PROC_BLOCKED + 记录等待目标 + sched_yield()（BLOCKED
+ * 不回队，既有语义）；被 exit_process_code 唤醒改 READY 入队后本函数返回，
+ * 调用方必须重跑 scan（唤醒可能是多子女竞争下的"虚假唤醒"）。禁止忙等。 */
+void     process_wait_block(int target);
+/* 收割 zombie：释放残留内核栈/私有目录并 memset 清槽（slot 可复用）。 */
+void     process_wait_reap(int pid);
+
+/* ── kill 语义核心（nr=35 数据面；返回 0 / -EINVAL / -ESRCH）─────────────────
+ * SIGKILL → 对目标直接 exit_process_code(编码 sig)；SIGTERM/SIGCHLD → 仅置
+ * 目标 pending 位（投递点 = 目标下次 syscall 返回前，见 syscall.c 投递器）；
+ * sig==0 为存在性探活。自杀（pid==current）走同一路径自然成立。 */
+int      process_kill(uint32_t pid, uint32_t sig);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * COW fork 内核侧核心（对照 linux-ref/kernel/fork.c kernel_clone()/copy_process()
@@ -96,9 +139,40 @@ uint32_t process_current_pid(void);
  *
  * 限制（本轮）：
  *   - 仅 PROC_CTX_KERNEL 例程上下文可调（pcb[0]/idle 拒绝）；
- *   - ring3 fork 需下一轮 syscall 接线：在 int80 中断帧上克隆
- *     （child 帧 eax=0、parent 帧 eax=pid），复用本轮 clone/fault 地基。
+ *   - ring3 fork 由下方 process_fork_user() 承接（nr=33 已接线）。
  * ═══════════════════════════════════════════════════════════════════════════ */
 int process_fork(void);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * nr=33 FORK 接线：ring3 int 0x80 中断帧上的 fork（syscall.c sys_fork 调用）。
+ *
+ * 与 process_fork() 的分工：本函数服务 PROC_CTX_USER 调用方——int80 已把
+ * 完整用户现场（pusha×8 + [vector][err] + iret 五连）压在父进程私有内核栈顶
+ * （arch.asm isr_128 布局），子进程无需克隆内核 C 栈尾，而是以"恢复到 ring3
+ * 调用点之后"的方式重建现场。
+ *
+ * 返回值布置（寄存器约定，与 process_fork 契约同源）：
+ *   - 父进程：普通 C 返回 → interrupts.c 写回帧 eax=子 pid；其余 gp 寄存器
+ *     经既有 popa/iretd 原样还原（ring3 sc5() 无 clobber 契约依赖此）；
+ *   - 子进程：首次派发经 context_switch 进入 fork_user_resume_stub：
+ *     重装 ds/es/fs/gs=0x23 → 按父被陷时的 pusha 快照逆序弹回全部 gp 寄存器
+ *     （eax 强制 0）→ iretd 回到 int $0x80 下一条指令、同一 user ESP/EFLAGS。
+ *     即子进程视角 = "fork 调用返回了 0"，其余寄存器与父逐一相同。
+ *
+ * 中断帧定位（无 interrupts.c 配合的强签名扫描）：自本函数栈帧锚点向栈顶
+ * 扫描 [w[0]==128][w[1]==0][user eip][cs==0x1B][IF][uesp][ss==0x23] 六元组，
+ * 唯一命中即 vector 槽；gp 快照按 frame_t 相对偏移取回。扫描失败拒绝 fork
+ * （-1），绝不凭猜测克隆。
+ *
+ * 资源语义：地址空间 paging_clone_address_space() COW 克隆（写缺页走 ISR14
+ * 已接线路径）；fd_table 全局单例浅共享（同 process_fork 注释）；ppid/信号
+ * 位图清零初始化，exit_code=0。调度：子 PROC_READY 入队尾，零改动复用既有
+ * schedule_next()/抢占 tick。
+ *
+ * 限制（诚实声明）：legacy 共享目录进程（page_dir==0）fork 后，共享目录中
+ * 可写用户页被双侧标 RO+COW，其他同目录进程的写意图 syscall 缓冲区在首次
+ * 写缺页前会得 -EFAULT（user_access_ok 查 RW 位）；每进程 fd 表仍留待禁区
+ * 解锁。 ═══════════════════════════════════════════════════════════════════ */
+int process_fork_user(void);
 
 #endif /* CATOS_PROCESS_H */

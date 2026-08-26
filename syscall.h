@@ -10,6 +10,13 @@
 #define CATOS_EADDRINUSE 98
 #define CATOS_EMFILE 24
 #define CATOS_ENOTCONN 107
+/* ── errno 补充（fork/waitpid/kill 组；数值依据 linux-ref include/uapi/
+ *    asm-generic/errno-base.h：EPERM=:7 ESRCH=:3 ENOENT=:2 ECHILD=:11 行）── */
+#define CATOS_EPERM 1
+#define CATOS_ESRCH 3
+#define CATOS_ENOENT 2
+#define CATOS_E2BIG 7
+#define CATOS_ECHILD 10
 #define CATOS_AF_INET 2
 #define CATOS_SOCK_DGRAM 2
 #define CATOS_SOCK_STREAM 1
@@ -26,6 +33,15 @@
 #define CATOS_SYS_PING_STATS 30
 #define CATOS_SYS_RESOLVE 31
 #define CATOS_SYS_NET_STATS 32
+/* ── 进程控制组编号锁定（2026-08-26，nginx M1 任务）：nr=33/34/35 归
+ *    fork/waitpid/kill 专属；poll 及后续扩展自 nr=36 起预留，不得占用。
+ *    EXEC/EXIT/WAIT(13) 为历史号段自 syscall.c 迁入统一管理（值不变）。 ── */
+#define CATOS_SYS_EXEC 11
+#define CATOS_SYS_EXIT 12
+#define CATOS_SYS_WAIT 13   /* 遗留 stub（恒 -ECHILD），真实语义在 nr=34 */
+#define CATOS_SYS_FORK 33
+#define CATOS_SYS_WAITPID 34
+#define CATOS_SYS_KILL 35
 #define CATOS_ETIMEDOUT 110
 void syscall_init(void);
 int32_t syscall_dispatch(uint32_t,uint32_t,const uint32_t *);

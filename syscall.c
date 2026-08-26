@@ -15,39 +15,28 @@
 
 /* ── code2 改动范围声明（Cat-OS 并行任务，文件锁：本文件追加修改）───────
  * exec/exit/wait 进程类系统调用（nr=11..13）：
- *   - elf_load/create_user_process/exit_process 的实现在 elf.c/process.c
- *     （其他代理区域），本文件仅按任务书以 extern 声明对接，不 include
- *     elf.h/process.h —— 避免在并行窗口拉入其未提交中间态。
+ *   - elf_load/create_user_process/exit_process 的实现在 elf.c/process.c。
+ *     [fork/waitpid/kill 里程碑更新] process.h 已随本轮由本任务接管并定稿，
+ *     改为正式 #include "process.h"；elf_load 继续走 elf.h（line 52 已含）。
  *   - shell 镜像来自 shell_bin.h（本代理生成）；kernel.c 尚未 include 该头，
  *     故以 weak extern 引用，符号缺失时链接通过、运行时判空走 VFS 分支。
  *   - nr=11..13 落于 VFS 兼容层号段（<20）但 vfs_syscall 对其无分支
  *     （vfs.c default→-ENOSYS），故在 syscall_dispatch 前置拦截，无重叠。
  * 任务书原稿与头文件定稿的接口差异（create_process/双参 exit_process、
- * elf_load(path) 签名）已按 elf.h:44 / process.h:66-69 定稿适配，见回执。
+ * elf_load(path) 签名）已按 elf.h:44 / process.h 定稿适配，见回执。
  */
-/* code2: 进程类系统调用号（syscall.h 锁定不可改，常量暂驻本文件；
- * TODO(解锁后): 迁入 syscall.h 与既有 CATOS_SYS_* 家族对齐——先例同 M2 的
- * CATOS_EMSGSIZE 驻留方案）。 */
-#define CATOS_SYS_EXEC 11
-#define CATOS_SYS_EXIT 12
-#define CATOS_SYS_WAIT 13
-#define CATOS_EPERM    1   /* linux-ref include/uapi/asm-generic/errno-base.h:7 */
-#define CATOS_ENOENT   2   /* 同上 :2 */
-#define CATOS_E2BIG    7   /* 同上 :8 */
-#define CATOS_ECHILD  10   /* 同上 :11 */
+/* 进程类系统调用号：CATOS_SYS_EXEC=11 / CATOS_SYS_EXIT=12 / CATOS_SYS_WAIT=13
+ * 及新增 CATOS_SYS_FORK=33 / CATOS_SYS_WAITPID=34 / CATOS_SYS_KILL=35 均已
+ * 迁入 syscall.h 统一锁定（2026-08-26；poll 预留 nr>=36）。 */
+#include "process.h"
 
-/* code2: 对接其他代理实现的外部接口（签名逐字对照定稿头文件）：
- *   elf.h:44      int elf_load(const void *image, size_t len, uint32_t *entry_out);
- *                 （注意：镜像内存指针 + 长度，而非任务书原稿的 path 单参）
- *   process.h:66  int create_user_process(uint32_t user_entry, uint32_t page_dir,
- *                                         uint32_t user_esp);
- *   process.h:68  void exit_process(int pid);（单参，非任务书原稿双参）
- *   process.h:69  uint32_t process_current_pid(void); */
-extern int elf_load(const void *image, unsigned int len, uint32_t *entry_out);
-extern int create_user_process(uint32_t user_entry, uint32_t page_dir,
-                               uint32_t user_esp);
-extern void exit_process(int pid);
-extern uint32_t process_current_pid(void);
+/* code2: 对接 process.h 定稿接口（原 extern 块已由 #include "process.h" 取代）：
+ *   elf.h:44        int elf_load(const void *image, unsigned int len, uint32_t *entry_out);
+ *   process.h       int create_user_process(uint32_t user_entry, uint32_t page_dir,
+ *                                           uint32_t user_esp);
+ *   process.h       void exit_process(int pid) / exit_process_code(pid, code);
+ *   process.h       uint32_t process_current_pid(void);
+ *   process.h [新]  process_fork_user / process_wait_{scan,block,reap} / process_kill */
 
 #include "elf.h"   /* stage4: CATOS_SOCKABI_* 栈布局常量（elf.h） */
 
@@ -207,27 +196,114 @@ static int sys_exec(const uint32_t *a)
     }
 }
 
-/* exit(status)：标记当前进程 TERMINATED（exit_process），调度器随即将
- * 上下文切走，本调用对 ring3 不再返回。status 暂无处存储 —— PCB 无退出码
- * 字段（process.h 定稿无此成员），待 wait 实装一并扩展。
- * TODO(code2): PCB 增加 exit_status 后于此记录，供 wait 收割上报。 */
+/* exit(status)：标记当前进程 TERMINATED（exit_process_code）并记录编码化
+ * 退出码（status&0xFF)<<8，Linux wait-status 兼容），随后唤醒 BLOCKED 等待父、
+ * 给存活父置 SIGCHLD pending；调度器随即将上下文切走，对 ring3 不再返回。
+ * 退出码由 waitpid(nr=34) 收割上报 —— sys_exit 原「status 暂无处存储」缺口就此结清。 */
 static int sys_exit(const uint32_t *a)
 {
     uint32_t pid = process_current_pid();
-    if (pid == 0u) return -CATOS_EPERM; /* pcb[0]=idle/内核保留位（process.h:52），禁自杀 */
-    (void)a[0]; /* status：见上注 */
-    exit_process((int)pid);
+    if (pid == 0u) return -CATOS_EPERM; /* pcb[0]=idle/内核保留位（process.h），禁自杀 */
+    exit_process_code((int)pid, (int)(((uint32_t)a[0] & 0xFFu) << 8));
     return 0;
 }
 
-/* wait(status_out)：stub —— 真实等待需要 PROC_BLOCKED 的睡眠/唤醒原语
- * （process.h 五态模型中该态仅定义，process.c 无 sleep/wakeup）。
- * 对照 linux-ref kernel/exit.c:1448：无（可收割）子进程 → -ECHILD。
- * TODO(code2): 阻塞原语就绪后实现子进程链表扫描 + 退出码回收。 */
+/* wait(status_out)：nr=13 遗留 stub —— 真实等待语义由 nr=34 waitpid 承接
+ * （PROC_BLOCKED 睡眠/唤醒原语已落地：process_wait_block/exit_process_code 唤醒）。
+ * 本号保留恒 -ECHILD 行为不变（无既有消费方依赖破坏面）；libc/新代码一律用 34。 */
 static int sys_wait(const uint32_t *a)
 {
     if (bad_user((const void *)(uintptr_t)a[0], 4u, 1)) return -CATOS_EFAULT;
     return -CATOS_ECHILD;
+}
+
+/* ── fork/waitpid/kill（nr=33/34/35，nginx M1 三件套）────────────────────── */
+
+/* fork(void)：ring3 路径全权委托 process_fork_user()——在 int80 中断帧上
+ * COW 克隆（子 eax=0 / 父 eax=子 pid 的寄存器布置见其契约注释）。内核例程
+ * 上下文误入本号返回 -1（该场景应直接调 process_fork()，不经 int80）。 */
+static int sys_fork(const uint32_t *a)
+{
+    (void)a;
+    return process_fork_user();
+}
+
+/* COW 感知的写意图指针复核：user_access_ok(w=1) 对「PRESENT|USER 但 RW=0、
+ * 带 _PAGE_COW」的未私有化页（fork 后未触碰）会误判不可写；此类页的 CPU 写
+ * 会经 ISR14 缺页路径透明私有化（CR0.WP=1 已启用），故写意图按「RW 或 COW」
+ * 判定（对照 Linux access_ok/GUP：地址无需当前可写）。逐页走表校验：
+ * 任一页非 PRESENT|USER，或既无 RW 又无 COW（真只读段）→ 拒绝。
+ * 仅用于本文件新增调用（waitpid 的 status 出参）；socket 族既有严格语义不变。 */
+static int user_cow_faultable(uintptr_t u, uint32_t n)
+{
+    uint32_t cr3;
+    const pde_t *pd;
+
+    if (!user_access_ok(u, n, 0)) return 0;     /* 边界/存在性先按读意图把关 */
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    pd = (const pde_t *)phys_to_virt(cr3 & PAGE_MASK);
+    for (uintptr_t v = u & PAGE_MASK; v < u + n; v += PAGE_SIZE) {
+        pde_t pde = pd[PDE_INDEX(v)];
+        const pte_t *pt;
+        pte_t pte;
+        if (!(pde & _PAGE_PRESENT) || !(pde & _PAGE_USER) || (pde & _PAGE_PSE))
+            return 0;
+        pt = (const pte_t *)phys_to_virt(pde & PAGE_MASK);
+        pte = pt[PTE_INDEX(v)];
+        if (!(pte & _PAGE_PRESENT) || !(pte & _PAGE_USER))
+            return 0;
+        if (!(pte & (_PAGE_RW | _PAGE_COW)))
+            return 0;                           /* 真只读：写必错，维持 -EFAULT */
+    }
+    return 1;
+}
+
+/* waitpid(pid,&status,options)：最小语义阻塞等待。
+ *   pid>0  恰等该子女（非我子女 → -ECHILD，POSIX 同）；
+ *   pid=-1 等任意子女；
+ *   options!=0 / pid==0 / pid<-1 → -EINVAL（WNOHANG 等未实现，显式拒绝）；
+ *   status 为 NULL 时允许（调用方放弃退出码），否则须可写 4B。
+ * 循环体 = scan →(zombie) copy-out + reap → 返回子 pid；
+ *          scan →(有活子无 zombie) process_wait_block() 阻塞让 CPU，
+ *          被 exit_process_code 唤醒后重扫（竞争落败=虚假唤醒安全）；
+ *          scan →(-ECHILD) 直接返回。禁止忙等：BLOCKED 不回队、零轮询。 */
+static int sys_waitpid(const uint32_t *a)
+{
+    int32_t target = (int32_t)a[0];
+    uint32_t ust = a[1];
+
+    if (a[2] != 0u) return -CATOS_EINVAL;
+    if (target == 0 || target < -1) return -CATOS_EINVAL;
+    if (ust != 0u && bad_user((const void *)(uintptr_t)ust, 4u, 1) &&
+        !user_cow_faultable(ust, 4u))
+        return -CATOS_EFAULT;
+
+    for (;;) {
+        int32_t code = 0;
+        int z = process_wait_scan(target, &code);
+        if (z > 0) {
+            /* 写用户态前复检：RW 直写；COW 页经内核态缺页透明私有化后落笔
+             * （CR0.WP=1 下 CPL0 写 RO+COW 触发 ISR14 解析，iretd 重执行）。
+             * 两查皆败则仍收割并返回子 pid（放弃 status 上报）。 */
+            if (ust != 0u &&
+                (user_access_ok(ust, 4u, 1u) ||
+                 user_cow_faultable(ust, 4u))) {
+                *(volatile int32_t *)(uintptr_t)ust = code;
+            }
+            process_wait_reap(z);
+            return z;
+        }
+        if (z < 0) return z;            /* -ECHILD */
+        process_wait_block(target);
+    }
+}
+
+/* kill(pid,sig)：语义核心在 process_kill（SIGKILL 直杀 / SIGTERM/SIGCHLD 置
+ * pending 位 / sig==0 探活）。注意 SIGTERM 自杀路径在本调用内即完成投递前
+ * 置位、正常返回 0，真正的终止发生在 dispatch 尾部投递点（本 syscall 返回前）。 */
+static int sys_kill(const uint32_t *a)
+{
+    return process_kill(a[0], a[1]);
 }
 
 /* code2: 进程类分发入口（syscall_dispatch 前置拦截转发至此） */
@@ -237,6 +313,9 @@ static int proc_syscall(uint32_t nr, const uint32_t *a)
     case CATOS_SYS_EXEC: return sys_exec(a);
     case CATOS_SYS_EXIT: return sys_exit(a);
     case CATOS_SYS_WAIT: return sys_wait(a);
+    case CATOS_SYS_FORK: return sys_fork(a);
+    case CATOS_SYS_WAITPID: return sys_waitpid(a);
+    case CATOS_SYS_KILL: return sys_kill(a);
     default: return -CATOS_ENOSYS;
     }
 }
@@ -246,12 +325,54 @@ static int proc_syscall(uint32_t nr, const uint32_t *a)
  *   5 个传参寄存器）；n 恒为 6；返回值经 sign-extend 写回 EAX，负值为 -errno。
  * nr<20 整体委托 vfs_syscall（VFS 兼容 ABI：0/3=read（3 为 Linux x86-32 read 号，
  * L8 close 别名已拆除）/1=write/5=open/6=close，详见 nr==28 处 L8 说明块）。 */
-int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
+/* ── 信号投递点（nr=35 数据面的消费端；无 handler 框架，默认动作制）────────
+ * 时机契约：每次 int80 分发返回前检查 current 的 pending 位图 ——
+ *   SIGTERM/SIGKILL → 默认动作终止：exit_process_code(self, sig&0x7F)，本调用
+ *                     不再返回（调度器切走，iretd 永不执行，中断帧随栈废弃）；
+ *   SIGCHLD         → 默认动作忽略：清位即可（真实收割走 nr=34 waitpid 扫描）。
+ * 投递优先级 KILL>TERM>CHLD。pcb[0] 寄居上下文（enter_usermode 探针）与空槽
+ * 一律跳过。限制（诚实声明）：长阻塞内核操作（resolve/ping 的 sti 轮询窗）
+ * 中到达的信号延迟到该次 syscall 返回时统一投递；纯用户态自旋中的进程仅
+ * SIGKILL 可即时终止（SIGTERM 需其发起下一次 syscall）。 */
+static int32_t syscall_signal_deliver(int32_t r)
+{
+    uint32_t pid = process_current_pid();
+    process_t *p;
+    uint32_t pend;
+
+    if (pid == 0u || pid >= MAX_PROCESSES) return r;
+    p = &pcb[pid];
+    pend = p->sig_pending;
+    if (pend == 0u) return r;
+
+    if (pend & (1u << CATOS_SIGKILL)) {
+        p->sig_pending &= ~(1u << CATOS_SIGKILL);
+        kputs("[OK] signal deliver: SIGKILL -> pid=");
+        kput_dec(pid);
+        kputs("\n");
+        exit_process_code((int)pid, (int)(CATOS_SIGKILL & 0x7Fu));
+        return r;                       /* 不可达防御 */
+    }
+    if (pend & (1u << CATOS_SIGTERM)) {
+        p->sig_pending &= ~(1u << CATOS_SIGTERM);
+        kputs("[OK] signal deliver: SIGTERM -> pid=");
+        kput_dec(pid);
+        kputs("\n");
+        exit_process_code((int)pid, (int)(CATOS_SIGTERM & 0x7Fu));
+        return r;                       /* 不可达防御 */
+    }
+    if (pend & (1u << CATOS_SIGCHLD)) {
+        p->sig_pending &= ~(1u << CATOS_SIGCHLD);   /* 默认动作：忽略留待 wait */
+    }
+    return r;
+}
+
+static int32_t syscall_dispatch_nr(uint32_t nr,uint32_t n,const uint32_t *a){
     (void)n;if(!a)return -CATOS_EFAULT; /* 防御性守卫：现调用点 a 恒为内核栈数组非空 */
-    /* code2: 进程类 nr=11..13 先于 VFS 兼容层分发。vfs_syscall 对未知 nr
-     * 返回 -ENOSYS（vfs.c default 分支），与本组号段无重叠；前置拦截避免
-     * exec/exit/wait 误入 VFS default 路径。 */
-    if(nr>=11u&&nr<=13u)return proc_syscall(nr,a);
+    /* code2: 进程类 nr=11..13 / 33..35 先于 VFS 兼容层与 socket 表分发。
+     * vfs_syscall 对未知 nr 返回 -ENOSYS（vfs.c default 分支），nr=33..35 落
+     * 其「其他(<20)? 否」之外且主 switch 无分支，前置拦截统一走 proc_syscall。 */
+    if((nr>=11u&&nr<=13u)||(nr>=CATOS_SYS_FORK&&nr<=CATOS_SYS_KILL))return proc_syscall(nr,a);
     if(nr<20)return vfs_syscall(nr,a);
     switch(nr){
     /* socket(type)：a[0]=type（house ABI 无 domain/protocol 形参）。
@@ -424,4 +545,11 @@ int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
     }
     default:return -CATOS_ENOSYS;
     }
+}
+
+/* 公共入口：分发 → 信号投递点 → 写回。所有 nr（含 VFS 兼容层路径）统一
+ * 过投递器，满足「投递点=syscall 返回前」契约（interrupts.c 仅写回 eax）。 */
+int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a)
+{
+    return syscall_signal_deliver(syscall_dispatch_nr(nr,n,a));
 }

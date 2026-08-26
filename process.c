@@ -15,6 +15,7 @@
 #include "kernel.h"
 #include "paging.h"
 #include "process.h"
+#include "syscall.h"    /* CATOS_EINVAL/ESRCH/ECHILD（waitpid/kill 错误码契约） */
 
 #include <stddef.h>
 
@@ -364,6 +365,10 @@ int process_fork_kernel(const uint32_t *cap)
     child->kstack_phys = (uint32_t)kstack;
     child->next_ready = NULL;
     child->state = PROC_READY;
+    child->ppid = parent->pid;                          /* 家族链：waitpid 匹配依据 */
+    child->exit_code = 0;                               /* 家族/信号面清零（勿继承父值） */
+    child->sig_pending = 0u;
+    child->wait_target = 0u;
     ready_enqueue(child);
 
     kputs("[OK] COW fork: parent pid=");
@@ -374,6 +379,172 @@ int process_fork_kernel(const uint32_t *cap)
     kput_hex32(child_pd);
     kputs("\n");
     return slot;                        /* 父进程经包装器拿到 eax=子 pid */
+}
+
+/* ---------------------------------------------------------------------------
+ * nr=33 ring3 fork（契约全文见 process.h process_fork_user 注释）。
+ *
+ * 子进程首派发镜像布局（context_switch 恢复序 → stub popa 序 → iretd 五连，
+ * 自低向高共 18 槽；fw[] 为 int80 中断帧相对 vector 槽的下标）：
+ *   im[0..3]  edi/esi/ebx/ebp   （context_switch 的 pops）
+ *   im[4]     eflags            （popfl；取 EFLAGS_IF_SET，同 build_initial_frame）
+ *   im[5]     &fork_user_resume_stub （context_switch 的 ret 目标）
+ *   im[6..12] 用户 edi/esi/ebp/ebx/edx/ecx/eax(=0)（stub 逆序弹回）
+ *   im[13..17] user_eip/0x1B/eflags|IF/user_esp/0x23（iretd 直返 ring3 调用点）
+ * ------------------------------------------------------------------------- */
+extern void fork_user_resume_stub(void);   /* 下方内联汇编定义 */
+
+__asm__(
+    ".text\n"
+    ".align 4\n"
+    "fork_user_resume_stub:\n\t"
+    "movw $0x23, %ax\n\t"       /* 数据段族重装（同 process_trampoline 约定）*/
+    "movw %ax, %ds\n\t"
+    "movw %ax, %es\n\t"
+    "movw %ax, %fs\n\t"
+    "movw %ax, %gs\n\t"
+    "popl %edi\n\t"             /* 父被陷时 pusha 快照逆序还原，eax=0 */
+    "popl %esi\n\t"
+    "popl %ebp\n\t"
+    "popl %ebx\n\t"
+    "popl %edx\n\t"
+    "popl %ecx\n\t"
+    "popl %eax\n\t"
+    "iretl\n"                   /* 回 ring3：int $0x80 下一条指令（AT&T 助记） */
+);
+
+/* isr_128 中断帧强签名扫描（arch.asm 布局实证）：
+ *   [vector=128][err=0][user_eip][cs=0x1B][eflags.IF][user_esp][ss=0x23]
+ * 命中处即 vector 槽 fw；gp 快照 = fw[-8..-1]（edi,esi,ebp,esp_orig,ebx,edx,ecx,eax）。
+ * 扫描区间 [本函数栈帧锚点, 内核栈页顶)，越页下界防御由调用方保证锚点在本页。 */
+static const volatile uint32_t *fork_locate_int80_frame(uintptr_t anchor,
+                                                        uintptr_t stack_top,
+                                                        uintptr_t stack_base)
+{
+    uintptr_t a = anchor & ~3u;
+    while (a + 7u * sizeof(uint32_t) <= stack_top) {
+        const volatile uint32_t *w = (const volatile uint32_t *)a;
+        if (w[0] == 128u && w[1] == 0u &&
+            w[2] >= 0x400000u && w[2] < KERNEL_VIRT_BASE &&
+            w[3] == 0x1Bu && (w[4] & 0x200u) != 0u &&
+            w[5] >= 0x1000u && w[5] < KERNEL_VIRT_BASE &&
+            w[6] == 0x23u &&
+            (a - 8u * sizeof(uint32_t)) >= stack_base) {
+            return w;
+        }
+        a += sizeof(uint32_t);
+    }
+    return NULL;
+}
+
+int process_fork_user(void)
+{
+    process_t *parent;
+    process_t *child;
+    uintptr_t kstack;
+    uint32_t child_pd = 0u;
+    uint32_t cr3_now;
+    uint32_t eflags;
+    uintptr_t c_top, stack_top, stack_base;
+    const volatile uint32_t *fw;
+    uint32_t *im;
+    int slot;
+
+    if (!current || current == &pcb[0]) {       /* idle/内核主上下文不可为父 */
+        kputs("[WARN] ring3 fork: rejected (pcb0/idle)\n");
+        return -1;
+    }
+    parent = current;
+    if (parent->ctx_type != PROC_CTX_USER || parent->kstack_phys == 0u) {
+        /* 内核例程上下文请走 process_fork()（汇编包装器路径）。 */
+        kputs("[WARN] ring3 fork: user-context only\n");
+        return -1;
+    }
+
+    __asm__ volatile("pushfl; popl %0" : "=r"(eflags));
+    __asm__ volatile("cli" ::: "memory");   /* 至镜像构建+入队完成 */
+
+    stack_top = (uintptr_t)phys_to_virt(parent->kstack_phys) + PAGE_SIZE;
+    stack_base = (uintptr_t)phys_to_virt(parent->kstack_phys);
+    {
+        /* 锚点：本函数栈帧必低于中断帧且与父内核栈同页（ring3 触发的 int80
+         * 经 TSS.esp0 落在该页顶）。取局部变量地址强制落栈。 */
+        uintptr_t anchor_slot = (uintptr_t)&slot;
+        fw = fork_locate_int80_frame(anchor_slot, stack_top, stack_base);
+    }
+    if (fw == NULL) {
+        kputs("[WARN] ring3 fork: int80 frame not found on kernel stack\n");
+        __asm__ volatile("pushl %0; popfl" :: "r"(eflags) : "memory");
+        return -1;
+    }
+
+    slot = process_alloc_slot();
+    if (slot < 0) {
+        kputs("[WARN] ring3 fork: process table full\n");
+        __asm__ volatile("pushl %0; popfl" :: "r"(eflags) : "memory");
+        return -12;                             /* ENOMEM（与 process_fork 同码） */
+    }
+    kstack = pmm_alloc_page();
+    if (!kstack) {
+        memset(&pcb[slot], 0, sizeof(pcb[slot]));
+        __asm__ volatile("pushl %0; popfl" :: "r"(eflags) : "memory");
+        return -12;                             /* ENOMEM */
+    }
+
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_now));
+    if (paging_clone_address_space(cr3_now, &child_pd) != 0) {
+        memset(&pcb[slot], 0, sizeof(pcb[slot]));
+        pmm_free_page(kstack);
+        __asm__ volatile("pushl %0; popfl" :: "r"(eflags) : "memory");
+        return -12;                             /* clone 内部已自回滚 */
+    }
+
+    c_top = (uintptr_t)phys_to_virt(kstack) + PAGE_SIZE;
+    im = (uint32_t *)(c_top - 18u * sizeof(uint32_t));
+    im[0] = fw[-8];                             /* edi（ctx_switch 弹出序）*/
+    im[1] = fw[-7];                             /* esi */
+    im[2] = fw[-4];                             /* ebx */
+    im[3] = fw[-6];                             /* ebp */
+    im[4] = EFLAGS_IF_SET;                      /* popfl（含 IF）*/
+    im[5] = (uint32_t)(uintptr_t)&fork_user_resume_stub;
+    im[6] = fw[-8];                             /* 用户 edi（stub popa 序）*/
+    im[7] = fw[-7];                             /* esi */
+    im[8] = fw[-6];                             /* ebp */
+    im[9] = fw[-4];                             /* ebx */
+    im[10] = fw[-3];                            /* edx */
+    im[11] = fw[-2];                            /* ecx */
+    im[12] = 0u;                                /* eax：子进程 fork 返回 0 */
+    im[13] = fw[2];                             /* iretd: user EIP */
+    im[14] = 0x1Bu;                             /*       user CS  */
+    im[15] = fw[4] | 0x202u;                    /*       EFLAGS(IF|bit1) */
+    im[16] = fw[5];                             /*       user ESP */
+    im[17] = 0x23u;                             /*       user SS  */
+
+    child = &pcb[slot];
+    memcpy(child, parent, sizeof(*child));      /* 结构整体复制后改写差异字段 */
+
+    child->pid = (uint32_t)slot;                /* 下标即 pid（既有约定） */
+    child->as.page_dir = child_pd;              /* 私有 COW 目录 */
+    child->kstack_phys = (uint32_t)kstack;
+    child->ksp = (uint32_t)(uintptr_t)im;
+    child->next_ready = NULL;
+    child->state = PROC_READY;
+    child->ppid = parent->pid;                  /* 家族链：waitpid 匹配依据 */
+    child->exit_code = 0;
+    child->sig_pending = 0u;
+    child->wait_target = 0u;
+    ready_enqueue(child);
+
+    __asm__ volatile("pushl %0; popfl" :: "r"(eflags) : "memory");
+
+    kputs("[OK] ring3 fork: parent pid=");
+    kput_dec(parent->pid);
+    kputs(" child pid=");
+    kput_dec((uint32_t)slot);
+    kputs(" pd=");
+    kput_hex32(child_pd);
+    kputs("\n");
+    return slot;                        /* 父进程经 dispatch 写回帧 eax=子 pid */
 }
 
 /* 任务书要求标记串：" [OK] process scheduler initialized"。 */
@@ -571,25 +742,88 @@ void sched_launch(void)
     schedule_next();
 }
 
+/* 槽位回收（收割语义公共尾）：仅可作用于"非 current"的终态/孤儿槽。
+ * 顺序：私有目录销毁（ref-- 归零还 PMM）→ 内核栈页归还 → memset 清槽
+ * （process_alloc_slot 的 CREATED+pid==0+无栈 判据随之满足，槽位可再生）。 */
+static void process_reap_slot(process_t *p)
+{
+    if (p->as.page_dir != 0u && p->as.page_dir != paging_kernel_pd_phys()) {
+        paging_destroy_address_space(p->as.page_dir);
+        p->as.page_dir = 0u;
+    }
+    if (p->kstack_phys != 0u) {
+        pmm_free_page(p->kstack_phys);
+        p->kstack_phys = 0u;
+    }
+    memset(p, 0, sizeof(*p));
+}
+
 /* 任务书 API：标记终止并回收资源。
  * 自杀路径（current==p）：栈不能立刻释放——context_switch 还要在其上
  * 保存现场，故仅置状态，物理页由 pick_next() 的惰性回收点释放；
  * 外部 kill 路径：若目标不在运行中，立即回收。 */
 void exit_process(int pid)
 {
+    exit_process_code(pid, 0);          /* 例程自然返回兜底 = exit(0) 编码 */
+}
+
+/* 带退出码的终止核心（waitpid/信号数据面；对照 linux-ref kernel/exit.c
+ * do_exit→wait_task_zombie 思路裁剪：记录编码化退出码 → 唤醒匹配等待者 →
+ * 父端 SIGCHLD pending → 孤儿子女摘链/zombie 预收割 → 既有资源回收路径）。
+ * code 为最终 wait-status 字：正常退出 (code&0xFF)<<8，信号致死 sig&0x7F。 */
+void exit_process_code(int pid, int code)
+{
     if (pid <= 0 || pid >= (int)MAX_PROCESSES) {
         return;
     }
     process_t *p = &pcb[pid];
-    if (p->state == PROC_TERMINATED) {
-        return;
+    if (p->state == PROC_TERMINATED || p->state == PROC_CREATED ||
+        p->pid == 0u) {
+        return;                         /* 已终止 / 空槽 / pid0 守卫 */
     }
 
     kputs("[OK] sched: exit pid=");
     kput_dec((uint32_t)pid);
     kputs("\n");
 
+    p->exit_code = code;
     p->state = PROC_TERMINATED;
+
+    /* [WAIT] 唤醒匹配的阻塞等待父：wait_target==-1（任意子）或恰为本 pid，
+     * 且本进程确为其子女。改 READY 入队，由其重跑 scan 收割（允许多等待者
+     * 竞争唤醒：落败者 rescan 后重新阻塞或 -ECHILD）。 */
+    for (uint32_t i = 1u; i < MAX_PROCESSES; ++i) {
+        process_t *b = &pcb[i];
+        if (b->state == PROC_BLOCKED && b->pid != 0u &&
+            (b->wait_target == 0xFFFFFFFFu ||
+             b->wait_target == (uint32_t)pid) &&
+            p->ppid == b->pid) {
+            b->state = PROC_READY;
+            ready_enqueue(b);
+        }
+    }
+
+    /* [SIG] 默认动作数据面：存活父置 SIGCHLD pending 位（投递点=父下次
+     * syscall 返回前；默认动作忽略、清位即可，真实收割走 waitpid 扫描）。 */
+    if (p->ppid != 0u && p->ppid < MAX_PROCESSES &&
+        pcb[p->ppid].pid != 0u) {
+        pcb[p->ppid].sig_pending |= (1u << CATOS_SIGCHLD);
+    }
+
+    /* [ORPHAN] 濒死进程的孤儿子女：zombie 直接预收割防槽位滞留；
+     * 活着的摘链（ppid=0）使其退出时不再匹配任何等待者（不重父 init，
+     * 最小语义：孤儿不可被 wait）。 */
+    for (uint32_t i = 1u; i < MAX_PROCESSES; ++i) {
+        process_t *c = &pcb[i];
+        if (c->pid != 0u && c->ppid == (uint32_t)pid &&
+            c->state != PROC_CREATED) {
+            if (c->state == PROC_TERMINATED) {
+                process_reap_slot(c);
+            } else {
+                c->ppid = 0u;
+            }
+        }
+    }
 
     /* [COW] 私有地址空间回收（fork 子进程路径）：用户页 ref-- 归零才还 PMM，
      * 内核半区共享不动（paging.c destroy）。page_dir==0 的 legacy 进程
@@ -603,6 +837,20 @@ void exit_process(int pid)
         }
         paging_destroy_address_space(p->as.page_dir);
         p->as.page_dir = 0u;
+    }
+
+    /* [ORPHAN SELF-REAP] 修复审查发现的 [HIGH] 问题：孤儿（ppid==0）退出后
+     * 唤醒扫描/SIGCHLD 均不命中 ppid==0，PCB 永留 TERMINATED 不可再生。
+     * 此处对已完成全部清理的孤儿自收割：memset 清零使 alloc_slot 的
+     * CREATED+pid==0+无栈 判据成立，槽位可再生。  审查来源：review-wavea
+     * 注意：仅限外部 kill 路径（current!=p）；自杀路径必须走 schedule_next()
+     * 否则 iret 回用户态时地址空间已销毁导致静默挂死。 */
+    if (current != p && p->ppid == 0u && p->state == PROC_TERMINATED) {
+        kputs("[OK] sched: orphan self-reap pid=");
+        kput_dec((uint32_t)pid);
+        kputs("\n");
+        memset(p, 0, sizeof(*p));
+        return;
     }
 
     if (current != p) {
@@ -622,6 +870,99 @@ void exit_process(int pid)
         /* 不可达防御：若调度器异常返回则安全停机，绝不带病续跑 */
         for(;;){ __asm__ volatile("cli; hlt"); }
     }
+}
+
+/* ── waitpid 三原语（阻塞循环组装见 syscall.c sys_waitpid）────────────────── */
+int process_wait_scan(int target, int32_t *code_out)
+{
+    process_t *me;
+    int have_child = 0;
+
+    if (!current || current == &pcb[0]) {
+        return -CATOS_ECHILD;           /* pcb[0] 无家族概念 */
+    }
+    me = current;
+    for (uint32_t i = 1u; i < MAX_PROCESSES; ++i) {
+        process_t *p = &pcb[i];
+        if (p->pid == 0u || p->ppid != me->pid) {
+            continue;                   /* 空槽 / 非我子女 */
+        }
+        if (target != -1 && (uint32_t)target != p->pid) {
+            continue;
+        }
+        have_child = 1;
+        if (p->state == PROC_TERMINATED) {
+            if (code_out) {
+                *code_out = p->exit_code;
+            }
+            return (int)i;              /* zombie：未收割，交调用方 copy-out 后 reap */
+        }
+    }
+    return have_child ? 0 : -CATOS_ECHILD;
+}
+
+void process_wait_block(int target)
+{
+    process_t *p = current;
+
+    if (!p || p == &pcb[0]) {
+        return;                         /* idle 无可阻 */
+    }
+    p->wait_target = (uint32_t)target;
+    if (p->state == PROC_RUNNING) {
+        p->state = PROC_BLOCKED;        /* sched_yield 对 BLOCKED 纯让出不回队 */
+    }
+    sched_yield();
+    /* 返回即已被 exit_process_code 唤醒入队并再度派发；调用方必须重扫。 */
+}
+
+void process_wait_reap(int pid)
+{
+    if (pid <= 0 || pid >= (int)MAX_PROCESSES) {
+        return;
+    }
+    process_t *p = &pcb[pid];
+    if (p->state != PROC_TERMINATED || p->pid == 0u) {
+        return;                         /* 非 zombie：拒绝误收割 */
+    }
+    /* zombie 不可能是 current（自杀路径已 schedule_next 一去不返），栈安全。 */
+    process_reap_slot(p);
+}
+
+/* ── kill 语义核心（nr=35；契约见 process.h process_kill 注释）─────────────── */
+int process_kill(uint32_t pid, uint32_t sig)
+{
+    process_t *t;
+
+    if (pid == 0u || pid >= MAX_PROCESSES) {
+        return -CATOS_EINVAL;           /* 无进程组语义，最小实现直接拒绝 */
+    }
+    if (sig != 0u && sig != CATOS_SIGKILL && sig != CATOS_SIGTERM &&
+        sig != CATOS_SIGCHLD) {
+        return -CATOS_EINVAL;           /* 白名单外编号（含 >31 无位图位）*/
+    }
+    t = &pcb[pid];
+    if (t->pid == 0u || t->state == PROC_CREATED) {
+        return -CATOS_ESRCH;
+    }
+    if (sig == 0u) {
+        return 0;                       /* 存在性探活 */
+    }
+    if (sig == CATOS_SIGKILL) {
+        /* 直接终止：目标 RUNNING/READY/BLOCKED 一律即时终态化（外部路径
+         * 即刻回收内核栈）；目标是 current 时等价自杀，本调用不再返回。 */
+        exit_process_code((int)pid, (int)(CATOS_SIGKILL & 0x7Fu));
+        return 0;
+    }
+    /* SIGTERM/SIGCHLD：置 pending 位即返回；动作延迟到目标自身 syscall
+     * 返回前投递（syscall.c 投递器：SIGTERM 默认死、SIGCHLD 默认忽略）。 */
+    t->sig_pending |= (1u << sig);
+    kputs("[OK] signal: pid=");
+    kput_dec(pid);
+    kputs(" sig=");
+    kput_dec(sig);
+    kputs(" pending\n");
+    return 0;
 }
 
 /* 核心派发：选出 next 并切换。prev 现场（含 C 局部变量所在内核栈）
