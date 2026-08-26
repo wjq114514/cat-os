@@ -14,4 +14,4 @@ __pycache__/
 *.pyc
 
 # QEMU 日志 / 调试
-*.log
+*.loglibc/tests/host_test
