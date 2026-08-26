@@ -111,7 +111,8 @@ LIBC_CFLAGS = -m32 -march=i686 -ffreestanding -fno-builtin -nostdlib \
               -Wall -Wextra -std=gnu99 -O2 -I$(LIBC_INC)
 
 LIBC_SRCS = $(LIBC_DIR)/src/string.c $(LIBC_DIR)/src/stdio.c \
-            $(LIBC_DIR)/src/stdlib.c
+            $(LIBC_DIR)/src/stdlib.c $(LIBC_DIR)/src/environ.c \
+            $(LIBC_DIR)/src/ctype.c $(LIBC_DIR)/src/errno.c
 LIBC_OBJS = $(LIBC_SRCS:.c=.o)
 LIBC_HDRS = $(wildcard $(LIBC_INC)/*.h) $(LIBC_DIR)/src/catos_syscall.h
 
@@ -149,4 +150,5 @@ libc-test: libc-check
 	./$(LIBC_DIR)/tests/host_test && echo "[OK] host unit test EXIT=0"
 libc-clean:
 	rm -f $(LIBC_OBJS) $(LIBC_DIR)/libc.a $(LIBC_DIR)/tests/smoke_test.o \
+	      $(LIBC_DIR)/tests/host_test.o \
 	      $(LIBC_DIR)/tests/smoke_test.elf $(LIBC_DIR)/tests/host_test
