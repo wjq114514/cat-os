@@ -134,3 +134,42 @@
 ---
 
 本节由 orchestrator 回填，原始协议条款不变。
+
+## 2026-08-26 并行波次记录（orchestrator 授权回填）
+
+### 已落地 commit（d934511..611b080，共 10 笔，均未 push）
+
+| commit | 内容 |
+|--------|------|
+| 7852fb9 | kernel: stage4 在 sock_abi 之后拉起常驻 ring3 shell REPL |
+| f9e226b | net: ARP 缓存老化、探测节流与失败回收；新增 arp_entry_expired 计数器 |
+| 289e9ce | kernel: 拆除 nr==3 close 别名——read(fd=3) 不再静默关闭（L8 别名拆除） |
+| a6752ca | net: DNS 名字解压缩，带指针环路防护 |
+| 7a6d754 | usermode: kbd_done 标签别名坠入空重试路径修复（用户保留区自行落地） |
+| 4acd797 | kernel: 消除 pcb[0] 饥饿；定义 /dev/kbd 多读者 FCFS 策略 |
+| b9530ff | net: DHCP 租约续期状态机——T1/T2/expire、NAK 处理、仅续期退避 |
+| fcc386e | kernel+userland: httpd 守护接线进 stage4（pid3，listen :7000）；run-httpd target |
+| 61f86c7 | docs: ABI 修订记录（nr==3 语义）+ 测试矩阵 2026-08-26 波次 |
+| 611b080 | net: 网络单体拆分为按协议模块（net_tcp.c 等），为并行开发铺路 |
+
+docs 落点补充：除专笔 61f86c7 外，f9e226b/a6752ca 各随带 docs/RING3_SYSCALL_ABI.md 同步更新。
+
+### 在途待提交（工作区 M 文件已核实，reconcile 进行中）
+
+- TCP 64 连接扩容：net.h / net_internal.h / net_tcp.c（diff 中 "64" 扩容参数密集出现）
+- nr=33/34/35 fork/waitpid/kill：process.c/h、syscall.c/h（+331 行主实现）
+- dhcp_lease 用例：tests/net_suite.py
+- S7n/backlog 对齐：reconcile 进行中，勿抢先提交
+
+### 新开工
+
+- e1000 真机加固
+- FAT16 M-B0 块设备层
+- 内存探测 E820
+- poll 事件子系统设计
+- 物理机移植评估
+
+### 阶段宣告与下一主线
+
+- **阶段 5（网络工程完整性）宣告完成**：ARP 老化（f9e226b）、DHCP 续期（b9530ff）、DNS 解析与解压缩（46ff839+a6752ca）、统计计数器均已落地。
+- 下一主线 = nginx M1（fork/waitpid 已就绪待合入）→ M2 poll → 文件系统。
