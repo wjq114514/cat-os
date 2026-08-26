@@ -27,8 +27,13 @@
 # 环境变量（均可被 CLI 覆盖）:
 #   CATOS_ISO CATOS_SERIAL CATOS_MODE CATOS_BOOT_TIMEOUT CATOS_QEMU
 #   CATOS_MEM(默认128M) CATOS_WIRE_PORT(默认12345)
+#   slirp 就绪判定缺省为 hostfwd P_TCP80 可连；设 CATOS_SLIRP_READY_MARK 后
+#   改为等该串口标记原文出现（dhcp_lease 用 "[NET] DHCP ACK ip="，与内核
+#   常驻服务解耦——pristine HEAD 无 ring3 :80 探针时端口门会假超时）
 #   hostfwd 端口: P_TCP80(18080) P_TCP81(18081) P_DEAD_TCP(18099)
 #                 P_UDP7(17007) P_UDP7000(17000) P_DEAD_UDP(16969)
+#                 P_HTTPD(18082, guest TCP:7000 httpd 守护；与既有 UDP:7000
+#                 转发分属 TCP/UDP 分表互不冲突，intfix 遗留回填 2026-08-26)
 #
 # 本脚本不写仓库内任何现有文件；串口日志默认落在脚本目录或调用方指定路径。
 # ============================================================================
@@ -73,10 +78,12 @@ mkdir -p "$(dirname "$SERIAL")"
 : > "$SERIAL"
 
 # ---- 回收本封装家族的历史残留实例（-name tag 匹配，不误伤其他任务的 QEMU）----
+# [FIX 2026-08-26] 原先 pkill -f "catos-test-" 会匹配到其他并行会话的同前缀实例
+# （多代理各自跑套件时互杀）。改为只杀本机历史 TAG 精确名 + 孤儿检测仅告警。
 TAG="catos-test-$$"
+pkill -f "^qemu-system.*-name $TAG\b" 2>/dev/null || true
 if pgrep -f "catos-test-" >/dev/null 2>&1; then
-  pkill -f "catos-test-" 2>/dev/null || true
-  sleep 1
+  echo "[qemu_run][WARN] 检测到其他会话的 catos-test-* QEMU 在跑（并行开发环境），不回收" >&2
 fi
 if [ "$MODE" = socket ]; then
   # 等待 wire 端口释放（最多 ~15s），避免 socket listen 冲突
@@ -90,7 +97,8 @@ NETARGS=()
 if [ "$MODE" = slirp ]; then
   P_TCP80="${P_TCP80:-18080}"; P_TCP81="${P_TCP81:-18081}"; P_DEAD_TCP="${P_DEAD_TCP:-18099}"
   P_UDP7="${P_UDP7:-17007}"; P_UDP7000="${P_UDP7000:-17000}"; P_DEAD_UDP="${P_DEAD_UDP:-16969}"
-  NETARGS=(-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${P_TCP80}-:80,hostfwd=tcp:127.0.0.1:${P_TCP81}-:81,hostfwd=tcp:127.0.0.1:${P_DEAD_TCP}-:9999,hostfwd=udp:127.0.0.1:${P_UDP7}-:7,hostfwd=udp:127.0.0.1:${P_UDP7000}-:7000,hostfwd=udp:127.0.0.1:${P_DEAD_UDP}-:16969" -device e1000,netdev=net0)
+  P_HTTPD="${P_HTTPD:-18082}"
+  NETARGS=(-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${P_TCP80}-:80,hostfwd=tcp:127.0.0.1:${P_TCP81}-:81,hostfwd=tcp:127.0.0.1:${P_DEAD_TCP}-:9999,hostfwd=udp:127.0.0.1:${P_UDP7}-:7,hostfwd=udp:127.0.0.1:${P_UDP7000}-:7000,hostfwd=udp:127.0.0.1:${P_DEAD_UDP}-:16969,hostfwd=tcp:127.0.0.1:${P_HTTPD}-:7000" -device e1000,netdev=net0)
 else
   NETARGS=(-netdev "socket,id=net0,listen=127.0.0.1:${WIRE_PORT}" -device e1000,netdev=net0)
 fi
@@ -111,7 +119,16 @@ trap 'kill "$QPID" 2>/dev/null; exit 130' INT TERM
 
 # ---- 就绪等待 ----------------------------------------------------------------
 DEADLINE=$(( $(date +%s) + BOOT_TIMEOUT ))
-if [ "$MODE" = slirp ]; then
+SLIRP_READY_MARK="${CATOS_SLIRP_READY_MARK:-}"
+if [ "$MODE" = slirp ] && [ -n "$SLIRP_READY_MARK" ]; then
+  echo "[qemu_run] waiting '$SLIRP_READY_MARK' in serial (<= ${BOOT_TIMEOUT}s) ..."
+  while :; do
+    grep -qF -- "$SLIRP_READY_MARK" "$SERIAL" 2>/dev/null && break
+    kill -0 "$QPID" 2>/dev/null || { echo "[qemu_run] QEMU died during boot"; exit 3; }
+    if [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "[qemu_run] BOOT TIMEOUT"; exit 4; fi
+    sleep 0.5
+  done
+elif [ "$MODE" = slirp ]; then
   echo "[qemu_run] waiting guest:80 via hostfwd 127.0.0.1:${P_TCP80} (<= ${BOOT_TIMEOUT}s) ..."
   while :; do
     if port_busy "$P_TCP80"; then break; fi
