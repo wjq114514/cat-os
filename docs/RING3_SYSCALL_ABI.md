@@ -102,8 +102,19 @@ ring3 侧生成方式参考（只读旁证，非本 ABI 的规范来源）：`us
 | 28 | close | a[0]=fd | **唯一 socket-aware 关闭路径**：FILE_SOCKET → `net_socket_close` 成功后接 `vfs_socket_close` 释放 fd；普通文件 → 回落 `vfs_close` | `net_socket_close` / `vfs_close` | syscall.c:167-188；net.c:553-563 |
 | 29 | ping | a[0]=目标文本(≤16B), a[1]=out, a[2]=out_len, a[3]=id(u16), a[4]=seq(u16) | 文本不可读/out 不可写 → EFAULT；非法地址走「写错误串入 out」而非错误码（既定演示语义） | `net_parse_ipv4` + `net_ping` | syscall.c:189-193 |
 | 30 | ping_stats | a[0]=out, a[1]=out_len | out 不可写 → EFAULT | `net_ping_stats` | syscall.c:194-196 |
+| 31 | resolve | a[0]=name(域名文本，≤64B), a[1]=out_ip*(u32×1) | name 首字节不可读 / 扫描中任一字节不可读 → EFAULT；65B 内无终止 NUL（长度>64）→ EINVAL；out4 不可写 → EFAULT；成功(返回0)才写 *out_ip | `net_dns_resolve`（net.c） | syscall.c nr=31 分支；net.h NETDNS_E* |
 | 32 | net_stats | a[0]=out(struct net_stats*), a[1]=cap(条目数,u32) | cap 先截断到 NET_STATS_COUNT(12) 再按 cap×4B 预检 out 可写 → EFAULT（截断先行，杜绝超大 cap×4 无符号回绕绕审）；cap==0 不触碰用户内存返回 0 | `net_stats_snapshot` | syscall.c:386-396；net.c:1212-1218；net.h:74-95 |
 | 其他 (≥20) | — | — | `-ENOSYS(-38)` | — | syscall.c:197 |
+
+**nr=31 补充说明**（阶段5 第二棒）：向 DHCP option 6 学得的 resolver（无 DHCP 时回落
+slirp 惯例 `10.0.2.3`，见 net.c `g_dns`）发送 RD=1 的 A/IN 查询（UDP:53，随机 txid +
+临时端口 49152..53247）；内部 sti 轮询至多 300 ticks、每 25 ticks 重发（net_ping 同款
+节奏）。响应仅取 answer 首条 A 记录，CNAME 链最多跳 4；只认字面量标签名
+（`05hello03com` 形式），遇 `0xC0` 压缩指针直接失败（防解引用越界，fail-closed 取舍：
+压缩型 resolver 会得到 -EINVAL）。返回码：0 成功 / `-EINVAL(-22)` 域名非法或响应畸形 /
+`-ENETUNREACH(-101)` 未配置 resolver / `-ETIMEDOUT(-110)` 超时 / `-ECONNREFUSED(-111)`
+rcode!=0。串口观测：成功 `[NET] DNS <name> -> <ip>`，失败 `[NET] DNS <name> fail (<原因>)`。
+ring3 参考：shell 内建 `resolve <host>` 命令（shell_user.c）。
 
 **nr=32 补充说明**（阶段5 任务1）：out 按 `struct net_stats` 字段序线性接收计数器
 （12×uint32 连续无填充，字段布局即 ABI，见 net.h:80-94）；成功返回**写入条目数**
@@ -213,6 +224,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | read/write(0/1) | ±字节数 / `-EBADF` / `-EFAULT` |
 | ping(29) | 字节数（非法地址写串而非报错，syscall.c:190-192）/ `-EFAULT` |
 | ping_stats(30) | 字节数 / `-EFAULT` |
+| resolve(31) | 0（写 *out_ip）/ `-EFAULT`(name/out 审计) / `-EINVAL`(域名非法·长度>64·响应畸形) / `-ENETUNREACH`(未配置 resolver) / `-ETIMEDOUT` / `-ECONNREFUSED`(rcode!=0) |
 | net_stats(32) | 条目数(≤12，cap 截断后直通) / `-EFAULT` / cap==0 → 0（不触碰用户内存） |
 
 ---

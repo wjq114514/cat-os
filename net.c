@@ -26,6 +26,8 @@ static void memset6(uint8_t *d){for(int i=0;i<6;i++)d[i]=0;}
 /* ═══════════ 全局配置 ═══════════ */
 static uint8_t  g_mac[6];
 static uint32_t g_ip,g_gw,g_mask;   /* 均以网络序存储 */
+static uint32_t g_dns;              /* resolver IPv4（网络序）：DHCP option 6 学得，
+                                       无 DHCP 时 net_poll 回落 slirp 惯例 10.0.2.3 */
 static uint16_t ip_id;
 static uint32_t seq_gen=0x12340000; /* 本地 TCP ISN 生成器 */
 static uint32_t dhcp_xid, dhcp_offer, dhcp_server, dhcp_mask, dhcp_gw;
@@ -258,7 +260,7 @@ static void dhcp_handle(const uint8_t *d,uint32_t n){
     if(n<240||d[0]!=2||d[1]!=1||d[2]!=6||ntoh32(*(const uint32_t*)(d+4))!=dhcp_xid)return;
     if(d[28]!=g_mac[0]||d[29]!=g_mac[1]||d[30]!=g_mac[2]||d[31]!=g_mac[3]||d[32]!=g_mac[4]||d[33]!=g_mac[5])return;
     if(d[236]!=99||d[237]!=130||d[238]!=83||d[239]!=99)return;
-    uint8_t mt=0;uint32_t i=240;while(i<n&&d[i]!=255){if(d[i]==0){i++;continue;}if(i+1>=n||i+2+d[i+1]>n)break;uint8_t l=d[i+1];if(d[i]==53&&l)mt=d[i+2];else if(d[i]==54&&l==4)memcpy_u(&dhcp_server,d+i+2,4);else if(d[i]==1&&l==4)memcpy_u(&dhcp_mask,d+i+2,4);else if(d[i]==3&&l>=4)memcpy_u(&dhcp_gw,d+i+2,4);i+=2+l;}
+    uint8_t mt=0;uint32_t i=240;while(i<n&&d[i]!=255){if(d[i]==0){i++;continue;}if(i+1>=n||i+2+d[i+1]>n)break;uint8_t l=d[i+1];if(d[i]==53&&l)mt=d[i+2];else if(d[i]==54&&l==4)memcpy_u(&dhcp_server,d+i+2,4);else if(d[i]==1&&l==4)memcpy_u(&dhcp_mask,d+i+2,4);else if(d[i]==3&&l>=4)memcpy_u(&dhcp_gw,d+i+2,4);else if(d[i]==6&&l==4)memcpy_u(&g_dns,d+i+2,4);i+=2+l;}
     if(mt==2&&dhcp_state==DHCP_WAIT_OFFER){dhcp_offer=*(const uint32_t*)(d+16);dhcp_state=DHCP_WAIT_ACK;dhcp_send(3);dhcp_last=ticks;dhcp_wait=2;return;}
     if(mt==5&&dhcp_state==DHCP_WAIT_ACK){dhcp_offer=*(const uint32_t*)(d+16);net_set_ip(dhcp_offer);net_set_gateway(dhcp_gw);net_set_subnet(dhcp_mask);dhcp_state=DHCP_DONE;kputs("[NET] DHCP ACK ip=");net_ip_print(g_ip);kputs(" gw=");net_ip_print(g_gw);kputs(" mask=");net_ip_print(g_mask);kputs("\n");}
 }
@@ -289,6 +291,135 @@ void udp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     }
     else NETSTAT_INC(rx_drop_full);
     kputs("[NET] UDP :");kput_dec(dport);kputs(" <- ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs(" ");kput_dec(dlen);kputs("B\n");
+}
+
+/* ═══════════ DNS 最小解析器（阶段5 第二棒）═══════════
+ * 报文布局（RFC 1035 §4.1）:
+ *   头 12B: ID(2) FLAGS(2: QR|Opcode|AA|TC|RD|RA|Z|RCODE) QDCOUNT(2)
+ *           ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
+ *   Question: QNAME(标签序列 05hello03com00) QTYPE(2=1 A) QCLASS(2=1 IN)
+ *   Answer:   NAME TYPE CLASS TTL(4) RDLENGTH RDATA
+ * 仅支持字面量标签名；遇 0xC0 压缩指针一律失败返回（防越界解引用，任务红线）。
+ * 轮询模型照抄 net_ping()：sti 进环、总超时 300 ticks、每 25 ticks 重发。 */
+#define DNS_PORT          53u
+#define DNS_QTYPE_A       1u
+#define DNS_QCLASS_IN     1u
+#define DNS_NAME_MAX      64u     /* 输入域名长度上限 */
+#define DNS_QNAME_CAP     80u     /* 编码域名缓冲上限（含根终止 0，栈上 ≤80B 红线） */
+#define DNS_TOTAL_TIMEOUT 300u    /* ticks @100Hz */
+#define DNS_RESEND_TICKS  25u     /* 重发节拍（同 net_ping） */
+#define DNS_CNAME_MAX     4u      /* CNAME 链最大跳数 */
+/* 错误码契约见 net.h（NETDNS_E*，与函数声明同处） */
+
+/* 跳过报文中的一个域名（不读内容）。只认字面量标签；0xC0-0xFF 高位即失败；
+ * 全程以 msg+n 为界，杜绝越界读。成功时 *off 指向名字之后一字节。 */
+static bool dns_skip_name(const uint8_t *msg,uint32_t n,uint32_t *off){
+    uint32_t p=*off;
+    while(p<n){
+        uint8_t l=msg[p];
+        if(l==0){*off=p+1;return true;}
+        if(l&0xC0)return false;             /* 压缩指针：直接失败 */
+        p++;if(p+l>n)return false;          /* 标签体越过报文尾 */
+        p+=l;
+    }
+    return false;                           /* 未遇终止 0 即到尾 */
+}
+
+int net_dns_resolve(const char *name,uint32_t *out_ip){
+    if(!name||!out_ip)return NETDNS_EARGS;
+    if(!g_dns)return NETDNS_ENORESOLVER;
+    uint8_t pkt[12+DNS_QNAME_CAP+4];        /* 头+编码域名+QTYPE/QCLASS 单缓冲 */
+    for(uint32_t i=0;i<sizeof(pkt);i++)pkt[i]=0;
+    seq_gen+=0x9e3779b9u;                   /* txid 由 ISN 生成器派生 */
+    uint16_t txid=(uint16_t)(seq_gen>>16);
+    pkt[2]=0x01;pkt[5]=1;                   /* RD=1, QDCOUNT=1 */
+    uint32_t np=12,labpos=0;
+    for(uint32_t i=0;;i++){
+        char c=name[i];
+        if(c!='\0'&&i>=DNS_NAME_MAX)return NETDNS_EARGS;
+        if(c=='.'||c=='\0'){
+            uint32_t llen=i-labpos;
+            if(llen==0||llen>63)return NETDNS_EARGS;         /* 空/超长标签 */
+            if(np+1+llen>12+DNS_QNAME_CAP-1)return NETDNS_EARGS; /* 编码区上限 */
+            pkt[np]=(uint8_t)llen;memcpy_u(pkt+np+1,name+labpos,llen);np+=1+llen;
+            if(c=='\0')break;
+            labpos=i+1;
+        }else{
+            bool ok=(c>='0'&&c<='9')||(c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='-';
+            if(!ok)return NETDNS_EARGS;                      /* 标签字符白名单 */
+        }
+    }
+    if(np==12)return NETDNS_EARGS;          /* 空名 */
+    pkt[np++]=0;                            /* 根终止 */
+    pkt[np]=0;pkt[np+1]=(uint8_t)DNS_QTYPE_A;pkt[np+3]=(uint8_t)DNS_QCLASS_IN;
+    uint16_t qlen=(uint16_t)(np+4);
+    /* 临时端口 + 内部直取 UDP 槽（不经 udp_open 免日志噪音）；语义同其内部赋值 */
+    udp_sock_t *us=NULL;uint16_t lport=0;
+    for(uint32_t t=0;t<4&&!us;t++){
+        uint16_t p=(uint16_t)(0xC000u+((txid+t*97u)&0x1FFFu)); /* 49152..53247 临时段 */
+        if(p==67||p==68||udp_sock_by_port(p))continue;
+        us=udp_sock_find_free();if(us){us->used=true;us->bound=true;us->owned=false;us->lport=p;us->head=us->n=0;lport=p;}
+    }
+    if(!us)return NETDNS_ENORESOLVER;
+    socket_t ts;ts.type=SOCK_UDP;ts.udp.lport=lport;ts.udp.slot=(uint8_t)(us-udp_socks);ts.udp.owned=0;
+    /* 失败归因：串口日志与错误码共用；TO=超时，其余映射见函数尾 */
+    enum { DNS_TO,DNS_FMT,DNS_RCODE,DNS_TRUNC,DNS_CNAME,DNS_NOA } cause=DNS_TO;
+    static const char *const dns_reasons[]={"timeout","format","rcode","truncated","cname depth","no A record"};
+    uint32_t rcode=0,ip=0;bool got=false;
+    __asm__ volatile("sti" ::: "memory");
+    uint32_t start=ticks;
+    while(!g_ip&&(uint32_t)(ticks-start)<DNS_TOTAL_TIMEOUT)net_poll();   /* 等 DHCP 就绪（同 net_ping） */
+    start=ticks;uint32_t last_send=0xFFFFFFFFu;
+    uint8_t rxb[512];                        /* 经典 UDP DNS 上限 512B */
+    while((uint32_t)(ticks-start)<DNS_TOTAL_TIMEOUT){
+        if(last_send==0xFFFFFFFFu||(uint32_t)(ticks-last_send)>=DNS_RESEND_TICKS){
+            (void)udp_send(g_dns,(uint16_t)DNS_PORT,lport,pkt,qlen);last_send=ticks;}
+        for(;;){
+            uint32_t sip;uint16_t sport;
+            int n=udp_recvfrom(&ts,&sip,&sport,rxb,sizeof(rxb));
+            if(n<0)break;
+            if(n<12)continue;               /* 截断头：当垃圾丢弃 */
+            uint32_t rn=(uint32_t)n;        /* 此处起 n∈[12,512]，转无符号免符号比较 */
+            uint16_t id=(uint16_t)((rxb[0]<<8)|rxb[1]);
+            if(id!=txid)continue;           /* 重发残留/无关包 */
+            uint16_t flags=(uint16_t)((rxb[2]<<8)|rxb[3]);
+            if(!(flags&0x8000))continue;    /* QR=0 非响应 */
+            if(flags&0x000F){rcode=(uint32_t)(flags&0xF);cause=DNS_RCODE;break;}
+            if(flags&0x0200){cause=DNS_TRUNC;break;}
+            uint32_t qd=((uint32_t)rxb[4]<<8)|rxb[5],an=((uint32_t)rxb[6]<<8)|rxb[7];
+            uint32_t off=12,hops=0;bool fmt=false;
+            for(uint32_t q=0;q<qd;q++){if(dns_skip_name(rxb,rn,&off)&&off+4<=rn)off+=4;else{fmt=true;break;}}
+            for(uint32_t a=0;a<an&&!fmt;a++){
+                if(!dns_skip_name(rxb,rn,&off)){fmt=true;break;}
+                if(off+10>rn){fmt=true;break;}
+                uint16_t type=(uint16_t)((rxb[off]<<8)|rxb[off+1]);
+                uint16_t cls=(uint16_t)((rxb[off+2]<<8)|rxb[off+3]);
+                uint16_t rdlen=(uint16_t)((rxb[off+8]<<8)|rxb[off+9]);
+                off+=10;
+                if(off+rdlen>rn){fmt=true;break;}
+                if(cls==(uint16_t)DNS_QCLASS_IN&&type==(uint16_t)DNS_QTYPE_A&&rdlen==4){memcpy_u(&ip,rxb+off,4);got=true;break;}
+                if(type==(uint16_t)5&&++hops>DNS_CNAME_MAX){cause=DNS_CNAME;fmt=true;break;} /* CNAME 链 >4 跳 */
+                off+=rdlen;
+            }
+            if(fmt&&cause==DNS_TO)cause=DNS_FMT;
+            if(got||fmt)break;
+            if(an){cause=DNS_NOA;break;}    /* 应答走完仍无 A 记录 */
+            break;                          /* an==0 合规空响应：继续等重发 */
+        }
+        if(got||cause!=DNS_TO)break;
+        net_poll();
+    }
+    __asm__ volatile("cli" ::: "memory");
+    us->used=false;us->bound=false;           /* 归还临时槽位 */
+    if(got){
+        kputs("[NET] DNS ");kputs(name);kputs(" -> ");net_ip_print(ip);kputs("\n");
+        *out_ip=ip;                           /* 仅成功时写 */
+        return 0;
+    }
+    kputs("[NET] DNS ");kputs(name);kputs(" fail (");kputs(dns_reasons[cause]);
+    if(cause==DNS_RCODE){kputs("=");kput_dec(rcode);}
+    kputs(")\n");
+    return cause==DNS_TO?NETDNS_ETIMEOUT:cause==DNS_RCODE?NETDNS_EREFUSED:NETDNS_EARGS;
 }
 
 socket_t *udp_open(uint16_t lport){
@@ -1213,7 +1344,7 @@ void net_set_subnet(uint32_t mask){g_mask=mask;}
 
 void net_napi_poll(void){e1000_poll();}
 
-void net_poll(void){e1000_poll();tcp_tick();if(dhcp_state!=DHCP_DONE&&dhcp_wait&&ticks-dhcp_last>=dhcp_wait*100u){dhcp_wait=0;if(dhcp_retries++>=6){net_set_ip(hton32(0x0A00020F));net_set_gateway(hton32(0x0A000202));net_set_subnet(hton32(0xFFFFFF00));dhcp_state=DHCP_DONE;kputs("[NET] DHCP failed, fallback static\n");}else{dhcp_xid^=(uint32_t)ip_id+0x9e3779b9u;dhcp_send(1);dhcp_state=DHCP_WAIT_OFFER;dhcp_wait=2;dhcp_last=ticks;}}}
+void net_poll(void){e1000_poll();tcp_tick();if(dhcp_state!=DHCP_DONE&&dhcp_wait&&ticks-dhcp_last>=dhcp_wait*100u){dhcp_wait=0;if(dhcp_retries++>=6){net_set_ip(hton32(0x0A00020F));net_set_gateway(hton32(0x0A000202));net_set_subnet(hton32(0xFFFFFF00));g_dns=hton32(0x0A000203);dhcp_state=DHCP_DONE;kputs("[NET] DHCP failed, fallback static\n");}else{dhcp_xid^=(uint32_t)ip_id+0x9e3779b9u;dhcp_send(1);dhcp_state=DHCP_WAIT_OFFER;dhcp_wait=2;dhcp_last=ticks;}}}
 
 /* 统计快照：按 struct net_stats 字段序线性导出到 out，至多 cap 个条目(u32)。
  * 返回写入条目数(min(cap,NET_STATS_COUNT))；out==NULL → -1；
@@ -1227,7 +1358,7 @@ int net_stats_snapshot(struct net_stats *out,uint32_t cap){
 
 void net_init(void){
     e1000_get_mac(g_mac);
-    net_set_ip(0);net_set_gateway(0);net_set_subnet(0);
+    net_set_ip(0);net_set_gateway(0);net_set_subnet(0);g_dns=0;
     kputs("[NET] up ip=");net_ip_print(g_ip);kputs(" gw=");net_ip_print(g_gw);kputs(" mask=");net_ip_print(g_mask);kputs("\n");
     /* 探测网关 MAC（无回应也不阻塞，收包路径会自行补缓存） */
     dhcp_xid=0x12340000u^ip_id;dhcp_retries=0;dhcp_wait=2;dhcp_state=DHCP_DISCOVER;dhcp_send(1);dhcp_last=ticks;dhcp_state=DHCP_WAIT_OFFER;

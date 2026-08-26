@@ -15,6 +15,7 @@
  *   nr=5  open(path,flags)      本版本未用（保留示例注释）
  *   nr=11 exec(path)            CATOS_SYS_EXEC（syscall.c code2 追加）
  *   nr=12 exit(status)          CATOS_SYS_EXIT
+ *   nr=31 resolve(name,out4)    CATOS_SYS_RESOLVE（阶段5 第二棒，最小 DNS 解析）
  *   nr=32 net_stats(out,cap)    CATOS_SYS_NET_STATS（阶段5 任务1，网络计数器快照）
  *
  * 链接布局约束（user_range_ok，syscall.c）：用户代码/数据须落在
@@ -69,6 +70,11 @@ static int32_t sys_exit(uint32_t status)
  * 契约：net_stats(out,cap) → 成功返回写入条目数(≤min(cap,12))，
  * 失败 -EFAULT；条目序 = 内核 struct net_stats 字段序（见下方 NS_* 索引）。 */
 #define CATOS_SYS_NET_STATS 32u
+/* 阶段5 第二棒：最小 DNS 解析（syscall.h CATOS_SYS_RESOLVE，nr=31）。
+ * 契约：resolve(name,out4) → 0 成功且 *out4=IPv4(网络序)；负 errno 失败：
+ * -EINVAL 域名非法/响应畸形、-ENETUNREACH 未配置 resolver、-ETIMEDOUT 超时、
+ * -ECONNREFUSED rcode!=0（见 net.h NETDNS_E* 与 docs/RING3_SYSCALL_ABI.md）。 */
+#define CATOS_SYS_RESOLVE 31u
 enum {
     NS_ARP_REQ_OUT, NS_ARP_REPLY_IN, NS_ARP_RESOLVE_MISS, NS_IP_CSUM_ERR,
     NS_ETHERTYPE_UNKNOWN, NS_UDP_NO_LISTENER, NS_RX_DROP_FULL,
@@ -78,6 +84,10 @@ enum {
 static int32_t sys_net_stats(uint32_t *buf, uint32_t cap)
 {
     return syscall3(CATOS_SYS_NET_STATS, (uint32_t)buf, cap, 0u);
+}
+static int32_t sys_resolve(const char *name, uint32_t *out_ip)
+{
+    return syscall3(CATOS_SYS_RESOLVE, (uint32_t)name, (uint32_t)out_ip, 0u);
 }
 #define SHELL_LINE_MAX 128u
 
@@ -205,6 +215,7 @@ static void cmd_help(void)
     print("  echo <text>   print text\n");
     print("  help          list commands\n");
     print("  netstat       show network stack counters\n");
+    print("  resolve <host>  resolve hostname via DNS (nr=31)\n");
     print("  exec <path>   load and run an ELF32 program via exec syscall\n");
     print("  exit          terminate this shell (exit syscall)\n");
 }
@@ -236,6 +247,39 @@ static void cmd_netstat(void)
         print_u32(st[i]);
         print("\n");
     }
+}
+
+/* resolve <host>：nr=31 域名解析。成功打印点分十进制；失败打印负 errno。
+ * out 缓冲用 .bss 静态区（用户合法区，同 cmd_netstat 惯例）。 */
+static void print_ip(uint32_t ip_be)
+{
+    const uint8_t *b = (const uint8_t *)&ip_be;
+    for (uint32_t i = 0; i < 4u; i++) {
+        print_u32(b[i]);
+        if (i < 3u)
+            print(".");
+    }
+}
+static void cmd_resolve(const char *host)
+{
+    if (*host == '\0') {
+        print("resolve: usage: resolve <host>\n");
+        return;
+    }
+    static uint32_t ip; /* .bss，位于用户合法区 */
+    int32_t r = sys_resolve(host, &ip);
+    if (r == 0) {
+        print(host);
+        print(" -> ");
+        print_ip(ip);
+        print("\n");
+        return;
+    }
+    print("resolve: ");
+    print(host);
+    print(" failed (errno ");
+    print_i32(r);
+    print(")\n");
 }
 
 /* exec <path>：路径指针直传内核；EFAULT/EINVAL 等负 errno 原样展示 */
@@ -309,6 +353,8 @@ static void shell_repl(void)
             cmd_help();
         } else if (kstrcmp(cmd, "netstat") == 0) {
             cmd_netstat();
+        } else if (kstrcmp(cmd, "resolve") == 0) {
+            cmd_resolve(rest);
         } else if (kstrcmp(cmd, "exec") == 0) {
             cmd_exec(rest);
         } else if (kstrcmp(cmd, "exit") == 0) {

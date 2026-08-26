@@ -126,6 +126,17 @@ socket_t *udp_open(uint16_t lport);
 int udp_sendto(socket_t *s, uint32_t dst_ip, uint16_t dst_port, const uint8_t *data, uint32_t len);
 int udp_recvfrom(socket_t *s, uint32_t *src_ip, uint16_t *src_port, uint8_t *buf, uint32_t max_len);
 
+/* DNS（阶段5 最小解析器，仅 syscall 上下文调用——内部 sti 轮询 300 ticks）
+ * net_dns_resolve(name,out_ip)：向 g_dns(DHCP option6/回落10.0.2.3) 发 A/IN 查询，
+ * 取 answer 首条 A 记录；CNAME 链≤4 跳；只认字面量标签名(05hello03com)，
+ * 响应遇 0xC0 压缩指针直接失败（防越界）。out_ip 仅成功时写。
+ * 错误码（负 errno，对照 linux errno-base）： */
+#define NETDNS_EARGS       (-22)   /* EINVAL：参数空/域名非法/响应畸形 */
+#define NETDNS_ENORESOLVER (-101)  /* ENETUNREACH：未配置 DNS/UDP 槽耗尽 */
+#define NETDNS_ETIMEOUT    (-110)  /* ETIMEDOUT：总超时无匹配响应 */
+#define NETDNS_EREFUSED    (-111)  /* ECONNREFUSED：响应 rcode!=0 */
+int net_dns_resolve(const char *name, uint32_t *out_ip);
+
 /* TCP */
 socket_t *tcp_listen(uint16_t port);
 int tcp_accept(socket_t *s, uint32_t *remote_ip, uint16_t *remote_port);

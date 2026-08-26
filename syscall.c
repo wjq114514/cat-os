@@ -394,6 +394,34 @@ int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
         if(bad_user((void*)a[0],cnt*4u,1))return -CATOS_EFAULT;
         return net_stats_snapshot((struct net_stats*)a[0],cnt);
     }
+    /* resolve(name,out4)（阶段5 nr=31）：a[0]=域名文本指针 a[1]=uint32_t*(4B 可写)。
+     * bad_user 双指针审计（照抄 nr=29/32 范式）：
+     *   - name 按 strnlen 上限 64 逐字节读审计（首字节预检 + 每字节 user_access_ok，
+     *     sys_fetch_path 同款扫描策略），拷入内核栈缓冲 kname[65] 后才交给
+     *     net_dns_resolve —— 用户页内容不再被网络栈直接解引用；
+     *   - out4 预检 4B 可写（w=1）；解析结果经内核暂存，仅成功(返回0)时写回，
+     *     与 net_dns_resolve「out_ip 仅成功时写」契约对齐。
+     * 返回值直通底层：0 成功 / -EINVAL 域名非法或响应畸形 / -ENETUNREACH 未配置
+     * resolver / -ETIMEDOUT / -ECONNREFUSED(rcode!=0)，语义见 net.h NETDNS_E*。
+     * 阻塞窗口：内部 sti 轮询至多 300 ticks + 等 IP 300 ticks（net_ping 同款），
+     * 仅在 syscall 上下文运行，禁止 ISR 调用。 */
+    case CATOS_SYS_RESOLVE:{
+        char kname[65];
+        const char *up=(const char*)(uintptr_t)a[0];
+        if(bad_user(up,1,0))return -CATOS_EFAULT;
+        uint32_t i=0;
+        for(;i<65u;i++){                  /* 扫至多 65B：len≤64 + 终止 NUL */
+            if(!user_access_ok((uintptr_t)(up+i),1u,0))return -CATOS_EFAULT;
+            kname[i]=up[i];
+            if(!kname[i])break;
+        }
+        if(i>=65u)return -CATOS_EINVAL;   /* 65B 内无终止 NUL → 长度>64，拒绝 */
+        if(bad_user((void*)a[1],4u,1))return -CATOS_EFAULT;
+        uint32_t ip=0;
+        int r=net_dns_resolve(kname,&ip);
+        if(r==0)*(uint32_t*)(uintptr_t)a[1]=ip;
+        return r;
+    }
     default:return -CATOS_ENOSYS;
     }
 }

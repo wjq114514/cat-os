@@ -24,6 +24,7 @@
 #define CATOS_SYS_CLOSE 28
 #define CATOS_SYS_PING 29
 #define CATOS_SYS_PING_STATS 30
+#define CATOS_SYS_RESOLVE 31
 #define CATOS_SYS_NET_STATS 32
 #define CATOS_ETIMEDOUT 110
 void syscall_init(void);
