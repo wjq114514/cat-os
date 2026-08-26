@@ -106,12 +106,16 @@ ring3 侧生成方式参考（只读旁证，非本 ABI 的规范来源）：`us
 | 32 | net_stats | a[0]=out(struct net_stats*), a[1]=cap(条目数,u32) | cap 先截断到 NET_STATS_COUNT(13) 再按 cap×4B 预检 out 可写 → EFAULT（截断先行，杜绝超大 cap×4 无符号回绕绕审）；cap==0 不触碰用户内存返回 0 | `net_stats_snapshot` | syscall.c:386-396；net.c arp_tick/net_stats_snapshot；net.h:75-97 |
 | 其他 (≥20) | — | — | `-ENOSYS(-38)` | — | syscall.c:197 |
 
-**nr=31 补充说明**（阶段5 第二棒）：向 DHCP option 6 学得的 resolver（无 DHCP 时回落
+**nr=31 补充说明**（阶段5 第二棒；解压缩升级）：向 DHCP option 6 学得的 resolver（无 DHCP 时回落
 slirp 惯例 `10.0.2.3`，见 net.c `g_dns`）发送 RD=1 的 A/IN 查询（UDP:53，随机 txid +
 临时端口 49152..53247）；内部 sti 轮询至多 300 ticks、每 25 ticks 重发（net_ping 同款
-节奏）。响应仅取 answer 首条 A 记录，CNAME 链最多跳 4；只认字面量标签名
-（`05hello03com` 形式），遇 `0xC0` 压缩指针直接失败（防解引用越界，fail-closed 取舍：
-压缩型 resolver 会得到 -EINVAL）。返回码：0 成功 / `-EINVAL(-22)` 域名非法或响应畸形 /
+节奏）。响应解析支持 RFC 1035 §4.1.4 名字解压缩（net.c `dns_read_name`）：压缩指针
+带环保护——目标必须落在报文头(12B)之后且严格位于当前指针之前（只准回头，前向/自指
+拒绝）、跳转 ≤8 次、全程消耗字节 ≤ 报文长度，任何越界/保留类别(0x40/0x80 前缀)
+一律判响应畸形（fail-closed 保持）。answer 取首条 A 记录（rdlength==4 定长 IP，
+不涉及名字）；CNAME 链最多跳 4：应答内扫描到链尾 A 则直接采用；若应答只有 CNAME，
+则解压目标名覆写查询包 QNAME 换新 txid 立即重发查询（跳数跨重发累计，超限
+`cname depth` 失败）。返回码：0 成功 / `-EINVAL(-22)` 域名非法或响应畸形 /
 `-ENETUNREACH(-101)` 未配置 resolver / `-ETIMEDOUT(-110)` 超时 / `-ECONNREFUSED(-111)`
 rcode!=0。串口观测：成功 `[NET] DNS <name> -> <ip>`，失败 `[NET] DNS <name> fail (<原因>)`。
 ring3 参考：shell 内建 `resolve <host>` 命令（shell_user.c）。
