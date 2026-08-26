@@ -72,6 +72,28 @@ enum tcp_state {
 
 typedef struct tcp_conn tcp_conn_t;
 
+/* ─── 网络统计（阶段5 观测基建）───
+ * 唯一实例 static 于 net.c。字段布局即 ABI：net_stats_snapshot() 按字段序
+ * 线性导出（12×uint32 连续无填充），ring3 nr=32 依赖此序，勿增删/重排字段。
+ * 写上下文仅 PIT IRQ0(net_poll) / 主循环 / syscall(cli)，单核对齐 u32
+ * 自增天然原子，免锁；ISR 路径零分配零格式化。 */
+#define NET_STATS_COUNT 12u
+struct net_stats {
+    uint32_t arp_req_out;        /* arp_request: ARP 请求帧成功提交 TX */
+    uint32_t arp_reply_in;       /* arp_handle: 收到指向本机的 ARP reply */
+    uint32_t arp_resolve_miss;   /* arp_resolve: 缓存未命中(触发请求) */
+    uint32_t ip_csum_err;        /* ip_handle: IPv4 头校验和失败丢弃 */
+    uint32_t ethertype_unknown;  /* net_handle_packet: 未识别 ethertype */
+    uint32_t udp_no_listener;    /* udp_handle: 无 socket 绑定该端口 */
+    uint32_t rx_drop_full;       /* udp_handle: RX 队列满整包丢弃 */
+    uint32_t tcp_rst_sent;       /* tcp_send_rst_ack 各调用点发出的 RST/RST-ACK */
+    uint32_t tcp_rto_rexmit;     /* tcp_tick: RTO 到期重传(SYN-ACK/FIN/数据) */
+    uint32_t tcp_sack_rexmit;    /* tcp_tx_retransmit_lost: SACK 选择性重传 */
+    uint32_t tcp_persist_probe;  /* tcp_tick: 零窗口 persist 探测(1B) */
+    uint32_t icmp_echo_out;      /* icmp_handle: echo reply 成功发出 */
+};
+int net_stats_snapshot(struct net_stats *out, uint32_t cap);
+
 /* ─── Socket API ─── */
 typedef enum { SOCK_CLOSED, SOCK_UDP, SOCK_TCP_LISTEN, SOCK_TCP_ESTAB, SOCK_UDP_UNBOUND, SOCK_TCP_UNBOUND } sock_type_t;
 

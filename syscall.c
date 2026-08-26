@@ -383,6 +383,17 @@ int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
     /* ping_stats(out,out_len)：EFAULT 审计通过 —— a[1] 长度参与
      * user_access_ok 的 n<=0xBFC00000-v 上界判断，无整数溢出（paging.c:330）。 */
     case CATOS_SYS_PING_STATS:{if(bad_user((void*)a[0],a[1],1))return -CATOS_EFAULT;return net_ping_stats((char*)a[0],a[1]);}
+    /* net_stats(out,cap)（阶段5 任务1）：网络栈观测计数器快照，EFAULT 审计
+     * 照抄 nr=29/30 PING_STATS 范式 —— 差异点：cap 先截断到 NET_STATS_COUNT(12)
+     * 再按 cap×4B 预检 out 可写性（上限 48B，杜绝超大 a[1]×4 无符号回绕绕过
+     * user_access_ok 的 n 上界检查）。cap==0 → 不触碰用户内存、返回 0；
+     * 返回值直通 net_stats_snapshot：成功=写入条目数(≤min(cap,12))。
+     * 字段序契约见 net.h struct net_stats 与 docs/RING3_SYSCALL_ABI.md §3.2。 */
+    case CATOS_SYS_NET_STATS:{
+        uint32_t cnt=a[1];if(cnt>NET_STATS_COUNT)cnt=NET_STATS_COUNT;
+        if(bad_user((void*)a[0],cnt*4u,1))return -CATOS_EFAULT;
+        return net_stats_snapshot((struct net_stats*)a[0],cnt);
+    }
     default:return -CATOS_ENOSYS;
     }
 }

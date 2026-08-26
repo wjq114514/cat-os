@@ -15,6 +15,7 @@
  *   nr=5  open(path,flags)      本版本未用（保留示例注释）
  *   nr=11 exec(path)            CATOS_SYS_EXEC（syscall.c code2 追加）
  *   nr=12 exit(status)          CATOS_SYS_EXIT
+ *   nr=32 net_stats(out,cap)    CATOS_SYS_NET_STATS（阶段5 任务1，网络计数器快照）
  *
  * 链接布局约束（user_range_ok，syscall.c）：用户代码/数据须落在
  * [0x400000, 0xBFC00000)；链接基址取 0x400000（-Ttext），栈由 elf_load
@@ -64,6 +65,20 @@ static int32_t sys_exit(uint32_t status)
 
 #define CATOS_SYS_EXEC 11u
 #define CATOS_SYS_EXIT 12u
+/* 阶段5 任务1：网络统计快照（syscall.h CATOS_SYS_NET_STATS）。
+ * 契约：net_stats(out,cap) → 成功返回写入条目数(≤min(cap,12))，
+ * 失败 -EFAULT；条目序 = 内核 struct net_stats 字段序（见下方 NS_* 索引）。 */
+#define CATOS_SYS_NET_STATS 32u
+enum {
+    NS_ARP_REQ_OUT, NS_ARP_REPLY_IN, NS_ARP_RESOLVE_MISS, NS_IP_CSUM_ERR,
+    NS_ETHERTYPE_UNKNOWN, NS_UDP_NO_LISTENER, NS_RX_DROP_FULL,
+    NS_TCP_RST_SENT, NS_TCP_RTO_REXMIT, NS_TCP_SACK_REXMIT,
+    NS_TCP_PERSIST_PROBE, NS_ICMP_ECHO_OUT, NS_COUNT
+};
+static int32_t sys_net_stats(uint32_t *buf, uint32_t cap)
+{
+    return syscall3(CATOS_SYS_NET_STATS, (uint32_t)buf, cap, 0u);
+}
 #define SHELL_LINE_MAX 128u
 
 /* ── 极小运行时（无 libc）──────────────────────────────────────────────── */
@@ -87,6 +102,34 @@ static int kstrcmp(const char *a, const char *b)
 static void print(const char *s)
 {
     (void)sys_write(1u, s, kstrlen(s));
+}
+
+/* 极小无符号/带符号十进制输出（风格同 cmd_exec 的内联数字打印） */
+static void print_u32(uint32_t v)
+{
+    char b[10];
+    int i = 0;
+    if (v == 0u)
+        b[i++] = '0';
+    while (v > 0u) {
+        b[i++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+    char out[10];
+    int j = 0;
+    while (i > 0)
+        out[j++] = b[--i];
+    (void)sys_write(1u, out, (uint32_t)j);
+}
+static void print_i32(int32_t v)
+{
+    if (v < 0) {
+        char m = '-';
+        (void)sys_write(1u, &m, 1u);
+        print_u32((uint32_t)(-(v + 1)) + 1u); /* INT_MIN 安全取负 */
+        return;
+    }
+    print_u32((uint32_t)v);
 }
 
 /* ── 读一行（轮询 stdin=/dev/kbd）────────────────────────────────────────
@@ -161,8 +204,38 @@ static void cmd_help(void)
     print("Cat-OS shell commands:\n");
     print("  echo <text>   print text\n");
     print("  help          list commands\n");
+    print("  netstat       show network stack counters\n");
     print("  exec <path>   load and run an ELF32 program via exec syscall\n");
     print("  exit          terminate this shell (exit syscall)\n");
+}
+
+/* netstat：nr=32 快照并逐条打印；返回值 <0 或 > NS_COUNT 视为异常。
+ * 标签名与内核 struct net_stats 字段一一对应（docs/RING3_SYSCALL_ABI.md）。 */
+static const char *const ns_names[NS_COUNT] = {
+    "arp_req_out", "arp_reply_in", "arp_resolve_miss", "ip_csum_err",
+    "ethertype_unknown", "udp_no_listener", "rx_drop_full", "tcp_rst_sent",
+    "tcp_rto_rexmit", "tcp_sack_rexmit", "tcp_persist_probe", "icmp_echo_out"
+};
+static void cmd_netstat(void)
+{
+    static uint32_t st[NS_COUNT]; /* .bss，位于用户合法区 */
+    int32_t r = sys_net_stats(st, (uint32_t)NS_COUNT);
+    if (r <= 0 || r > (int32_t)NS_COUNT) {
+        print("netstat: snapshot failed (ret ");
+        print_i32(r);
+        print(")\n");
+        return;
+    }
+    uint32_t n = (uint32_t)r;
+    print("--- net stack counters ---\n");
+    for (uint32_t i = 0; i < n; i++) {
+        print("  ");
+        print(ns_names[i]);
+        for (uint32_t p = kstrlen(ns_names[i]); p < 20u; p++)
+            print(" ");
+        print_u32(st[i]);
+        print("\n");
+    }
 }
 
 /* exec <path>：路径指针直传内核；EFAULT/EINVAL 等负 errno 原样展示 */
@@ -234,6 +307,8 @@ static void shell_repl(void)
             cmd_echo(rest);
         } else if (kstrcmp(cmd, "help") == 0) {
             cmd_help();
+        } else if (kstrcmp(cmd, "netstat") == 0) {
+            cmd_netstat();
         } else if (kstrcmp(cmd, "exec") == 0) {
             cmd_exec(rest);
         } else if (kstrcmp(cmd, "exit") == 0) {

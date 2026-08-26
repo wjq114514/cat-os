@@ -87,7 +87,7 @@ ring3 侧生成方式参考（只读旁证，非本 ABI 的规范来源）：`us
 
 ### 3.2 网络/Socket 组（nr ≥ 20，syscall_dispatch 直辖）
 
-编号常量定义于 `syscall.h:16-26`。
+编号常量定义于 `syscall.h:16-27`。
 
 | nr | 名称 | 参数（a[i]） | 关键前置校验（按判定顺序） | 底层调用 | 证据 |
 |---|---|---|---|---|---|
@@ -102,7 +102,12 @@ ring3 侧生成方式参考（只读旁证，非本 ABI 的规范来源）：`us
 | 28 | close | a[0]=fd | **唯一 socket-aware 关闭路径**：FILE_SOCKET → `net_socket_close` 成功后接 `vfs_socket_close` 释放 fd；普通文件 → 回落 `vfs_close` | `net_socket_close` / `vfs_close` | syscall.c:167-188；net.c:553-563 |
 | 29 | ping | a[0]=目标文本(≤16B), a[1]=out, a[2]=out_len, a[3]=id(u16), a[4]=seq(u16) | 文本不可读/out 不可写 → EFAULT；非法地址走「写错误串入 out」而非错误码（既定演示语义） | `net_parse_ipv4` + `net_ping` | syscall.c:189-193 |
 | 30 | ping_stats | a[0]=out, a[1]=out_len | out 不可写 → EFAULT | `net_ping_stats` | syscall.c:194-196 |
+| 32 | net_stats | a[0]=out(struct net_stats*), a[1]=cap(条目数,u32) | cap 先截断到 NET_STATS_COUNT(12) 再按 cap×4B 预检 out 可写 → EFAULT（截断先行，杜绝超大 cap×4 无符号回绕绕审）；cap==0 不触碰用户内存返回 0 | `net_stats_snapshot` | syscall.c:386-396；net.c:1212-1218；net.h:74-95 |
 | 其他 (≥20) | — | — | `-ENOSYS(-38)` | — | syscall.c:197 |
+
+**nr=32 补充说明**（阶段5 任务1）：out 按 `struct net_stats` 字段序线性接收计数器
+（12×uint32 连续无填充，字段布局即 ABI，见 net.h:80-94）；成功返回**写入条目数**
+`min(cap, 12)`。ring3 参考：shell 内建 `netstat` 命令（shell_user.c）。
 
 ### 3.3 close 的三条路径与双重别名关系（L8）
 
@@ -157,7 +162,7 @@ ring3 close ────────┤                 否 → vfs_close()
 | `CATOS_EMFILE` | 24 | syscall.h:11 | socket 描述符表耗尽（VFS_MAX_FD=32 上限） |
 | `CATOS_EADDRINUSE` | 98 | syscall.h:10 | bind 端口冲突 / UDP 槽位占用（TCP 同端口「附着」例外，见 SOCKET_API.md §H2） |
 | `CATOS_ENOTCONN` | 107 | syscall.h:12 | send/recv 作用于非 SOCK_TCP_ESTAB 的 socket |
-| `CATOS_ETIMEDOUT` | 110 | syscall.h:27 | （已定义；本次通读未见 dispatch 返回该值的路径——待核实用途） |
+| `CATOS_ETIMEDOUT` | 110 | syscall.h:28 | （已定义；本次通读未见 dispatch 返回该值的路径——待核实用途） |
 | `CATOS_EMSGSIZE` | 90 | **syscall.c:20**（暂驻 .c 文件，受文件锁限制未迁入 syscall.h） | sendto len > 1472 |
 | `CATOS_EADDRNOTAVAIL` | 99 | **syscall.c:21**（同上） | sendto 作用于 SOCK_UDP_UNBOUND（未 bind） |
 
@@ -208,6 +213,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | read/write(0/1) | ±字节数 / `-EBADF` / `-EFAULT` |
 | ping(29) | 字节数（非法地址写串而非报错，syscall.c:190-192）/ `-EFAULT` |
 | ping_stats(30) | 字节数 / `-EFAULT` |
+| net_stats(32) | 条目数(≤12，cap 截断后直通) / `-EFAULT` / cap==0 → 0（不触碰用户内存） |
 
 ---
 
@@ -237,6 +243,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | recv | buf, len | 1 | syscall.c:164 |
 | ping | 目标文本 16 字节(w=0)；out,out_len(w=1) | 混合 | syscall.c:193 |
 | ping_stats | out, out_len（w=1；out_len 参与 `n<=0xBFC00000-v` 上界判断，合法入参无整数溢出） | 1 | syscall.c:194-195 |
+| net_stats | out, cap×4B（w=1；cap 先截断到 NET_STATS_COUNT=12 再审计，上界恒 ≤48B 无回绕） | 1 | syscall.c:386-396 |
 | open(nr==5, vfs.c:92) | path 首字节 1B(w=0)；此后**逐字节**预检直到 '\0'；累计长度 sl≥256 → `-EFAULT` | 0 | vfs.c:92 |
 | read/write(nr==0/1) | vfs_read 对 buf(n,w=1)；vfs_write 对 buf(n,w=0)。注意 vfs_write 的检查**先于** fd 校验执行（顺序事实，vfs.c:68） | 见左 | vfs.c:68 |
 
@@ -283,6 +290,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | N5 | `user_range_ok` 的现存调用点 | 待核实 | 导出符号但未见调用（§6.3） |
 | N6 | vfs.c:46-64 `[VFS-FD] selftest` | 代码内置自检，本任务未复跑 | 断言逻辑见 vfs.c:46-64，输出标记 `[VFS-FD] selftest PASS ...` |
 | N7 | L1（listen 自动绑定）、H2（bind 同端口）、M 族错误码区分等加固 | 未修复/进行中 | 缺口编号登记见 `docs/SOCKET_API.md` §6；本文档如实记录现状行为 |
+| N8 | nr=32 `net_stats`（阶段5 任务1 新增） | NOT_TESTED（运行时） | 副本编译自检通过；ring3 实测入口为 shell 内建 `netstat`，计数器写入点均为既有行为路径旁的单条 u32 自增 |
 
 ---
 

@@ -42,6 +42,11 @@ void icmp_handle(const uint8_t *,uint32_t,uint32_t);
 void udp_handle(const uint8_t *,uint32_t,uint32_t);
 void tcp_handle(const uint8_t *,uint32_t,uint32_t);
 
+/* ═══════════ 网络统计（阶段5 观测基建）═══════════
+ * 字段布局/写上下文约束见 net.h struct net_stats 注释。 */
+static struct net_stats g_net_stats;
+#define NETSTAT_INC(f) (++g_net_stats.f)
+
 /* ═══════════ ARP ═══════════ */
 #define ARP_CACHE_MAX 8
 typedef struct {uint32_t ip;uint8_t mac[6];} arp_entry_t;
@@ -64,12 +69,13 @@ static void arp_request(uint32_t ip){
     arp_pkt_t *a=(arp_pkt_t*)(p+14);
     a->htype=hton16(1);a->ptype=hton16(0x0800);a->hlen=6;a->plen=4;a->op=hton16(ARP_OP_REQUEST);
     memcpy6(a->sha,g_mac);*(uint32_t*)a->spa=g_ip;memset6(a->tha);*(uint32_t*)a->tpa=ip;
-    if(e1000_tx_submit(42)==0){kputs("[NET] ARP who-has ");net_ip_print(ip);kputs("?\n");}
+    if(e1000_tx_submit(42)==0){NETSTAT_INC(arp_req_out);kputs("[NET] ARP who-has ");net_ip_print(ip);kputs("?\n");}
 }
 
 bool arp_resolve(uint32_t ip,uint8_t mac[6]){
     if(ip==0xFFFFFFFFu){memset6(mac);for(int i=0;i<6;i++)mac[i]=0xFF;return true;}
     for(int i=0;i<arp_cache_n;i++)if(arp_cache[i].ip==ip){memcpy6(mac,arp_cache[i].mac);return true;}
+    NETSTAT_INC(arp_resolve_miss);
     arp_request(ip);
     return false;
 }
@@ -105,6 +111,7 @@ static void arp_handle(const uint8_t *p,uint32_t len){
         memcpy6(r->sha,g_mac);*(uint32_t*)r->spa=g_ip;memcpy6(r->tha,a->sha);*(uint32_t*)r->tpa=spa;
         if(e1000_tx_submit(42)==0){kputs("[NET] ARP reply -> ");net_ip_print(spa);kputs("\n");}
     }else if(op==ARP_OP_REPLY && tpa==g_ip){
+        NETSTAT_INC(arp_reply_in);
         kputs("[NET] ARP reply from ");net_ip_print(spa);kputs("\n");
     }
 }
@@ -159,7 +166,7 @@ bool ip_send(uint32_t dst,uint8_t proto,const uint8_t *data,uint32_t len){
 
 static void ip_handle(const uint8_t *p,uint32_t len){
     if(len<20)return;
-    if(ip_checksum(p,20)!=0)return;
+    if(ip_checksum(p,20)!=0){NETSTAT_INC(ip_csum_err);return;}
     const ip_hdr_t *h=(const ip_hdr_t*)p;
     uint32_t dst=h->dst;
     if(dst!=g_ip&&dst!=0xFFFFFFFF)return;
@@ -187,7 +194,7 @@ void icmp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     icmp_hdr_t *r=(icmp_hdr_t*)out;
     r->type=ICMP_TYPE_ECHO_REPLY;r->code=0;r->csum=0;
     r->csum=hton16(ip_checksum(out,seglen));
-    if(end_ip(out,seglen,IP_PROTO_ICMP)){kputs("[NET] ICMP echo reply -> ");net_ip_print(src_ip);kputs(" (");kput_dec(seglen-8);kputs("B)\n");}
+    if(end_ip(out,seglen,IP_PROTO_ICMP)){NETSTAT_INC(icmp_echo_out);kputs("[NET] ICMP echo reply -> ");net_ip_print(src_ip);kputs(" (");kput_dec(seglen-8);kputs("B)\n");}
 }
 
 static uint32_t ping_putc(char *out,uint32_t cap,uint32_t n,char c){if(n<cap)out[n]=c;return n+1;}
@@ -265,6 +272,7 @@ void udp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     if(dport==68&&sport==67){dhcp_handle(data,dlen);return;}
     udp_sock_t *s=udp_sock_by_port(dport);
     if(!s){
+        NETSTAT_INC(udp_no_listener);
         kputs("[NET] UDP :");kput_dec(dport);kputs(" no listener\n");
         return;
     }
@@ -279,6 +287,7 @@ void udp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
         memcpy_u(w+10,data,dlen);
         s->head+=4+4+2+dlen;s->n+=4+4+2+dlen;
     }
+    else NETSTAT_INC(rx_drop_full);
     kputs("[NET] UDP :");kput_dec(dport);kputs(" <- ");net_ip_print(src_ip);kputs(":");kput_dec(sport);kputs(" ");kput_dec(dlen);kputs("B\n");
 }
 
@@ -521,9 +530,11 @@ static bool tcp_tx_retransmit_lost(tcp_conn_t *c){
     for(uint32_t i=0;i<c->tx_n;i++)if(c->tx[i].used&&c->tx[i].lost&&!c->tx[i].sacked&&!c->tx[i].retransmitted){
         uint32_t off=c->tx[i].seq-c->snd_una;
         if(tcp_seq_before(c->tx[i].seq,c->snd_una)||off+c->tx[i].len>c->snd_used)continue;
-        tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->tx[i].seq,c->rcv_nxt,c->sndb+off,c->tx[i].len);
+        /* 问题1[MEDIUM]: 发送失败不标 retransmitted（continue 试下一段/留给下一 SACK 轮次或 RTO 兜底），返回值 true/false 语义不变 */
+        if(!tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->tx[i].seq,c->rcv_nxt,c->sndb+off,c->tx[i].len))continue;
         c->tx[i].retransmitted=true;c->rtt_retransmitted=true;tcp_rto_rearm(c);
         kputs("[NET] TCP SACK: re-xmit ");kput_dec(c->tx[i].len);kputs("B\n");
+        NETSTAT_INC(tcp_sack_rexmit);
         return true;
     }
     return false;
@@ -816,10 +827,11 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
             if(tcp_pending_count(dport)>=l->backlog){
                 kputs("[NET] TCP accept queue full, RST\n");
                 tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);
+                NETSTAT_INC(tcp_rst_sent);
                 return;
             }
             c=tcp_conn_find_free();
-            if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);return;}
+            if(!c){kputs("[NET] TCP conn table full, RST\n");tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);NETSTAT_INC(tcp_rst_sent);return;}
             /* 问题3[MED]: 关中断完成全部字段初始化后，最后单条 used=true 发布
                （pushfl 保存/恢复原 IF 状态，同 process.c context_switch 惯用法）。
                取代 df995a8 的"四元组最先落位"缓解 —— 彼案只缩小未闭合：
@@ -856,6 +868,7 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
            裸 RST 被静默丢弃 -> slirp 停留 SYN_SENT 重发 SYN -> 宿主侧超时，
            hostfwd 回不来 RST/EOF（blackbox rst:no_listener FAIL 根因）。 */
         tcp_send_rst_ack(src_ip,dport,sport,seq,flags,dlen);
+        NETSTAT_INC(tcp_rst_sent);
         return;
     }
 
@@ -923,8 +936,12 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
                     if(c->sack_n)sack_retx=tcp_tx_retransmit_lost(c);
                 }
                 if(!sack_retx){
-                    tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,in_flight>TCP_MSS?TCP_MSS:in_flight);
-                    c->rtt_retransmitted=true;tcp_rto_rearm(c);
+                    /* 问题2[LOW]: 快速重传发送失败则不进 fast_recovery（回退标记），仅 rearm RTO 兜底 */
+                    if(tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,in_flight>TCP_MSS?TCP_MSS:in_flight)){
+                        c->rtt_retransmitted=true;tcp_rto_rearm(c);
+                    } else {
+                        c->fast_recovery=false;tcp_rto_rearm(c);
+                    }
                 }
             } else if(c->fast_recovery&&c->dupacks>3){c->cwnd+=TCP_MSS;tcp_xmit_pending(c);}
         } else if(ack==c->snd_una&&c->peer_win>old_win){
@@ -943,7 +960,8 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
                 if(c->cwnd<c->ssthresh)c->cwnd+=acked>TCP_MSS?TCP_MSS:acked;
                 else {uint32_t inc=(TCP_MSS*acked)/(c->cwnd?c->cwnd:TCP_MSS);c->cwnd+=inc?inc:1;}
             }
-            if(c->fast_recovery&&ack>=c->recover_seq){c->cwnd=c->ssthresh;c->fast_recovery=false;}
+            /* 问题3[LOW]: fast recovery 退出比较回绕安全化(原裸 ack>=c->recover_seq unsigned 比较)，语义等价于回绕安全 >= */
+            if(c->fast_recovery&&(tcp_seq_after(ack,c->recover_seq)||ack==c->recover_seq)){c->cwnd=c->ssthresh;c->fast_recovery=false;}
             c->dupacks=0;c->rto_backoff=0;c->rto_attempts=0; /* 进度事件：R2 计数按段重置(RFC 9293 §3.8.3(a)) */
             kputs("[NET] TCP ack=");kput_dec(ack);kputs(" una=");kput_dec(c->snd_una);kputs(" sndb=");kput_dec(c->snd_used);kputs(" cwnd=");kput_dec(c->cwnd);kputs("\n");
             if(!c->sack_n||!tcp_tx_retransmit_lost(c))tcp_xmit_pending(c);
@@ -1060,6 +1078,7 @@ static void tcp_tick(void){
                    字节的重传，置 rtt_retransmitted 抑制其 ACK 产生虚假 RTT 采样
                    （与 RTO 重传路径 net.c tcp_rto_retry/fast retransmit 同口径） */
                 c->rtt_retransmitted=true;
+                NETSTAT_INC(tcp_persist_probe);
                 kputs("[NET] TCP persist probe 1B\n");tcp_persist_retry(c);
             }
         }
@@ -1074,14 +1093,17 @@ static void tcp_tick(void){
                 continue;
             }
             if(c->state==TCP_SYN_RECEIVED){
+                NETSTAT_INC(tcp_rto_rexmit);
                 kputs("[NET] TCP RTO: re-SYN-ACK\n");
                 tcp_put_pkt(c,TCP_FLAG_SYNACK,c->snd_isn,c->rcv_nxt,NULL,0);
                 tcp_rto_retry(c);
             }else if(c->state==TCP_LAST_ACK){
+                NETSTAT_INC(tcp_rto_rexmit);
                 kputs("[NET] TCP RTO: re-FIN\n");
                 tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt-1,c->rcv_nxt,NULL,0);
                 tcp_rto_retry(c);
             }else if((c->state==TCP_FIN_WAIT_1||c->state==TCP_CLOSING)&&!c->snd_used){
+                NETSTAT_INC(tcp_rto_rexmit);
                 kputs("[NET] TCP RTO: re-FIN\n");
                 tcp_put_pkt(c,TCP_FLAG_FINACK,c->snd_nxt-1,c->rcv_nxt,NULL,0);
                 tcp_rto_retry(c);
@@ -1090,6 +1112,7 @@ static void tcp_tick(void){
                 if(in_flight>c->snd_used)in_flight=c->snd_used;
                 tcp_tx_clear_marks(c); /* SACK is advisory; peer may renege after RTO. */
                 tcp_loss_window(c,in_flight);c->rtt_retransmitted=true;
+                NETSTAT_INC(tcp_rto_rexmit);
                 kputs("[NET] TCP RTO: re-xmit ");kput_dec(in_flight);kputs("B\n");
                 tcp_put_pkt(c,TCP_FLAG_ACK|TCP_FLAG_PSH,c->snd_una,c->rcv_nxt,c->sndb,in_flight);
                 tcp_rto_retry(c);
@@ -1191,6 +1214,16 @@ void net_set_subnet(uint32_t mask){g_mask=mask;}
 void net_napi_poll(void){e1000_poll();}
 
 void net_poll(void){e1000_poll();tcp_tick();if(dhcp_state!=DHCP_DONE&&dhcp_wait&&ticks-dhcp_last>=dhcp_wait*100u){dhcp_wait=0;if(dhcp_retries++>=6){net_set_ip(hton32(0x0A00020F));net_set_gateway(hton32(0x0A000202));net_set_subnet(hton32(0xFFFFFF00));dhcp_state=DHCP_DONE;kputs("[NET] DHCP failed, fallback static\n");}else{dhcp_xid^=(uint32_t)ip_id+0x9e3779b9u;dhcp_send(1);dhcp_state=DHCP_WAIT_OFFER;dhcp_wait=2;dhcp_last=ticks;}}}
+
+/* 统计快照：按 struct net_stats 字段序线性导出到 out，至多 cap 个条目(u32)。
+ * 返回写入条目数(min(cap,NET_STATS_COUNT))；out==NULL → -1；
+ * cap==0 合法：不写任何字节、返回 0。 */
+int net_stats_snapshot(struct net_stats *out,uint32_t cap){
+    if(!out)return -1;
+    uint32_t n=cap<NET_STATS_COUNT?cap:NET_STATS_COUNT;
+    memcpy_u(out,&g_net_stats,n*sizeof(uint32_t));
+    return (int)n;
+}
 
 void net_init(void){
     e1000_get_mac(g_mac);
