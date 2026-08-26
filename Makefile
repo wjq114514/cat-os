@@ -11,7 +11,7 @@ LDFLAGS = -m elf_i386 -T linker.ld -nostdlib
 QEMUFLAGS = -cdrom os.iso -m 128M -display none -serial stdio -no-reboot -no-shutdown \
             -netdev user,id=net0 -device e1000,netdev=net0
 
-OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o kbdwait.o ide.o rtc.o usermode.o vfs.o net.o \
+OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o kbdwait.o ide.o rtc.o usermode.o vfs.o net.o net_arp.o net_icmp.o net_udp.o net_dhcp.o net_dns.o net_tcp.o \
       elf.o # elf.o(code2): exec syscall 链接 elf_load 所需（elf.c 属其他代理实现）
 
 all: shell_bin.h sock_abi_bin.h httpd_bin.h os.iso
@@ -35,7 +35,7 @@ boot.o: boot.asm
 arch.o: arch.asm
 	$(AS) -f elf32 -o $@ $<
 
-%.o: %.c kernel.h paging.h multiboot.h net.h e1000.h shell_bin.h sock_abi_bin.h httpd_bin.h
+%.o: %.c kernel.h paging.h multiboot.h net.h net_internal.h e1000.h shell_bin.h sock_abi_bin.h httpd_bin.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 run: os.iso
