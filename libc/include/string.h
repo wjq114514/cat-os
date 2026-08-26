@@ -28,12 +28,29 @@ typedef __SIZE_TYPE__ size_t;
 void *memset(void *s, int c, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);      /* 不处理重叠 */
 void *memmove(void *dst, const void *src, size_t n);     /* 处理重叠   */
+int memcmp(const void *a, const void *b, size_t n);      /* <0/0/>0，unsigned char 语义 */
 
 /* 字符串 */
 size_t strlen(const char *s);
 int strcmp(const char *a, const char *b);                /* <0/0/>0，unsigned char 语义 */
 int strncmp(const char *a, const char *b, size_t n);
 char *strcpy(char *dst, const char *src);                /* 含 NUL，返回 dst */
+char *strncpy(char *dst, const char *src, size_t n);     /* 截断/补 NUL 至 n，返回 dst */
 char *strcat(char *dst, const char *src);                /* 追加含 NUL，返回 dst */
+char *strncat(char *dst, const char *src, size_t n);     /* 至多追加 n 字符 + NUL */
+
+/* 查找：均按首次/末次匹配返回指针；未命中返回 NULL。
+ * strchr/strrchr 的 c 按 unsigned char 解释，c=='\0' 时指向串尾 NUL。 */
+char *strchr(const char *s, int c);
+char *strrchr(const char *s, int c);
+char *strstr(const char *h, const char *n);              /* n 为空串 → 返回 h */
+
+/* 忽略大小写比较（仅 ASCII [A-Z] 折叠），unsigned char 语义 */
+int strcasecmp(const char *a, const char *b);
+int strncasecmp(const char *a, const char *b, size_t n);
+
+/* 可重入分词：*sp 为跨调用游标；delim 中任一字符均为分隔符；
+ * 连续分隔符视为一个（不产生空 token）；无剩余 token 返回 NULL。 */
+char *strtok_r(char *s, const char *delim, char **sp);
 
 #endif /* CATOS_LIBC_STRING_H */

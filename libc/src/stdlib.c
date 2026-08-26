@@ -19,9 +19,17 @@
  */
 
 #include "stdlib.h"
+#include "errno.h"
 #include "catos_syscall.h"
 
 typedef __UINTPTR_TYPE__ catos_uintptr_t;
+
+#ifndef __LONG_MAX__
+#define __LONG_MAX__ 2147483647L /* i386 LP32 兜底（正常由编译器内建提供） */
+#endif
+#define CATOS_LONG_MAX (__LONG_MAX__)
+#define CATOS_LONG_MIN (-__LONG_MAX__ - 1L)
+#define CATOS_ULONG_MAX ((unsigned long)__LONG_MAX__ * 2UL + 1UL)
 
 typedef struct catos_block {
     unsigned int size;              /* 载荷字节数（不含头，16 对齐）      */
@@ -150,4 +158,141 @@ void exit(int status)
     (void)catos_syscall3(CATOS_SYS_EXIT_NR, (unsigned)status, 0u, 0u);
     for (;;)
         ; /* 内核已摘除本进程；此行为编译器要求的不可达兜底 */
+}
+
+/* ── strtol/strtoul 共享扫描核心 ────────────────────────────────────────
+ * 返回按无符号累积的幅值（溢出时钳位到 ULONG_MAX），*ovf 置 1；
+ * *any 置 1 表示至少消费了一个数字。跳过空白与正负号，处理进制前缀。 */
+static unsigned long catos_strto_scan(const char *nptr, char **endptr,
+                                      int base, int *ovf, int *any,
+                                      int *neg)
+{
+    const char *s = nptr;
+    unsigned long acc = 0UL;
+    const char *digits_start;
+
+    *ovf = 0;
+    *any = 0;
+    *neg = 0;
+
+    while (*s == ' ' || (*s >= '\t' && *s <= '\r')) /* isspace，免依赖 ctype */
+        s++;
+    if (*s == '+') {
+        s++;
+    } else if (*s == '-') {
+        *neg = 1;
+        s++;
+    }
+
+    if (base == 0) { /* 自动识别 */
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+            base = 16;
+            s += 2;
+        } else if (s[0] == '0') {
+            base = 8;
+            s += 1;
+        } else {
+            base = 10;
+        }
+    } else if (base == 16) { /* 显式 16 进制允许可选前缀 */
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
+            ((s[2] >= '0' && s[2] <= '9') || (s[2] >= 'A' && s[2] <= 'F') ||
+             (s[2] >= 'a' && s[2] <= 'f')))
+            s += 2;
+    }
+
+    digits_start = s;
+    while (*s != '\0') {
+        int d;
+
+        if (*s >= '0' && *s <= '9')
+            d = *s - '0';
+        else if (*s >= 'a' && *s <= 'z')
+            d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z')
+            d = *s - 'A' + 10;
+        else
+            break;
+        if (d >= base)
+            break;
+
+        if (!*ovf) {
+            if (acc > (CATOS_ULONG_MAX - (unsigned long)d) / (unsigned long)base)
+                *ovf = 1; /* 继续消费字符只为正确设置 endptr */
+            else
+                acc = acc * (unsigned long)base + (unsigned long)d;
+        }
+        if (*ovf)
+            acc = CATOS_ULONG_MAX;
+        s++;
+    }
+
+    *any = (s != digits_start);
+    if (endptr != (char **)0)
+        *endptr = (char *)(*any ? s : nptr);
+    return acc;
+}
+
+long strtol(const char *nptr, char **endptr, int base)
+{
+    int ovf;
+    int any;
+    int neg;
+    unsigned long mag;
+
+    if (base != 0 && (base < 2 || base > 36)) {
+        if (endptr != (char **)0)
+            *endptr = (char *)nptr;
+        errno = EINVAL;
+        return 0L;
+    }
+
+    mag = catos_strto_scan(nptr, endptr, base, &ovf, &any, &neg);
+    if (!any)
+        return 0L;
+    if (ovf) {
+        errno = ERANGE;
+        return neg ? CATOS_LONG_MIN : CATOS_LONG_MAX;
+    }
+    if (neg) {
+        if (mag >= (unsigned long)CATOS_LONG_MAX + 1UL) {
+            if (mag > (unsigned long)CATOS_LONG_MAX + 1UL)
+                errno = ERANGE;
+            return CATOS_LONG_MIN; /* 恰为 -LONG_MAX-1 时合法命中 */
+        }
+        return -(long)mag; /* mag ≤ LONG_MAX：无转换风险 */
+    }
+    if (mag > (unsigned long)CATOS_LONG_MAX) {
+        errno = ERANGE;
+        return CATOS_LONG_MAX;
+    }
+    return (long)mag;
+}
+
+unsigned long strtoul(const char *nptr, char **endptr, int base)
+{
+    int ovf;
+    int any;
+    int neg;
+    unsigned long mag;
+
+    if (base != 0 && (base < 2 || base > 36)) {
+        if (endptr != (char **)0)
+            *endptr = (char *)nptr;
+        errno = EINVAL;
+        return 0UL;
+    }
+
+    mag = catos_strto_scan(nptr, endptr, base, &ovf, &any, &neg);
+    if (!any)
+        return 0UL;
+    if (ovf) {
+        errno = ERANGE;
+        return CATOS_ULONG_MAX;
+    }
+    if (neg) {
+        errno = ERANGE; /* 负值回绕标准允许；精简版选择显式报告 */
+        return 0UL - mag; /* 无符号回绕，良定义（含 mag>LONG_MAX 情形） */
+    }
+    return mag;
 }

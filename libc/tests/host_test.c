@@ -4,15 +4,22 @@
  * 目的：ring3 运行时受文件锁阻塞（exec 链路需 kernel.c/shell_bin.h/vfs.c
  * 配合，均在锁内），先在宿主机上以强符号 catos_stdout_emit 覆盖 stdio.c 的
  * 弱输出汇聚点，捕获输出做【逐字节精确断言】，验证：
- *   string 全家族、printf 全转换符（含边界值）、malloc/free 分配器行为
- *   （对齐、碎片复用、合并、防御性 free、耗尽-回收循环）。
+ *   string 全家族（含 memcmp/strncpy/strncat/strchr/strrchr/strstr/
+ *   strcasecmp 族/strtok_r）、printf 全转换符（含 %p、宽度、左对齐）、
+ *   ctype 整套、environ 家族、strtol/strtoul（含溢出饱和与 ERANGE）、
+ *   fgets/getchar（经 catos_stdin_read 强符号注入脚本化输入）、
+ *   malloc/free 分配器行为（对齐、碎片复用、合并、防御性 free、
+ *   耗尽-回收循环）。
  * int 0x80 真实通路不在本文件覆盖范围（见 README 测试证据节）。
  *
  * 编译：gcc -O2 -Wall -Wextra -Ilibc/include -o /tmp/host_test \
  *          libc/src/string.c libc/src/stdio.c libc/src/stdlib.c \
+ *          libc/src/environ.c libc/src/ctype.c libc/src/errno.c \
  *          libc/tests/host_test.c && /tmp/host_test
  */
 
+#include "ctype.h"
+#include "errno.h"
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
@@ -41,23 +48,106 @@ static void cap_reset(void)
     cap_fail = 0;
 }
 
+/* ── 输入注入：覆盖 stdio.c 的弱符号 catos_stdin_read ─────────────── */
+static const char *in_buf;
+static unsigned in_len;
+static unsigned in_pos;
+static int in_fail;
+
+int catos_stdin_read(int fd, char *buf, unsigned len)
+{
+    (void)fd; /* 注入通道不区分 fd */
+    if (in_fail)
+        return -5; /* 模拟读错误（任意负 errno） */
+    if (in_pos >= in_len)
+        return 0; /* EOF */
+    {
+        unsigned n = (len < in_len - in_pos) ? len : (in_len - in_pos);
+
+        for (unsigned i = 0u; i < n; i++)
+            buf[i] = in_buf[in_pos++];
+        return (int)n;
+    }
+}
+
+static void in_reset(const char *data)
+{
+    in_buf = data;
+    in_len = strlen(data);
+    in_pos = 0u;
+    in_fail = 0;
+}
+
 /* ── 断言框架 ─────────────────────────────────────────────────────── */
 static int g_fails;
+
+/* 失败报告直写通道（Linux i386 ABI nr=4 fd=2）：绕开输出捕获缓冲，
+ * 保证后续用例的 cap_reset 不会吞掉先前的失败现场。 */
+static void raw_out(const char *s)
+{
+    unsigned n = 0u;
+
+    while (s[n] != '\0')
+        n++;
+    __asm__ volatile("int $0x80"
+                     :: "a"(4u), "b"(2u), "c"(s), "d"(n)
+                     : "memory");
+}
+
+static void raw_out_dec(int v)
+{
+    char rev[12];
+    char buf[12];
+    int m = 0;
+    int n = 0;
+
+    if (v == 0) {
+        raw_out("0");
+        return;
+    }
+    while (v > 0) {
+        rev[m++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    while (m > 0)
+        buf[n++] = rev[--m];
+    buf[n] = '\0';
+    raw_out(buf);
+}
 
 #define EXPECT(cond, name)                                                   \
     do {                                                                     \
         if (!(cond)) {                                                       \
-            printf("FAIL: %s (line %d)\n", (name), __LINE__);                \
-            g_fails++;                                                       \
-        }                                                                    \
+            raw_out("FAIL: " name " (line ");                                 \
+            raw_out_dec(__LINE__);                                            \
+            raw_out(")\n");                                                   \
+            g_fails++;                                                        \
+        }                                                                     \
     } while (0)
+
+static void raw_out_trunc(const char *s, unsigned cap)
+{
+    unsigned n = 0u;
+
+    while (s[n] != '\0' && n < cap)
+        n++;
+    __asm__ volatile("int $0x80"
+                     :: "a"(4u), "b"(2u), "c"(s), "d"(n)
+                     : "memory");
+}
 
 static void expect_out(const char *want, const char *name)
 {
-    if (cap_fail || strcmp(cap_buf, want) != 0) {
-        printf("FAIL: %s\n  want=[%s]\n  got =[%s]\n", name, want, cap_buf);
-        g_fails++;
-    }
+    if (!cap_fail && strcmp(cap_buf, want) == 0)
+        return;
+    raw_out("FAIL: ");
+    raw_out(name);
+    raw_out("\n  want=[");
+    raw_out(want);
+    raw_out("]\n  got =[" );
+    raw_out_trunc(cap_buf, 96u);
+    raw_out("]\n");
+    g_fails++;
 }
 
 /* ══ 1. string 家族 ═══════════════════════════════════════════════════ */
@@ -287,6 +377,487 @@ static void test_exhaust_and_recover(void)
     free(big);
 }
 
+/* ══ 4. string 扩展家族 ══════════════════════════════════════════════ */
+static void test_string_ext(void)
+{
+    char buf[64];
+
+    /* memcmp：二进制语义（含内嵌 NUL 不得提前收敛） */
+    EXPECT(memcmp("abc", "abd", 3u) < 0, "memcmp lt");
+    EXPECT(memcmp("abd", "abc", 3u) > 0, "memcmp gt");
+    EXPECT(memcmp("abc", "abd", 2u) == 0, "memcmp n stops before diff");
+    EXPECT(memcmp("x", "y", 0u) == 0, "memcmp n=0");
+    {
+        char p1[3] = { 'a', '\0', 'c' };
+        char p2[3] = { 'a', '\0', 'd' };
+
+        EXPECT(memcmp(p1, p2, 3u) < 0, "memcmp binary past NUL");
+        EXPECT(memcmp(p1, p1, 3u) == 0, "memcmp self");
+    }
+
+    /* strncpy：截断不补 / 截断后补满 / 精确适配 */
+    memset(buf, 'X', sizeof(buf));
+    strncpy(buf, "abcdefg", 3u);
+    EXPECT(buf[0] == 'a' && buf[2] == 'c' && buf[3] == 'X',
+           "strncpy truncate no NUL");
+    strncpy(buf, "ab", 6u);
+    EXPECT(buf[0] == 'a' && buf[1] == 'b' && buf[2] == '\0' &&
+               buf[5] == '\0' && buf[6] == 'X',
+           "strncpy pads to n");
+    strncpy(buf, "abcd", 4u);
+    EXPECT(strlen(buf) == 4u && strcmp(buf, "abcd") == 0,
+           "strncpy exact fit incl NUL");
+    buf[0] = 'Z';
+    strncpy(buf, "never", 0u);
+    EXPECT(buf[0] == 'Z', "strncpy n=0 untouched");
+
+    /* strncat：部分追加恒单 NUL / 超长 src 全量追加 */
+    strcpy(buf, "foo");
+    strncat(buf, "barbaz", 3u);
+    EXPECT(strcmp(buf, "foobar") == 0 && strlen(buf) == 6u,
+           "strncat partial append");
+    strncat(buf, "q", 10u);
+    EXPECT(strcmp(buf, "foobarq") == 0, "strncat short src full copy");
+    strcpy(buf, "x");
+    strncat(buf, "ignored", 0u);
+    EXPECT(strcmp(buf, "x") == 0, "strncat n=0 no-op");
+
+    /* strchr：首匹配 / 未命中 / c=='\0' 指向串尾 */
+    {
+        const char *h = "hello";
+
+        EXPECT(strchr(h, 'l') == h + 2, "strchr first match");
+        EXPECT(strchr(h, 'z') == (char *)0, "strchr miss");
+        EXPECT(*strchr(h, '\0') == '\0', "strchr NUL finds terminator");
+        EXPECT(strchr("", 'a') == (char *)0, "strchr empty miss");
+        EXPECT(strchr("", '\0') != (char *)0, "strchr empty terminator");
+    }
+
+    /* strrchr：末匹配 */
+    {
+        const char *b = "banana";
+
+        EXPECT(strrchr(b, 'a') == b + 5, "strrchr last match");
+        EXPECT(strrchr(b, 'b') == b, "strrchr single");
+        EXPECT(strrchr(b, 'z') == (char *)0, "strrchr miss");
+        EXPECT(*strrchr(b, '\0') == '\0', "strrchr NUL terminator");
+    }
+
+    /* strstr：常规 / 空针 / 无命中 / 首位重叠匹配 */
+    EXPECT(strstr("hello world", "wor") ==
+               (const char *)"hello world" + 6,
+           "strstr mid match");
+    EXPECT(strstr("abc", "") == (const char *)"abc", "strstr empty needle");
+    EXPECT(strstr("", "") == (const char *)"", "strstr both empty");
+    EXPECT(strstr("", "a") == (char *)0, "strstr empty haystack miss");
+    EXPECT(strstr("abc", "abcd") == (char *)0, "strstr needle longer");
+    EXPECT(strstr("aaa", "aa") == (const char *)"aaa",
+           "strstr overlapping first");
+    EXPECT(strstr("abab", "ba") == (const char *)"abab" + 1,
+           "strstr second pos");
+
+    /* strcasecmp / strncasecmp */
+    EXPECT(strcasecmp("HeLLo", "hello") == 0, "strcasecmp fold eq");
+    EXPECT(strcasecmp("", "") == 0, "strcasecmp empty-empty");
+    EXPECT(strcasecmp("a", "b") < 0 && strcasecmp("B", "A") > 0,
+           "strcasecmp order");
+    EXPECT(strcasecmp("hello!", "hello?") < 0,
+           "strcasecmp non-letter raw diff"); /* '!'(33) < '?'(63) */
+    {
+        char hi[2] = { (char)0x80, '\0' };
+        char lo[2] = { (char)0x90, '\0' };
+
+        EXPECT(strcasecmp(hi, lo) < 0, "strcasecmp unsigned semantics");
+    }
+    EXPECT(strncasecmp("ABCDEF", "abcdefg", 6u) == 0,
+           "strncasecmp prefix eq");
+    EXPECT(strncasecmp("ABCDEF", "abcxyz", 3u) == 0 &&
+               strncasecmp("ABCDEF", "abcxyz", 4u) < 0,
+           "strncasecmp n boundary");
+    EXPECT(strncasecmp("ab", "ab", 8u) == 0, "strncasecmp NUL stop");
+    EXPECT(strncasecmp("ab", "cd", 0u) == 0, "strncasecmp n=0");
+
+    /* strtok_r：连续分隔符折叠 / 全分隔符 / 多分隔符集 / 双流交错 */
+    {
+        char t[32];
+        char *sp;
+        char *tk;
+
+        strcpy(t, "a,bb,,ccc");
+        tk = strtok_r(t, ",", &sp);
+        EXPECT(tk != (char *)0 && strcmp(tk, "a") == 0, "strtok_r tok1");
+        tk = strtok_r((char *)0, ",", &sp);
+        EXPECT(tk != (char *)0 && strcmp(tk, "bb") == 0,
+               "strtok_r skips empty field");
+        tk = strtok_r((char *)0, ",", &sp);
+        EXPECT(tk != (char *)0 && strcmp(tk, "ccc") == 0, "strtok_r tok3");
+        tk = strtok_r((char *)0, ",", &sp);
+        EXPECT(tk == (char *)0, "strtok_r exhausted");
+
+        strcpy(t, ",,,");
+        sp = (char *)0;
+        EXPECT(strtok_r(t, ",", &sp) == (char *)0,
+               "strtok_r all-delimiters");
+
+        strcpy(t, "x::y; z");
+        tk = strtok_r(t, ":; ", &sp);
+        EXPECT(tk != (char *)0 && strcmp(tk, "x") == 0,
+               "strtok_r multi-delim set 1");
+        tk = strtok_r((char *)0, ":; ", &sp);
+        EXPECT(tk != (char *)0 && strcmp(tk, "y") == 0,
+               "strtok_r multi-delim set 2");
+        tk = strtok_r((char *)0, ":; ", &sp);
+        EXPECT(tk != (char *)0 && strcmp(tk, "z") == 0,
+               "strtok_r multi-delim set 3");
+        tk = strtok_r((char *)0, ":; ", &sp);
+        EXPECT(tk == (char *)0, "strtok_r multi-delim end");
+
+        {
+            char u1[16], u2[16];
+            char *sp1, *sp2;
+
+            strcpy(u1, "1-2");
+            strcpy(u2, "3-4");
+            tk = strtok_r(u1, "-", &sp1);
+            EXPECT(tk != (char *)0 && strcmp(tk, "1") == 0,
+                   "strtok_r stream A first");
+            tk = strtok_r(u2, "-", &sp2);
+            EXPECT(tk != (char *)0 && strcmp(tk, "3") == 0,
+                   "strtok_r stream B interleaved");
+            tk = strtok_r((char *)0, "-", &sp1);
+            EXPECT(tk != (char *)0 && strcmp(tk, "2") == 0,
+                   "strtok_r stream A resumed");
+            tk = strtok_r((char *)0, "-", &sp2);
+            EXPECT(tk != (char *)0 && strcmp(tk, "4") == 0,
+                   "strtok_r stream B resumed");
+            EXPECT(strtok_r((char *)0, "-", &sp1) == (char *)0 &&
+                       strtok_r((char *)0, "-", &sp2) == (char *)0,
+                   "strtok_r both streams drained");
+        }
+    }
+}
+
+/* ══ 5. ctype 整套 ════════════════════════════════════════════════════ */
+static void test_ctype(void)
+{
+    EXPECT(isalpha('Q') && isalpha('q'), "isalpha letters");
+    EXPECT(!isalpha('1') && !isalpha(' '), "isalpha non-letters");
+    EXPECT(isdigit('7') && !isdigit('a') && !isdigit('/'), "isdigit bounds");
+    EXPECT(isspace(' ') && isspace('\t') && isspace('\n') &&
+               isspace('\v') && isspace('\f') && isspace('\r'),
+           "isspace all six");
+    EXPECT(!isspace('a') && !isspace('\0'), "isspace non-space");
+    EXPECT(isalnum('5') && isalnum('Z') && !isalnum('#'), "isalnum mix");
+    EXPECT(isupper('A') && isupper('Z') && !isupper('a'), "isupper");
+    EXPECT(islower('a') && islower('z') && !islower('A'), "islower");
+    EXPECT(isblank(' ') && isblank('\t') && !isblank('\n'),
+           "isblank space-tab only");
+    EXPECT(iscntrl(0x01) && iscntrl(0x1F) && iscntrl(0x7F),
+           "iscntrl range+DEL");
+    EXPECT(!iscntrl(' ') && !iscntrl('~'), "iscntrl printable excluded");
+    EXPECT(isprint(' ') && isprint('~') && !isprint('\t') &&
+               !isprint(0x7F),
+           "isprint [0x20,0x7E]");
+    EXPECT(isgraph('!') && isgraph('~') && !isgraph(' '),
+           "isgraph excludes space");
+    EXPECT(ispunct('!') && ispunct('/') && !ispunct('e') && !ispunct(' '),
+           "ispunct graph-non-alnum");
+    EXPECT(isxdigit('9') && isxdigit('F') && isxdigit('f') &&
+               !isxdigit('g') && !isxdigit('/'),
+           "isxdigit");
+    EXPECT(tolower('G') == 'g' && tolower('g') == 'g' &&
+               tolower('5') == '5',
+           "tolower idempotent non-upper");
+    EXPECT(toupper('g') == 'G' && toupper('G') == 'G' &&
+               toupper('%') == '%',
+           "toupper idempotent non-lower");
+    /* EOF(-1)/越界防御：分类恒 0、转换原样返回 */
+    EXPECT(!isalpha(-1) && !isdigit(-1) && !isspace(-1) && !isxdigit(-1),
+           "ctype EOF classifies false");
+    EXPECT(!isalpha(256) && !iscntrl(256), "ctype out-of-range safe");
+    EXPECT(tolower(-1) == -1 && toupper(300) == 300,
+           "ctype convert passthrough");
+}
+
+/* ══ 6. environ 家族 ══════════════════════════════════════════════════ */
+static void test_environ(void)
+{
+    static char putv_slot[] = "PUTV=direct"; /* putenv 所有权归环境 */
+
+    /* 初始空表与非法入参 */
+    EXPECT(getenv("NOPE") == (char *)0, "getenv initial empty");
+    EXPECT(getenv((char *)0) == (char *)0, "getenv NULL name");
+    EXPECT(getenv("") == (char *)0, "getenv empty name");
+    EXPECT(getenv("A=B") == (char *)0, "getenv name with '=' rejected");
+
+    /* setenv 新增 / overwrite==0 保护 / overwrite==1 替换 */
+    EXPECT(setenv("FOO", "bar", 1) == 0, "setenv new");
+    EXPECT(getenv("FOO") != (char *)0 &&
+               strcmp(getenv("FOO"), "bar") == 0,
+           "getenv roundtrip");
+    EXPECT(setenv("FOO", "baz", 0) == 0, "setenv overwrite=0 succeeds");
+    EXPECT(strcmp(getenv("FOO"), "bar") == 0, "overwrite=0 keeps value");
+    EXPECT(setenv("FOO", "qux", 1) == 0, "setenv overwrite=1");
+    EXPECT(strcmp(getenv("FOO"), "qux") == 0, "overwrite=1 replaces");
+
+    /* 空值合法 */
+    EXPECT(setenv("EMPTY", "", 1) == 0 && getenv("EMPTY")[0] == '\0',
+           "setenv empty value");
+
+    /* 非法 name */
+    EXPECT(setenv((char *)0, "v", 1) == -1, "setenv NULL name");
+    EXPECT(setenv("", "v", 1) == -1, "setenv empty name");
+    EXPECT(setenv("B=C", "v", 1) == -1, "setenv name contains '='");
+
+    /* putenv：纳入调用方串 → getenv 可见；随后被 setenv 顶替 */
+    EXPECT(putenv(putv_slot) == 0, "putenv accepts NAME=value");
+    EXPECT(getenv("PUTV") != (char *)0 &&
+               strcmp(getenv("PUTV"), "direct") == 0,
+           "putenv visible via getenv");
+    EXPECT(setenv("PUTV", "replaced", 1) == 0, "setenv over putenv entry");
+    EXPECT(strcmp(getenv("PUTV"), "replaced") == 0,
+           "putenv entry replaced by value");
+    EXPECT(putenv((char *)0) == -1, "putenv NULL rejected");
+    EXPECT(putenv("NOEQUALS") == -1, "putenv missing '=' rejected");
+
+    /* unsetenv：移除 / 不存在 / 非法名；移除后可重设（追加路径复用） */
+    EXPECT(unsetenv("FOO") == 0, "unsetenv existing");
+    EXPECT(getenv("FOO") == (char *)0, "unsetenv really gone");
+    EXPECT(unsetenv("NOPE") == -1, "unsetenv missing");
+    EXPECT(unsetenv("B=C") == -1, "unsetenv invalid name");
+    EXPECT(unsetenv("") == -1, "unsetenv empty name");
+    EXPECT(setenv("FOO", "again", 1) == 0, "re-set after unset");
+
+    /* environ 直读：NULL 结尾且内容精确（EMPTY 先于 PUTV/FOO 追加） */
+    {
+        int saw_empty = 0, saw_putv = 0, saw_foo = 0;
+        int count = 0;
+
+        for (char **e = environ; *e != (char *)0; e++) {
+            count++;
+            if (strcmp(*e, "EMPTY=") == 0)
+                saw_empty = 1;
+            if (strcmp(*e, "PUTV=replaced") == 0)
+                saw_putv = 1;
+            if (strcmp(*e, "FOO=again") == 0)
+                saw_foo = 1;
+        }
+        EXPECT(count == 3, "environ exact entry count");
+        EXPECT(saw_empty && saw_putv && saw_foo,
+               "environ contents via direct walk");
+    }
+
+    /* 清场：后续分配器测试依赖堆余量（owned 串全部回收） */
+    EXPECT(unsetenv("EMPTY") == 0 && unsetenv("PUTV") == 0 &&
+               unsetenv("FOO") == 0,
+           "environ teardown");
+}
+
+/* ══ 7. strtol/strtoul ════════════════════════════════════════════════ */
+static void test_strto(void)
+{
+    char *e;
+
+    errno = 0;
+    EXPECT(strtol("42", (char **)0, 10) == 42L, "strtol plain");
+    errno = 0;
+    EXPECT(strtol("   -42xyz", &e, 10) == -42L && *e == 'x',
+           "strtol ws+sign+endptr");
+    errno = 0;
+    EXPECT(strtol("+7", &e, 10) == 7L && *e == '\0', "strtol plus sign");
+    errno = 0;
+    EXPECT(strtol("0x1F", &e, 0) == 31L && *e == '\0',
+           "strtol base=0 hex auto");
+    errno = 0;
+    EXPECT(strtol("0X1f", &e, 16) == 31L && *e == '\0',
+           "strtol base16 upper prefix");
+    errno = 0;
+    EXPECT(strtol("012", &e, 0) == 10L, "strtol base=0 octal auto");
+    errno = 0;
+    EXPECT(strtol("012", &e, 10) == 12L, "strtol leading zero base10");
+    errno = 0;
+    EXPECT(strtol("789", &e, 8) == 7L && *e == '8',
+           "strtol stops at invalid digit");
+    errno = 0;
+    e = (char *)0;
+    EXPECT(strtol("zzz", &e, 10) == 0L && e != (char *)0 &&
+               strcmp(e, "zzz") == 0,
+           "strtol no digits endptr=nptr");
+    errno = 0;
+    EXPECT(strtol("", &e, 10) == 0L && strcmp(e, "") == 0,
+           "strtol empty string");
+    errno = 0;
+    EXPECT(strtol("10", &e, 1) == 0L && errno == EINVAL,
+           "strtol invalid base EINVAL");
+
+    /* 边界值（LP32：LONG_MAX=2147483647）*/
+    errno = 0;
+    EXPECT(strtol("2147483647", &e, 10) == 2147483647L && errno == 0,
+           "strtol LONG_MAX exact");
+    errno = 0;
+    EXPECT(strtol("-2147483648", &e, 10) == (-2147483647L - 1L) &&
+               errno == 0,
+           "strtol LONG_MIN exact");
+    errno = 0;
+    EXPECT(strtol("2147483648", &e, 10) == 2147483647L &&
+               errno == ERANGE,
+           "strtol overflow saturates LONG_MAX");
+    errno = 0;
+    EXPECT(strtol("-2147483649", &e, 10) == (-2147483647L - 1L) &&
+               errno == ERANGE,
+           "strtol underflow saturates LONG_MIN");
+    errno = 0;
+    EXPECT(strtol("99999999999", &e, 10) == 2147483647L &&
+               errno == ERANGE,
+           "strtol big overflow saturate");
+    errno = 0;
+    EXPECT(strtol("FFFFFFFFF", &e, 16) == 2147483647L && errno == ERANGE,
+           "strtol hex overflow saturate");
+
+    /* strtoul */
+    errno = 0;
+    EXPECT(strtoul("4000000000", &e, 10) == 4000000000UL && errno == 0,
+           "strtoul big in-range");
+    errno = 0;
+    EXPECT(strtoul("0xffffffff", &e, 0) == 4294967295UL,
+           "strtoul hex max");
+    errno = 0;
+    EXPECT(strtoul("+42", (char **)0, 10) == 42UL, "strtoul plus sign");
+    errno = 0;
+    EXPECT(strtoul("-1", &e, 10) == 4294967295UL && errno == ERANGE,
+           "strtoul negative wraps + ERANGE flag");
+    errno = 0;
+    EXPECT(strtoul("99999999999", &e, 10) == 4294967295UL &&
+               errno == ERANGE,
+           "strtoul overflow saturates ULONG_MAX");
+    errno = 0;
+    EXPECT(strtoul("789", &e, 8) == 7UL && *e == '8',
+           "strtoul stop digit shared core");
+}
+
+/* ══ 8. printf 扩展：%p / 宽度 / 左对齐 ══════════════════════════════ */
+static void test_printf_ext(void)
+{
+    int r;
+
+    cap_reset();
+    r = printf("[%p]", (const void *)&cap_buf); /* 任意非空指针 */
+    EXPECT(r >= 4, "printf %p return sane");
+    EXPECT(cap_buf[0] == '[' && cap_buf[1] == '0' && cap_buf[2] == 'x',
+           "printf %p 0x-prefixed");
+
+    cap_reset();
+    printf("<%p>", (const void *)0);
+    expect_out("<(nil)>", "printf %p NULL");
+
+    cap_reset();
+    r = printf("%5d|%-5d|", 42, 42);
+    expect_out("   42|42   |", "printf width right/left d");
+    EXPECT(r == 12, "width padding counted in return");
+
+    cap_reset();
+    printf("%6s|%-6s|", "ab", "ab");
+    expect_out("    ab|ab    |", "printf width right/left s");
+
+    cap_reset();
+    printf("%3x|%4u|", 0x1fu, 7u);
+    expect_out(" 1f|   7|", "printf width x/u");
+
+    cap_reset();
+    printf("%4c|%-4c|", 'q', 'q');
+    expect_out("   q|q   |", "printf width c");
+
+    cap_reset();
+    printf("%8s|", (char *)0);
+    expect_out("  (null)|", "printf width applies to (null)");
+
+    cap_reset();
+    r = printf("%13d", -2147483647 - 1); /* INT_MIN + 宽度 */
+    expect_out("  -2147483648", "printf INT_MIN right-aligned width");
+    EXPECT(r == 13, "INT_MIN padded length 13");
+
+    cap_reset();
+    printf("%-13d|", 0);
+    expect_out("0            |", "printf zero left-aligned");
+
+    cap_reset();
+    printf("tail:%5");
+    expect_out("tail:%5", "printf trailing incomplete spec replayed");
+
+    cap_reset();
+    printf("%-3y end"); /* 未支持转换符连同标志宽度字面回放 */
+    expect_out("%-3y end", "printf unknown spec with flags literal");
+
+    /* '0' 零填充标志（仅数值类；负号/0x 前缀在零之前） */
+    cap_reset();
+    r = printf("[%05d]", 42);
+    expect_out("[00042]", "printf zero-pad d");
+    EXPECT(r == 7, "zero-pad return counts width");
+    cap_reset();
+    printf("%05d|%08x|%010p", -42, 0xbeefu, (const void *)0x1234);
+    expect_out("-0042|0000beef|0x00001234", "printf zero-pad sign/hex/prefix");
+    cap_reset();
+    printf("%-05d|%010p|", 42, (const void *)0);
+    expect_out("42   |     (nil)|", "printf '-' beats zero-pad; NULL space pad");
+}
+
+/* ══ 9. fgets/getchar（经 catos_stdin_read 注入）═════════════════════ */
+static void test_fgets_getchar(void)
+{
+    char buf[32];
+
+    /* 常规两行读取，EOF 后返回 NULL */
+    in_reset("hi\nrest");
+    EXPECT(fgets(buf, sizeof(buf), 0) == buf && strcmp(buf, "hi\n") == 0,
+           "fgets line with newline kept");
+    EXPECT(fgets(buf, sizeof(buf), 0) == buf && strcmp(buf, "rest") == 0,
+           "fgets tail without newline at EOF");
+    EXPECT(fgets(buf, sizeof(buf), 0) == (char *)0, "fgets EOF returns NULL");
+
+    /* 截断保护：size-1 上限，剩余数据留给后续读取 */
+    in_reset("abcdefghij");
+    EXPECT(fgets(buf, 5, 0) == buf && strcmp(buf, "abcd") == 0,
+           "fgets truncates to size-1");
+    EXPECT(fgets(buf, 5, 0) == buf && strcmp(buf, "efgh") == 0,
+           "fgets resumes after truncation");
+    EXPECT(fgets(buf, 5, 0) == buf && strcmp(buf, "ij") == 0,
+           "fgets final fragment");
+
+    /* 恰好整行填满缓冲（含 '\n' 与 NUL 正好 size 字节） */
+    in_reset("12345\n");
+    EXPECT(fgets(buf, 7, 0) == buf && strcmp(buf, "12345\n") == 0,
+           "fgets exact-fit line");
+    EXPECT(fgets(buf, 7, 0) == (char *)0, "fgets exhausted after exact fit");
+
+    /* 参数防御 */
+    in_reset("data\n");
+    EXPECT(fgets(buf, 1, 0) == (char *)0, "fgets size=1 rejected");
+    EXPECT(fgets(buf, 0, 0) == (char *)0, "fgets size=0 rejected");
+    EXPECT(fgets((char *)0, 8, 0) == (char *)0, "fgets NULL buffer rejected");
+    EXPECT(in_pos == 0u, "rejected fgets consumes no input");
+
+    /* 读错误路径：立即错误 → NULL */
+    in_reset("");
+    in_fail = 1;
+    EXPECT(fgets(buf, sizeof(buf), 0) == (char *)0, "fgets error -> NULL");
+    in_fail = 0;
+
+    /* getchar：逐字节 + EOF 收敛为 -1 */
+    in_reset("AB");
+    EXPECT(getchar() == 'A', "getchar first");
+    EXPECT(getchar() == 'B', "getchar second");
+    EXPECT(getchar() == -1, "getchar EOF -> -1");
+
+    in_fail = 1;
+    in_reset("");
+    EXPECT(getchar() == -1, "getchar error -> -1");
+    in_fail = 0;
+
+    /* read 弱汇聚点未被覆盖时的默认通路无法在宿主机验证（真实 syscall），
+     * 此处仅验证注入通道与库内 fgets 的协作已全覆盖。 */
+    in_reset("");
+}
+
 int main(void);
 
 /* Linux i386 ABI：nr=4 write / nr=1 exit，退出码 = main 返回值（freestanding 无 crt）。
@@ -316,6 +887,12 @@ int main(void)
     test_malloc_basic();
     test_fragmentation();
     test_exhaust_and_recover();
+    test_string_ext();
+    test_ctype();
+    test_environ();
+    test_strto();
+    test_printf_ext();
+    test_fgets_getchar();
 
     if (g_fails == 0) {
         printf("host-test PASS (all assertions)\n");

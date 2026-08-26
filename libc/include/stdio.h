@@ -31,9 +31,11 @@ typedef __builtin_va_list va_list;
 #define va_end(v)      __builtin_va_end(v)
 #define va_copy(d, s)  __builtin_va_copy(d, s)
 
-/* ── write 封装（VFS 兼容 ABI nr=1）───────────────────────────────────
- * 返回：成功 = 实际写入字节数；失败 = 负 errno（-EFAULT/-EBADF/…，
- * 内核经 sign-extend 写回 EAX）。不设全局 errno 变量。 */
+/* ── write/read 封装（VFS 兼容 ABI nr=1 / nr=0）──────────────────────
+ * 返回：成功 = 实际传输字节数；失败 = 负 errno（-EFAULT/-EBADF/…，
+ * 内核经 sign-extend 写回 EAX）。不设全局 errno 变量。
+ * ⚠️ nr==3 在本内核被别名到 close（雷区），read 走 nr=0，与此无关。 */
+int read(int fd, void *buf, unsigned int len);
 int write(int fd, const void *buf, unsigned int len);
 
 /* stdout 输出（fd=1）。putchar 返回写入的字符或负 errno；
@@ -41,10 +43,25 @@ int write(int fd, const void *buf, unsigned int len);
 int putchar(int c);
 int puts(const char *s);
 
-/* 精简 printf：支持 %s %d %u %x %c %%。
- * - %x 为小写十六进制、无填充无前缀；%d 处理 INT_MIN；
+/* stdin（fd=0）逐字节读取。getchar 返回 (unsigned char) 字符，
+ * EOF/错误返回 -1。 */
+int getchar(void);
+
+/* 行读取（Cat-OS 精简 ABI 取舍：第三参为文件描述符而非 FILE*）。
+ * 从 fd 读至多 size-1 字节，遇 '\n' 停止并保留之，恒补 '\0'。
+ * 成功返回 s；size<=1、立即 EOF 或读错误返回 NULL（部分已读数据仍留在 s）。 */
+char *fgets(char *s, int size, int fd);
+
+/* printf 家族：支持 %s %d %u %x %c %p %% 及标志/宽度。
+ * - %x 为小写十六进制、无前缀；%d 处理 INT_MIN；
+ * - %p 打印 "0x"+小写十六进制；空指针打印 "(nil)"；
+ * - 宽度：'%' 后十进制数字指定最小字段宽（默认空格右填充）；
+ *   '-' 标志改为左对齐（右填充），如 "%-5d"；
+ *   '0' 标志数值类（%d/%u/%x/%p）改用零填充，负号/"0x" 前缀保持在
+ *   零之前（"%05d",-42 → "-0042"）；'-' 同现时 '-' 优先；
+ * - 不支持：精度、长度修饰符、动态宽度 '*'（按字面回放）；
  * - %s 对 NULL 打印 "(null)"（防 ring3 空指针解引用）；
- * - 未支持的转换符按字面输出 '%' + 该字符；
+ * - 未支持的转换符按字面输出 '%' 起、至该字符止的原文；
  * - 无缓冲：每个片段直接一次 write syscall（精简实现取舍，见 README）。
  * 返回：成功 = 输出字符总数；输出失败 = 负值。 */
 int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
