@@ -220,50 +220,105 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
 
 
 /* ===========================================================================
- * stage4: IRQ0 tick 钩子 —— boot 后延迟自动拉起内嵌 sock_abi 测试进程。
+ * stage4: IRQ0 tick 钩子 —— 两阶段 autorun：
+ *   phase1  boot 后延迟拉起内嵌 sock_abi 测试进程；
+ *   phase2  sock_abi 流程完成后（PCB 转 PROC_TERMINATED）自动 exec 内嵌
+ *           ring3 shell REPL（shell_user.elf，常驻 for(;;) 读 /dev/kbd）。
  *
  * 为什么放 tick 里而不是 kernel_main 顺序执行：enter_usermode() 的 ring3 探针
  * 以 jmp $ 终态驻留（usermode.c，用户锁定文件），kernel_main 中其后代码不可达；
  * IRQ0 每 tick 都会进入本钩子（中断驱动），是探针存活期间唯一可靠的内核入口。
  *
- * 栈布局：sock_abi 用独立栈底 0x702000（SP=0x703000），与探针栈 0x700000..0x701000
- * 不重叠 —— elf_load_ex 参数化栈底正是为此而设（PTE 盲写覆盖防护）。
- * 调度：create_user_process 入队后由 sched_preempt_tick() 的量子轮转接管 CPU，
- * 与探针进程并存分时；sock_abi exit 后队列回落探针，tcp81 监听不受影响。
+ * 栈布局（互不重叠，elf_load_ex 参数化栈底防 PTE 盲写覆盖）：
+ *   探针     0x700000..0x701000（usermode.c iret 帧 SP=0x700FFC）
+ *   sock_abi 0x702000..0x703000（CATOS_SOCKABI_*，elf.h）
+ *   shell    0x704000..0x705000（下方 CATOS_SHELL_*；段本体在 0x3ff000/0x400000）
  *
- * 失败策略：elf_load_ex/create_user_process 任一失败仅打日志不 panic ——
- * autorun 是增强路径，绝不能拖垮已全绿的 blackbox/inject 回归基线。
+ * 调度：create_user_process 入队后由 sched_preempt_tick() 的量子轮转接管 CPU，
+ * 与探针进程并存分时；sock_abi exit 后队列回落探针并即刻派发 shell；
+ * shell 阻塞读键盘时 kbdwait 走 sti;hlt 睡眠，IRQ0/net_poll 不受影响。
+ * shell REPL 常驻不退出（仅 'exit' 命令走 sys_exit）；届时队列照旧回落探针。
+ *
+ * 失败策略：两阶段任一失败仅打日志不 panic —— autorun 是增强路径，绝不能
+ * 拖垮已全绿的 blackbox/inject 回归基线；shell 不可用时探针 jmp $ 循环即兜底。
  * =========================================================================== */
+
+/* stage4: shell 进程专用栈布局 —— 与探针/sock_abi 栈页互不重叠（见上）。 */
+#define CATOS_SHELL_STACK_BASE 0x704000u
+#define CATOS_SHELL_USER_SP    (CATOS_SHELL_STACK_BASE + 4096u)
+
 void stage4_autorun_tick(void)
 {
-    static int done;
+    static int sock_done;        /* phase1 已执行（无论成败） */
+    static int shell_done;       /* phase2 已执行（一次性）   */
+    static int32_t sock_pid = -1;
     uint32_t entry;
 
-    if (done)
-        return;
-    if (sock_abi_elf_len == 0u)
-        return;                     /* 镜像未链接进来：静默跳过 */
-    if (ticks < 200u)               /* 延迟 2s：避开启动期日志洪峰 */
-        return;
-    done = 1;
+    /* ---- phase1: 延迟 2s 拉起 sock_abi 测试进程 ---- */
+    if (!sock_done) {
+        if (ticks < 200u)           /* 避开启动期日志洪峰 */
+            return;
+        sock_done = 1;
 
-    kputs("[OK] stage4: launching sock_abi test process\n");
-    int segs = elf_load_ex(sock_abi_elf, sock_abi_elf_len, &entry,
-                           CATOS_SOCKABI_STACK_BASE);
-    if (segs < 0) {
-        kputs("[ERR] stage4: sock_abi elf_load_ex failed: ");
-        kput_sdec(segs);
+        if (sock_abi_elf_len == 0u) {
+            /* 镜像未链接进来：视为流程已完结，直接放行 phase2 进 shell */
+            kputs("[WARN] stage4: sock_abi image not linked\n");
+            return;
+        }
+        kputs("[OK] stage4: launching sock_abi test process\n");
+        int segs = elf_load_ex(sock_abi_elf, sock_abi_elf_len, &entry,
+                               CATOS_SOCKABI_STACK_BASE);
+        if (segs < 0) {
+            kputs("[ERR] stage4: sock_abi elf_load_ex failed: ");
+            kput_sdec(segs);
+            kputs("\n");
+            return;                 /* 装载失败：流程视作完结，下 tick 进 shell */
+        }
+        int pid = create_user_process(entry, 0u, CATOS_SOCKABI_USER_SP);
+        if (pid < 0) {
+            kputs("[ERR] stage4: create_user_process(sock_abi) failed\n");
+            return;
+        }
+        sock_pid = pid;
+        kputs("[OK] stage4: sock_abi pid=");
+        kput_dec((uint32_t)pid);
+        kputs(" entry=");
+        kput_hex32(entry);
         kputs("\n");
         return;
     }
-    int pid = create_user_process(entry, 0u, CATOS_SOCKABI_USER_SP);
-    if (pid < 0) {
-        kputs("[ERR] stage4: create_user_process(sock_abi) failed\n");
+
+    /* ---- phase2: sock_abi 流程完成后 exec 内嵌 shell REPL（一次性）---- */
+    if (shell_done)
         return;
+    /* sock_abi 已成功创建的场合：等它 exit（exit_process 置 TERMINATED，
+     * 终态恒定不复用 —— process_alloc_slot 只认 memset 过的空槽）。
+     * 未创建（镜像缺失/装载失败）则流程视作已完结。 */
+    if (sock_pid > 0 && pcb[sock_pid].state != PROC_TERMINATED)
+        return;
+    shell_done = 1;
+
+    if (shell_user_elf_len == 0u) {
+        kputs("[WARN] stage4: shell image not linked; probe loop stays\n");
+        return;                     /* 探针 jmp $ 即兜底驻留 */
     }
-    kputs("[OK] stage4: sock_abi pid=");
+    kputs("[OK] stage4: exec embedded shell REPL\n");
+    int segs = elf_load_ex(shell_user_elf, shell_user_elf_len, &entry,
+                           CATOS_SHELL_STACK_BASE);
+    if (segs < 0) {
+        kputs("[ERR] stage4: shell elf_load_ex failed: ");
+        kput_sdec(segs);
+        kputs("\n");
+        return;                     /* 探针 jmp $ 兜底 */
+    }
+    int pid = create_user_process(entry, 0u, CATOS_SHELL_USER_SP);
+    if (pid < 0) {
+        kputs("[ERR] stage4: create_user_process(shell) failed\n");
+        return;                     /* 探针 jmp $ 兜底 */
+    }
+    kputs("[OK] stage4: shell pid=");
     kput_dec((uint32_t)pid);
     kputs(" entry=");
     kput_hex32(entry);
-    kputs("\n");
+    kputs(" (resident REPL, stdin=/dev/kbd)\n");
 }
