@@ -68,7 +68,9 @@
 #define SOCK_STREAM_C 1   /* CATOS_SOCK_STREAM */
 #define SOCK_DGRAM_C  2   /* CATOS_SOCK_DGRAM  */
 
-#define TCP_MAX_CONNS_C 16u   /* net.h:67 */
+#define TCP_MAX_CONNS_C 64u   /* net.h:86（2026-08-26 容量第一档 16→64）*/
+#define VFS_MAX_FD_C    32u   /* vfs.h:4（全局 fd 表容量；TCP 容量抬升后与
+                               * 协议表共同决定 ring3 耗尽次序，见 S7n 注释）*/
 #define UDP_SLOTS_C     8u    /* net.c:216（docs/SOCKET_API.md §2.2）*/
 #define UDP_PAYLOAD_MAX 1472u /* MTU1500-20-8，syscall.c CATOS_UDP_PAYLOAD_MAX */
 
@@ -184,7 +186,9 @@ static int32_t g_udp_bound;      /* 全程存活的已绑 UDP socket（S2 创建
 static uint8_t  iobuf[128];      /* 合法用户缓冲（发送/接收用）*/
 static uint32_t rip_out;         /* recvfrom 出参：src_ip（4B 可写对象）*/
 static uint16_t rpt_out;         /* recvfrom 出参：src_port（2B 可写对象）*/
-static int32_t  kept[40];        /* 资源耗尽用例的 fd 收集器（容量 > TCP_MAX_CONNS）*/
+static int32_t  kept[TCP_MAX_CONNS_C]; /* 资源耗尽用例 fd 收集器：按协议表容量
+                                        * 常量取上界（fd 表 VFS_MAX_FD_C 更小时
+                                        * 循环以终端错误码提前退出，不会越界）*/
 /* 非法指针样本（值本身永不解引用——内核 user_access_ok 预检先行拒绝）：
  *   BAD_LO = 0x100       < 0x1000 低页洞（paging.c user_access_ok 第一判）
  *   BAD_HI = 0xBFC00000  上界哨兵：n > 0xBFC00000-v 算术必拒（v=上界,n≥1）*/
@@ -389,19 +393,31 @@ static void suite_fd_lifecycle(void)
     }
 
 
-    /* TCP 连接表耗尽：net_init 基线已占 listener(:81)（工作区 net.c:1162，
-     * :80 处注释态），usermode 探针可能另占；故成功数断言为相对区间 [1,16]。 */
+    /* TCP 连接表/fd 表耗尽（2026-08-26 调和：容量第一档 16→64 后旧硬编码
+     * [1,16] 失准——64 容量下全局 fd 表先满，实测 opened=25 即撞 VFS 上限）。
+     * 鲁棒形式：循环开到终端错误码为止，成功数只断言相对区间，不硬编码次数：
+     *   上界 cap_eff = min(TCP_MAX_CONNS_C(net.h:86)=64, VFS_MAX_FD_C(vfs.h:4)=32)
+     *                 ——两条约束谁先到谁封顶，均不越过该值；
+     *   下界 ≥1（本用例自身至少能开 1 条）。
+     * 终端错误码恒为 -EMFILE(-24)，两条可能路径同码：
+     *   · 协议表满：sys_socket → net_socket_open()==NULL → -EMFILE；
+     *   · fd  表满：vfs_socket_install() 分配失败透传 -24（vfs.c:86）。
+     * 基线占用（内核 :81 + httpd :7000 + 本进程 listener :9460 等）只影响
+     * 落在区间内的具体开数，不参与断言。 */
+    cap = (TCP_MAX_CONNS_C < VFS_MAX_FD_C) ? TCP_MAX_CONNS_C : VFS_MAX_FD_C;
     cnt = 0; last = 0;
     for (n = 0; n < kept_cap; n++) {
         r = s_socket(SOCK_STREAM_C);
         if (r < 0) { last = r; break; }
         kept[cnt++] = r;
     }
-    chk_cond("S7n", "tcp_exhaustion_terminal_emfile_count_in_[1,16]",
-             last == EMFILE && cnt >= 1 && cnt <= (int32_t)TCP_MAX_CONNS_C);
+    chk_cond("S7n", "tcp_exhaustion_terminal_emfile_count_in_[1,cap_eff]",
+             last == EMFILE && cnt >= 1 && cnt <= (int32_t)cap);
     lb_reset(); lb_s("[USR_SOCK_ABI] INFO tcp_exhaustion: opened="); lb_dec(cnt);
     lb_s(" terminal="); lb_dec(last);
-    lb_s(" (cap=TCP_MAX_CONNS minus kernel-owned listeners)");
+    lb_s(" cap_eff=min(TCP_MAX_CONNS,");
+    lb_dec((int32_t)VFS_MAX_FD_C);
+    lb_s(") basis=net.h:86+vfs.h:4");
     lb_ch('\n'); lb_flush();
     while (cnt > 0) { info_call("S7z1", "close(exhausted-tcp)", s_close(kept[--cnt])); }
     r = s_socket(SOCK_STREAM_C);
@@ -425,9 +441,11 @@ static void suite_fd_lifecycle(void)
     chk_cond("S7r", "udp_slot_recycle_after_mass_close", r > 0);
     if (r > 0) { int32_t cr = s_close(r); info_call("S7z4", "close(recycled-udp)", cr); }
 
-    info("layering note: VFS_MAX_FD=32 (vfs.h:8) is NOT reachable first — "
-         "protocol caps TCP(16)/UDP(8) exhaust before the fd table fills; "
-         "observable exhaustion errno is -EMFILE via net tables/vfs_socket_install");
+    info("layering note (post cap-tier1): TCP cap=64 (net.h:86) >= VFS_MAX_FD=32 "
+         "(vfs.h:4), so for ring3 socket storms the GLOBAL fd table co-binds or "
+         "binds first; protocol caps still bind UDP(8) and kernel-side users. "
+         "S7n/S7q therefore assert errno+interval only: terminal errno is "
+         "-EMFILE via either path (net tables / vfs_socket_install vfs.c:86)");
 }
 
 /* ════════════════════════ S8: 杂项 ABI 完整性 ═══════════════════════════ */
@@ -445,7 +463,8 @@ int main(void)
     int32_t listener, r;
 
     info("user-mode socket ABI test suite v1 (code10, tests-only)");
-    info("expect-basis: syscall.c/net.c/vfs.c/paging.c @worktree HEAD=09fb9b4+");
+    info("expect-basis: syscall.c/net_tcp.c/vfs.c/paging.c @worktree HEAD=611b080+ "
+         "(cap tier1: net.h:86 TCP_MAX_CONNS 16->64)");
     info("trigger-path note: requires arbitrary-ELF exec (NOT available at this "
          "head: sys_exec embedded branch matches only /bin/shell; devfs has no "
          "regular files). Runtime results are NOT_TESTED until wired.");

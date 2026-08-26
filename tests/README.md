@@ -32,6 +32,12 @@ cd /home/wjqawa/osdev/tests
 ./qemu_run.sh --mode socket --serial /tmp/t1.serial -- \
   python3 ./net_suite.py --suite inject --case sack_t1 --serial /tmp/t1.serial --json /tmp/t1.json
 
+# DHCP 租约续期（dhcp_lease）：先编 LEASE_SCALE 专用 ISO（/tmp 副本树，
+# 主仓库零触碰），再以 slirp 模式驱动 —— inject 套件里唯一的 slirp 用例
+python3 ./net_suite.py --build-dhcp-scale-iso .. /tmp/dhcp_scale.iso
+./qemu_run.sh --mode slirp --iso /tmp/dhcp_scale.iso --serial /tmp/dh.serial -- \
+  python3 ./net_suite.py --suite inject --case dhcp_lease --serial /tmp/dh.serial --json /tmp/dh.json
+
 # 一键全量
 ./run_all.sh                       # 产物默认在 /tmp/catos-tests-run-<ts>/
 CATOS_INJECT_CASES="sack_t1 rst_l1" ./run_all.sh   # 自选注入用例
@@ -75,8 +81,9 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
 | `sack_t8` | 序号跨 2^32 顺序交付（ACK==4）；回绕后 OOO/SACK=(0x10,0x1A)；过期段拒绝（有符号比较）；回绕前 dup 拒绝；回绕点重叠排队；级联完成 ACK==0x1A | 32 位序号回绕语义（SACK 加固组，含 harness 侧修正注记） |
 | `rst_l1` | 窗内非精确 RST→challenge-ACK 且连接存活；窗上方/窗下方 RST→静默丢弃；精确 seq RST→复位；关闭后数据遇 RST/no-listener | RST 有效性校验三态（移植自 ox_lifecycle_edge.L1，TCP 安全加固组） |
 | `tw_recycle` | 主动关闭完整路径 FIN_WAIT_2→`TIME_WAIT entered`→`TIME_WAIT expired`（串口顺序断言）→同端口三次握手重建成功且重推 banner | TW1/TW2 回填：TIME_WAIT 到期回收 + 端口复用（TW=200 ticks≈2s@100Hz，net.c:982/1019；整例约 8-12s） |
-| `backlog_probe` | 容量模型动态推导：常驻 TCP listener 数 N 从串口 `[NET] TCP listen :` 行计数（现状 N=2：内核 ：81 + httpd :7000），n_half=TCP_MAX_CONNS(16, net.h:67)−N−A(1) 半开占满连接表后，下一四元组的 SYN 被 `RST|ACK ack=ISN+1` 拒绝；串口恰一条 `conn table full, RST` 且零条 `accept queue full`（LISTEN TCB 自身占槽 ⇒ pending 上限 16−N < backlog 16，队列满分支 fresh-boot 结构性不可达）；既有 ESTABLISHED 连接数据照常被 ACK | TB1 回填：容量硬断言对照 net.h:67、net.c tcp_listen/pending_count/conn-table-full 路径（2026-08-25 修正旧模型漏算 listen 占槽；2026-08-26 二次修正——kernel.c stage4 接线常驻 httpd(:7000) 后固定 `16−2` 失准，改为按串口监听行数动态推导，用例内先等 httpd 绑定再注入）；SYN 分批注入规避 e1000 8 描述符环溢 |
+| `backlog_probe` | 容量模型动态推导：常驻 TCP listener 数 N 从串口 `[NET] TCP listen :` 行计数（现状 N=2：内核 ：81 + httpd :7000），n_half=TCP_MAX_CONNS(64, net.h:86)−N−A(1) 半开占满连接表后，下一四元组的 SYN 被 `RST|ACK ack=ISN+1` 拒绝；串口恰一条 `conn table full, RST` 且零条 `accept queue full`（LISTEN TCB 自身占槽 ⇒ pending 上限 64−N < backlog 64，队列满分支 fresh-boot 结构性不可达）；既有 ESTABLISHED 连接数据照常被 ACK | TB1 回填：容量硬断言对照 net.h:86、net_tcp.c tcp_listen/pending_count/conn-table-full 路径（2026-08-25 修正旧模型漏算 listen 占槽；2026-08-26 二次修正——kernel.c stage4 接线常驻 httpd(:7000) 后固定 `16−2` 失准，改为按串口监听行数动态推导，用例内先等 httpd 绑定再注入；2026-08-26 三修——TCP 容量第一档 16→64（net.h:86），分母/注释随新常量对齐，注入端口段顺延至 31031..31092 无重叠）；SYN 分批注入规避 e1000 8 描述符环溢 |
 | `l3b_race` | banner 突发（16×90B 全量入初始 cwnd）后同拍双 ACK：恰好 1 条 `TCP RTT sample=`、样本 ≥1 且 RTO≥30、安静期零补采 | L3B 回填：RTT 采样竞态单次计样（net.c:755/932-938/641-649），样本钳位为 commit 58d55a9 的回归哨兵；守卫窗前移至 banner 等待之前——窗内任何 `TCP RTO: re-xmit`（Karn 抑制必致零采样，含帧在宿主侧迟到 >300ms 的形态）按 harness 故障 rc=5 重试而非断言失败 |
+| `dhcp_lease` | **slirp 模式 + LEASE_SCALE 专用 ISO**（inject 套件唯一非 socket 用例）：首取 DISCOVER→REQUEST→`DHCP ACK ip=` 恰一次；串口顺序 `DISCOVER < REQUEST < ACK < T1 renew due < REQUEST(renew) < ACK renew ip=`（BOUND--T1-->RENEWING 单播续期状态迁移，net_dhcp.c:154-165）；持续续期 ≥3 轮（每轮 ACK 经 dhcp_arm_lease 重挂三截止 ⇒ 循环非巧合）；契约不变量 expire/NAK/fallback 全零（slirp 恒应答）；REBINDING 机会性覆盖——T2 迁移允许瞬态触发（首轮单播 ARP 预热 miss，net_dhcp.c:158-160），但最后一条 `REQUEST(rebind)` 后必须被 `ACK renew` 收口（首跑实测观察到该恢复路径）；续期风暴中内核 UDP:7 echo 数据面存活（不依赖 ring3 探针接线）；final scan 无 panic。**覆盖边界**：租约到期 rediscover、NAK restart 为 NOT_TESTED —— 需要「授约后失联/拒绝」的服务端，slirp 恒应答且永不 NAK。SCALE 编译期宏经 `--build-dhcp-scale-iso` 副本重编解决（默认 21600 ⇒ 86400s→4s、T1≈2s、T1→T2 间隙 1.5s 吸收 ARP 预热） | DHCP 续期状态机（commit b9530ff）套件化：首取+T1 续期循环常驻回归 + REBINDING 恢复哨兵；标记原文对照 net_dhcp.c:102/108/124/139/140/157/170/194 |
 
 > 历史注记：TW1/TW2（TIME_WAIT 回收与同端口重建）、TB1（SYN backlog）、L3B（采样竞态）
 > 的原型脚本原居 /tmp 已随清理丢失，2026-08-25 以上述三个用例按现框架范式回填入库；
@@ -100,6 +107,21 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
 | M1/M3/M4/L3/L4/L5/L7 | 仅登记（SOCKET_API.md 口径：待核实，以协调者清单为准） | — |
 
 > 变更记录（2026-08-26）：L8 地雷拆除——内核 nr==3 由 close 别名改为 read 路径（vfs.c，对齐 Linux x86-32 编号），sock_abi 套件 S7 组新增 S7s–S7v 四断言锁定「nr==3=read / nr==6=close / fd 存活 / 关闭后 EBADF」，断言总数 85→89（PASS 81→85，skip 4 不变）；既有断言无一依赖旧「nr==3 即 close」语义（原 nr==3 用例为零，S7g 走 nr==6 保持不变）。
+>
+> 变更记录（2026-08-26 第二波）：① `dhcp_lease` 用例入库——DHCP 续期状态机
+> （commit b9530ff）从「副本手工验证」升级为套件常驻：LEASE_SCALE 专用 ISO
+> 经 net_suite.py 内置迷你构建器在 /tmp 副本树现编（route-a；T2/expire/NAK
+> 结构性 NOT_TESTED 见用例表）；② qemu_run.sh 回填 intfix 遗留的
+> `P_HTTPD(18082)->guest:7000` TCP hostfwd。
+>
+> 变更记录（2026-08-26 调和波，TCP 容量第一档 16→64 对齐）：① sock_abi S7n
+> 去 16 硬编码——改为「开到终端错误码为止 + errno/区间断言」：
+> `last==EMFILE && cnt∈[1, min(TCP_MAX_CONNS(net.h:86)=64, VFS_MAX_FD(vfs.h:4)=32)]`
+> （64 容量下全局 fd 表先满，实测 opened=25 撞 VFS 上限；两条耗尽路径同码
+> -EMFILE：net 表满 syscall.c 透传 / vfs_socket_install vfs.c:86）；
+> kept[] 收集器按 TCP_MAX_CONNS_C 取上界；② backlog_probe 分母 16→64
+> （net.h:86），净容量模型/pending 上限推导同步，注入端口段顺延无重叠；
+> tcp81:parallel 文案对齐。断言总数不变（89 = 85 PASS + 4 SKIP）。
 
 ## CI 化要点
 
@@ -114,9 +136,23 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
   另注（2026-08-26）：ring3 httpd 守护常驻 listen guest TCP :7000（kernel.c
   stage4），属容量模型「常驻 listener」的一员（见 backlog_probe 行）；与
   ring3 UDP 回显探针的 UDP:7000 不冲突——内核 UDP/TCP 分表（net.c
-  udp_socks[]:342 vs tcp_conns[]:743）。httpd 的 curl 验收 hostfwd 为
-  `tcp:127.0.0.1:18082->:7000`，由 `make run-httpd` 提供（18081 已被本表
-  P_TCP81→guest:81 占用；qemu_run.sh 属 harness 领地未加此 forward）。
+  udp_socks[]:342 vs tcp_conns[]:743）。httpd 的 curl 验收 hostfwd
+  `tcp:127.0.0.1:18082->:7000` 已回填本表 qemu_run.sh（`P_HTTPD`，intfix
+  遗留清偿；18081 已被 P_TCP81→guest:81 占用故取 18082），`make run-httpd`
+  保留为构建侧独立等价入口。
+- **dhcp_lease 与 LEASE_SCALE 专用 ISO**：租约续期依赖编译期宏
+  `CATOS_DHCP_LEASE_SCALE`（net_dhcp.c:41-58，commit b9530ff 测试旋钮），
+  生产 ISO 租约 86400s 等不到 T1。`python3 net_suite.py --build-dhcp-scale-iso
+  SRC OUT [--scale N] [--scratch DIR]` 把源树复制到 /tmp 副本后整树追加该宏
+  重编（全仓库仅 net_dhcp.c 消费此宏，其余编译单元逐位不变；主仓库只读零
+  触碰，工具链缺失/构建失败 rc=5）。run_all.sh 对 dhcp_lease 自动现编到
+  `$CATOS_TEST_OUT/dhcp_scale.iso`（失败 -> 该用例 NOT_TESTED 不拖垮整轮；
+  `CATOS_DHCP_SCALE_ISO` 可指向预构建产物跳过构建）。就绪门经
+  qemu_run.sh 新增旋钮 `CATOS_SLIRP_READY_MARK`（dhcp_lease 传
+  `[NET] DHCP ACK ip=`）走串口标记——pristine HEAD 无 ring3 :80 探针
+  （见「尚未接线」），guest:80 端口门会假超时。参数：scale/观察窗/
+  最少续期轮数分别由 `CATOS_DHCP_SCALE`(21600)/`CATOS_DHCP_WINDOW`(30s)/
+  `CATOS_DHCP_MIN_RENEWS`(3) 覆盖。覆盖边界与原因见上表 NOT_TESTED 注记。
 - **产物**：`*.serial`（串口原文证据）与 `*.json`（结构化结果）都落在 `CATOS_TEST_OUT`。
 
 ## 范围外（有意不做）

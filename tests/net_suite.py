@@ -11,6 +11,12 @@
   socket-netdev 原始帧注入；每个用例假设一颗**新引导**的内核——请用
   ``qemu_run.sh --mode socket -- python3 net_suite.py --suite inject --case <名>``
   驱动（run_all.sh 已按此编排）。
+- dhcp 用例 = dhcp_lease（2026-08-26 入库）：slirp 模式 + LEASE_SCALE 专用
+  ISO 常驻验证租约首取与 T1 续期循环。LEASE_SCALE 是编译期宏（net_dhcp.c，
+  commit b9530ff），故配套 ``--build-dhcp-scale-iso`` 迷你构建器：把源树
+  复制到 /tmp 副本后以 ``make CFLAGS+=-DCATOS_DHCP_LEASE_SCALE=N`` 重编出
+  dhcp_scale.iso 再由本用例引用——主仓库零触碰。slirp 永不静默也永不 NAK，
+  故 T2/REBINDING、expire、NAK 路径不在本用例覆盖面（见 README NOT_TESTED）。
 
 退出码：
   0 = 全部断言通过
@@ -22,14 +28,19 @@
   python3 net_suite.py --list
   python3 net_suite.py --suite blackbox --serial serial.log --json bb.json
   python3 net_suite.py --suite inject --case sack_t1 --serial serial.log --json t1.json
+  python3 net_suite.py --build-dhcp-scale-iso SRC_TREE OUT_ISO [--scale N]
+                                                        [--scratch DIR]
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -409,7 +420,7 @@ def stage_tcp81(S):
         t.join()
     succ = sum(1 for x in par_ok if x)
     S.check("tcp81:parallel", succ >= max(1, n_par - 2),
-            "%d/%d got banner (TCP_MAX_CONNS=16 上限内)" % (succ, n_par))
+            "%d/%d got banner (TCP_MAX_CONNS=64 上限内)" % (succ, n_par))
 
 
 def stage_backlog_probe(S):
@@ -874,8 +885,9 @@ def case_backlog_probe(S):
     httpd-wire 接线后二跑 FAIL 根因 = kernel.c stage4 新增常驻 httpd 守护
     （bind/listen :7000）再占 1 槽，实测第 14 条半开即撞 conn-table-full）。
     源码依据：
-    - net.h:67  TCP_MAX_CONNS=16（tcp_conns[16]，net.c:364）——容量分母；
-    - net.c tcp_listen() 经 tcp_conn_find_free() 取槽并置 used=true ⇒
+    - net.h:86  TCP_MAX_CONNS=64（tcp_conns[64]，net_tcp.c:15；2026-08-26 容量
+      第一档 16→64，分母随之更新）——容量分母；
+    - net_tcp.c tcp_listen() 经 tcp_conn_find_free() 取槽并置 used=true ⇒
       **每个监听者本身常驻占 1 槽**；且常驻 listener 数可从串口动态计数：
       内核侧 listen 打 "[NET] TCP listen :<port>"（tcp_listen），ring3 侧
       bind(nr=21) 在 net_socket_bind() 直接置 TCB=TCP_LISTEN 占槽、无内核
@@ -883,15 +895,17 @@ def case_backlog_probe(S):
       成功后打印）为占槽证据。现状两枚 —— 内核演示服务 ：81（net_init
       tcp_listen(81)）+ ring3 httpd 守护 :7000（kernel.c stage4 phase3 exec，
       回归设计端口，曾误绑 :80 与本套件 tcp80 回显探针冲突已纠正）；
-    - net.c tcp_pending_count() 只统计端口上 !accepted 的
+    - net_tcp.c tcp_pending_count() 只统计端口上 !accepted 的
       SYN_RECEIVED|ESTABLISHED（LISTEN 态不计）⇒ pending 上限
-      =16-N(listen) < backlog=16（listen 时 c->backlog=TCP_MAX_CONNS），
+      =64-N(listen) < backlog=64（listen 时 c->backlog=
+      TCP_LISTEN_BACKLOG_DEFAULT=TCP_MAX_CONNS，net.h:101/net_tcp.c:377），
       故「accept queue full」分支在 fresh-boot 场景结构性不可达：超额 SYN
       必然通过队列检查后在连接表分配处被拒（"[NET] TCP conn table full,
-      RST"）。两分支各自打日志后立即 return，对单个 SYN 严格互斥 ——
-      断言据此书写：窗口内 conn-table-full 恰 1 条、accept-queue-full 为 0；
-    - 净容量模型：listener(N)+A(ESTABLISHED 未 accept)(1)+(16-N-1) 半开
-      =16 槽占满，其后首个四元组（ovf）的裸 SYN 必被拒；
+      RST"，net_tcp.c:433）。两分支各自打日志后立即 return，对单个 SYN 严格
+      互斥 —— 断言据此书写：窗口内 conn-table-full 恰 1 条、accept-queue-full
+      为 0；
+    - 净容量模型：listener(N)+A(ESTABLISHED 未 accept)(1)+(64-N-1) 半开
+      =64 槽占满，其后首个四元组（ovf）的裸 SYN 必被拒；
       两条拒绝路径回包同源于 tcp_send_rst_ack：对无 ACK 的 SYN 回
       <SEQ=0><ACK=SEG.SEQ+1><RST|ACK>；
     - net.c:862-866 同四元组重复 SYN 仅重发 SYN-ACK ⇒ 半开连接须用不同源端口；
@@ -900,8 +914,8 @@ def case_backlog_probe(S):
     - e1000.c:8 RX/TX 环各仅 8 描述符 ⇒ SYN/RST 按 ≤5 一批注入防环溢丢帧。
     """
     dp = INJECT_DPORT
-    # 常驻 TCP listener 数动态推导（依据见 docstring / net.h:67）：
-    #   n_half = TCP_MAX_CONNS(16) − 常驻 listener − A(基线 ESTABLISHED 占 1)
+    # 常驻 TCP listener 数动态推导（依据见 docstring / net.h:86）：
+    #   n_half = TCP_MAX_CONNS(64) − 常驻 listener − A(基线 ESTABLISHED 占 1)
     # 现状常驻两枚：内核 :81（net_init）+ httpd :7000（kernel.c stage4）。
     # 信号面注记：两条监听路径的日志形态不同 ——
     #   · 内核侧 net_init 走 tcp_listen()，每次成功监听打一行
@@ -931,7 +945,7 @@ def case_backlog_probe(S):
            "内核[NET] TCP listen: + ring3 [HTTPD] listening 共 %d 枚"
            "（:81 + httpd :7000；等 httpd 绑定 %s）"
            % (n_listen, "ok" if n_listen >= 2 else "timeout→兜底"))
-    n_half = 16 - n_listen - 1   # TCP_MAX_CONNS(net.h:67) − 常驻 listener − A 占 1
+    n_half = 64 - n_listen - 1   # TCP_MAX_CONNS(net.h:86，第一档 16→64) − 常驻 listener − A 占 1
     sports = [31031 + i for i in range(n_half)]
     ovf_sport = 31031 + n_half
     w = wl.Wire(31030)
@@ -977,7 +991,8 @@ def case_backlog_probe(S):
                 ok_synack == n_half, "%d/%d" % (ok_synack, n_half))
 
         if filled:
-            # 超额第 16 个四元组：期望 RST|ACK 且 ack=ISN+1（net.c:684/821-822）
+            # 超额第 (n_half+1) 个四元组（表满后首个 SYN）：期望 RST|ACK 且
+            # ack=ISN+1（tcp_send_rst_ack，net_tcp.c）
             o_ovf = lsz(S.serial)
             isn_x = 830001
             w.put(wl.frame(wl.tcp_seg(ovf_sport, dp, isn_x, 0, wl.SYN,
@@ -998,7 +1013,7 @@ def case_backlog_probe(S):
             S.check("serial: 'conn table full' logged exactly once (binding constraint)",
                     s_ovf.count("TCP conn table full, RST") == 1,
                     "count=%d" % s_ovf.count("TCP conn table full, RST"))
-            S.check("serial: 'accept queue full' NOT hit (pending %d < backlog 16, queue branch unreachable fresh-boot)"
+            S.check("serial: 'accept queue full' NOT hit (pending %d < backlog 64, queue branch unreachable fresh-boot)"
                     % n_half,
                     s_ovf.count("TCP accept queue full, RST") == 0, "")
 
@@ -1135,6 +1150,273 @@ def case_l3b_race(S):
         w.close()
 
 
+# ==========================================================================
+# dhcp_lease（slirp + LEASE_SCALE 专用 ISO）与配套迷你构建器
+# ==========================================================================
+
+# 租约换算分母（net_dhcp.c:41-58）：秒→ticks 除以 N。取 21600 使 slirp 的
+# 86400s 租约折成 400 ticks(4s)、T1=200 ticks(2s)、T2=350 ticks(3.5s)——
+# 续期节奏 ~0.5 次/秒，窗口内轻松积累 ≥3 轮；且 T1→T2 绝对间隙 1.5s 足以
+# 吸收首轮续期的 ARP 预热延迟（首轮单播前 arp_resolve 必然 miss 一轮，
+# 见 net_dhcp.c:158-160；SCALE=172800 实测该间隙仅 180ms 时会推进到
+# REBINDING）。commit b9530ff 注释示例的 1728000 仅适合人肉观察全程，
+# 不适合常驻回归。可用 CATOS_DHCP_SCALE / --scale 覆盖。
+DHCP_SCALE_DEFAULT = 21600
+
+# 串口标记原文对照（net_dhcp.c，逐字核实）：
+#   :102  "[NET] DHCP DISCOVER" / "[NET] DHCP REQUEST" / "REQUEST(renew)" / "(rebind)"
+#   :108  "[NET] DHCP lease expired, rediscover"
+#   :124  "[NET] DHCP NAK, restart"
+#   :139  "[NET] DHCP ACK renew ip="      ← 与首取行靠 renew 字样区分
+#   :140  "[NET] DHCP ACK ip="            ← 首取 ACK（"ACK renew ip=" 不含本子串）
+#   :157  "[NET] DHCP T1 renew due"
+#   :170  "[NET] DHCP T2 rebind due"
+#   :194  "[NET] DHCP failed, fallback static"
+
+DHCP_MARK_DISCOVER = "[NET] DHCP DISCOVER"
+DHCP_MARK_REQUEST_FIRST = "[NET] DHCP REQUEST\n"     # 带 \n 排除 REQUEST(renew)
+DHCP_MARK_ACK_FIRST = "[NET] DHCP ACK ip="
+DHCP_MARK_T1 = "[NET] DHCP T1 renew due"
+DHCP_MARK_RENEW_REQ = "[NET] DHCP REQUEST(renew)"
+DHCP_MARK_RENEW_ACK = "[NET] DHCP ACK renew ip="
+
+# Makefile 主 CFLAGS 提取失败时的兜底镜像（Makefile:7-9 原文；提取成功则不用）
+_DHCP_FALLBACK_CFLAGS = (
+    "-m32 -march=i686 -ffreestanding -fno-pic -fno-pie "
+    "-fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables "
+    "-fno-unwind-tables -nostdlib -Wall -Wextra -std=gnu99 -O2")
+
+
+def _make_query_cflags(tree):
+    """从副本树 make 数据库提取主 CFLAGS（避免在本文件硬编码漂移）。"""
+    try:
+        r = subprocess.run(["make", "-C", tree, "-pn"], capture_output=True,
+                           timeout=120)
+        m = re.search(r"^CFLAGS = (.+)$", r.stdout.decode(errors="replace"),
+                      re.M)
+        return m.group(1).strip() if m else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def build_dhcp_scale_iso(src_tree, out_iso, scale=DHCP_SCALE_DEFAULT,
+                         scratch=None, keep_scratch=False):
+    """LEASE_SCALE 专用 ISO 迷你构建器（route-a，commit b9530ff 验收机制套件化）。
+
+    流程：源树 → /tmp 副本（剔除 .git/linux-ref 等非构建输入）→ make clean →
+    ``make -jN all CFLAGS="<原值> -DCATOS_DHCP_LEASE_SCALE=<N>"`` → os.iso 拷出。
+    整树统一追加该宏而非单文件重编：全仓库仅 net_dhcp.c 引用此宏（已 grep
+    核实），其余编译单元语义逐位不变——换来的是零 Makefile 改动、零单点
+    重链脚本。主仓库只读，构建一律发生在 scratch 副本。
+    """
+    src = os.path.realpath(src_tree)
+    if scale < 1:
+        raise wl.Fail("scale must be >=1 (net_dhcp.c:50-52), got %d" % scale)
+    for tool in ("make", "gcc", "nasm", "ld", "objcopy", "grub-mkrescue"):
+        if not shutil.which(tool):
+            raise wl.Fail("builder tool missing: %s" % tool)
+    if scratch:
+        tree = os.path.realpath(scratch)
+        if tree == src:
+            raise wl.Fail("refuse in-place build on %s （主目录禁止 make，"
+                          "请另指 --scratch）" % src)
+    else:
+        tree = tempfile.mkdtemp(prefix="catos-dhcpscale-")
+    if os.path.isdir(tree) and not keep_scratch:
+        shutil.rmtree(tree)
+    ignore = shutil.ignore_patterns(
+        ".git", ".opencode", "linux-ref", "__pycache__",
+        "*.o", "*.elf", "*.bin", "os.iso", "iso", "disk.img",
+        "downloaded", "*.log", "*.serial")
+    print("[dhcp-build] copy %s -> %s ..." % (src, tree))
+    shutil.copytree(src, tree, ignore=ignore, symlinks=True)
+    base = _make_query_cflags(tree)
+    if not base:
+        print("[dhcp-build] WARN: make -pn 未提取到 CFLAGS，用兜底镜像")
+        base = _DHCP_FALLBACK_CFLAGS
+    cflags = "%s -DCATOS_DHCP_LEASE_SCALE=%d" % (base, scale)
+    print("[dhcp-build] CFLAGS=%s" % cflags)
+
+    def run(cmd, timeout=900):
+        print("[dhcp-build] %s" % " ".join(cmd[:6]) + (" ..." if len(cmd) > 6 else ""))
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if r.returncode != 0:
+            tail = r.stdout.decode(errors="replace").splitlines()[-15:]
+            tail += r.stderr.decode(errors="replace").splitlines()[-15:]
+            raise wl.Fail("build step failed rc=%d:\n%s"
+                          % (r.returncode, "\n".join(tail)))
+        return r
+
+    run(["make", "-C", tree, "clean"])
+    t0 = time.time()
+    run(["make", "-C", tree, "-j%d" % (os.cpu_count() or 2),
+         "CFLAGS=%s" % cflags, "all"])
+    iso = os.path.join(tree, "os.iso")
+    if not os.path.isfile(iso):
+        raise wl.Fail("make reported success but os.iso missing in %s" % tree)
+    out_iso = os.path.abspath(out_iso)
+    out_dir = os.path.dirname(out_iso)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    shutil.copyfile(iso, out_iso)
+    print("[dhcp-build] OK scale=%d iso=%s (%dB, %.1fs)"
+          % (scale, out_iso, os.path.getsize(out_iso), time.time() - t0))
+    if not keep_scratch and not scratch:
+        shutil.rmtree(tree, ignore_errors=True)
+    return out_iso
+
+
+def case_dhcp_lease(S):
+    """DHCP 租约生命周期常驻用例（slirp 模式 + LEASE_SCALE 专用 ISO）。
+
+    前置：由 run_all.sh / 手工先用 ``--build-dhcp-scale-iso`` 造出
+    dhcp_scale.iso（SCALE 默认 21600 ⇒ 86400s→400 ticks、T1≈2s、T2≈3.5s，
+    net_dhcp.c:55-58 换算、:63-76 dhcp_arm_lease 取下限钳制），再经
+    ``CATOS_SLIRP_READY_MARK='[NET] DHCP ACK ip=' qemu_run.sh --mode slirp
+    --iso dhcp_scale.iso -- python3 net_suite.py --suite inject --case
+    dhcp_lease`` 驱动——就绪门走串口标记而非 guest:80 端口，因为 pristine
+    HEAD 无 ring3 :80 探针（README「尚未接线」）。slirp 的 DHCP 服务对任何
+    到达 UDP:67 的报文应答（含 RENEW 单播），租约恒 86400s。
+
+    断言面（标记原文见 DHCP_MARK_* 注释，net_dhcp.c 行号）：
+      P1 首取全程 DISCOVER(:102)→REQUEST(:102)→ACK ip=(:140) 各恰一次；
+      P2 串口顺序 DISCOVER < REQUEST < ACK < T1 due(:157) < REQUEST(renew)
+         < ACK renew ip=(:139) —— BOUND--T1-->RENEWING 单播续期状态迁移；
+      P3 续期可持续：≥CATOS_DHCP_MIN_RENEWS 轮 ACK renew（每轮 ACK 经
+         dhcp_arm_lease 重挂三截止 ⇒ 循环非一次性巧合）；且 REQUEST(renew)+
+         REQUEST(rebind) 总数 ≥ ACK renew 数（每个续期 ACK 必有在先请求，
+         尾部未决允许）；
+      P4 服务存活不变量（契约面）：expire(:108)/NAK(:124)/fallback
+         static(:194) 全程零次 —— slirp 恒应答，出现即回归信号；
+      P5 REBINDING 机会性覆盖：T2 due(:170)/REQUEST(rebind) 允许出现
+        （首轮单播 ARP 预热 miss 等瞬态即可触发，RFC 2131 §4.4.5 合法
+         迁移），但最后一条 rebind 请求之后必须出现 ACK renew —— 广播
+         续租被服务端接住并重新武装（首跑实测即观察到该恢复路径）；
+      P6 续期风暴中数据面存活：内核常驻 UDP:7 echo 往返（net_udp.c:35/41，
+         不依赖 ring3 探针接线——pristine HEAD 即可跑）；
+      P7 final scan 无 panic/CPU exception/CR2=/[ERR]。
+
+    NOT_TESTED（结构性不可达，见 README）：租约到期 rediscover、NAK
+    restart —— 需要「授约后失联/拒绝」的 DHCP 服务端，slirp 均不满足；
+    socket-netdev 裸模式无服务端只会走 fallback（另一条已被 socket 套件
+    隐式覆盖的路径），租约根本不建立。
+    """
+    scale = _env_int("CATOS_DHCP_SCALE", DHCP_SCALE_DEFAULT)
+    window = _env_int("CATOS_DHCP_WINDOW", 30)
+    min_renews = _env_int("CATOS_DHCP_MIN_RENEWS", 3)
+    lt_ticks = 86400 * 100 // max(1, scale)
+    S.note("lease_model",
+           "SCALE=%d ⇒ lease=%d ticks(%sms), T1=lt/2, T2≈0.875·lt；窗口 %ss、"
+           "最少续期轮数 %d"
+           % (scale, lt_ticks, lt_ticks * 10, window, min_renews))
+
+    want = {"ack_first": 1, "t1": 1,
+            "req_renew": min_renews, "ack_renew": min_renews}
+
+    def snapshot(txt):
+        return {
+            "discover": txt.count(DHCP_MARK_DISCOVER),
+            "req_first": txt.count(DHCP_MARK_REQUEST_FIRST),
+            "ack_first": txt.count(DHCP_MARK_ACK_FIRST),
+            "t1": txt.count(DHCP_MARK_T1),
+            "req_renew": txt.count(DHCP_MARK_RENEW_REQ),
+            "ack_renew": txt.count(DHCP_MARK_RENEW_ACK),
+            "rebind": txt.count("[NET] DHCP REQUEST(rebind)"),
+        }
+
+    def rebind_settled(txt):
+        """最后一条 rebind 请求后已有 ACK renew 收口（无 rebind 视为已收口）。"""
+        i = txt.rfind("[NET] DHCP REQUEST(rebind)")
+        return i < 0 or txt.find(DHCP_MARK_RENEW_ACK, i) >= 0
+
+    end = time.time() + window
+    while True:
+        txt = _read_serial_str(S.serial)
+        counts = snapshot(txt)
+        if (all(counts[k] >= v for k, v in want.items())
+                and rebind_settled(txt)):
+            break
+        if time.time() >= end:
+            break
+        # rebind 已现但 ACK 未落：多给 8s 宽限再判 P5，防把在途广播误判失败
+        if counts["rebind"] > 0 and not rebind_settled(txt) \
+                and time.time() > end - 8:
+            end = time.time() + 8
+        time.sleep(0.5)
+
+    S.check("serial:%s first-acquire" % DHCP_MARK_DISCOVER.strip(),
+            counts["discover"] >= 1, "count=%d" % counts["discover"])
+    S.check("serial:first-acquire ACK exactly once (%s)" %
+            DHCP_MARK_ACK_FIRST.strip(),
+            counts["ack_first"] == 1, "count=%d" % counts["ack_first"])
+    S.check("serial:T1 renew due fired", counts["t1"] >= 1,
+            "count=%d" % counts["t1"])
+    S.check("serial: sustained renewals >= %d (re-arm loop)" % min_renews,
+            counts["ack_renew"] >= min_renews, "count=%d" % counts["ack_renew"])
+    total_req = counts["req_renew"] + counts["rebind"]
+    S.check("serial: every renew-ACK has preceding renew/rebind REQUEST",
+            total_req >= counts["ack_renew"] > 0,
+            "req=%d+%d ack=%d" % (counts["req_renew"], counts["rebind"],
+                                  counts["ack_renew"]))
+
+    txt = _read_serial_str(S.serial)
+    marks = [DHCP_MARK_DISCOVER, DHCP_MARK_REQUEST_FIRST, DHCP_MARK_ACK_FIRST,
+             DHCP_MARK_T1, DHCP_MARK_RENEW_REQ, DHCP_MARK_RENEW_ACK]
+    pos = [txt.find(m) for m in marks]
+    S.check("serial order: DISCOVER<REQUEST<ACK<T1<REQUEST(renew)<ACK renew",
+            all(p >= 0 for p in pos) and pos == sorted(pos),
+            "%s" % [(marks[i].strip()[-14:], pos[i]) for i in range(len(marks))])
+
+    neg = {"lease expired": txt.count("lease expired"),
+           "NAK, restart": txt.count("NAK, restart"),
+           "fallback static": txt.count("fallback static")}
+    S.check("server-alive invariants: zero expire/NAK/fallback",
+            all(v == 0 for v in neg.values()), "%s" % neg)
+
+    rb = txt.count("[NET] DHCP REQUEST(rebind)")
+    if rb:
+        S.check("serial: REBINDING broadcast recovered by ACK",
+                rebind_settled(txt),
+                "rebind_req=%d（机会性覆盖：T2 迁移被观察且收口）" % rb)
+    else:
+        S.note("rebind_path", "本窗口未触发 T2/REBINDING（T1→T2 间隙充裕）；"
+                              "路径仍受 P5 恢复断言保护")
+
+    ok = _udp7_echo_alive()
+    S.check("dataplane alive amid renewal churn: kernel UDP:7 echo roundtrip",
+            ok, "P_UDP7=%d（内核常驻服务，不依赖 ring3 探针接线）" % P_UDP7)
+
+    time.sleep(2)
+    bad = [pat for pat in (r"panic", r"CPU exception", r"CR2=", r"\[ERR\]")
+           if re.search(pat, _read_serial_str(S.serial))]
+    S.check("serial:final_scan", not bad,
+            "无 panic/exception" if not bad else "发现 %s" % bad)
+
+
+def _read_serial_str(path):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _udp7_echo_alive(timeout=6.0):
+    """内核 UDP:7 echo 往返（net_udp.c:35 open :7 / :41 dport==7 回显）——
+    续期风暴中数据面存活的探针，不依赖任何 ring3 探针接线。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    payload = b"dhcp-lease-liveness"
+    try:
+        s.sendto(payload, (HOST, P_UDP7))
+        data, _a = s.recvfrom(2048)
+        return data == payload
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 INJECT_CASES = {
     "sack_t1": case_sack_t1,
     "sack_t2": case_sack_t2,
@@ -1144,6 +1426,9 @@ INJECT_CASES = {
     "tw_recycle": case_tw_recycle,
     "backlog_probe": case_backlog_probe,
     "l3b_race": case_l3b_race,
+    # 注意：dhcp_lease 是 inject 套件里唯一的 slirp 模式用例（需要 DHCP
+    # 服务端 + LEASE_SCALE 专用 ISO），驱动方式见用例 docstring / README。
+    "dhcp_lease": case_dhcp_lease,
 }
 
 
@@ -1179,10 +1464,28 @@ def main():
     ap.add_argument("--case", help="inject 单用例名；缺省则同进程连跑全部"
                                    "（注意：严格语义应每用例新引导，见 README）")
     ap.add_argument("--list", action="store_true", help="列出阶段与用例后退出")
+    ap.add_argument("--build-dhcp-scale-iso", nargs=2, metavar=("SRC_TREE", "OUT_ISO"),
+                    help="dhcp_lease 前置：在 /tmp 副本树以 -DCATOS_DHCP_LEASE_SCALE=N "
+                         "重编专用 ISO（主仓库零触碰；工具链缺失/构建失败 rc=5）")
+    ap.add_argument("--scale", type=int, default=DHCP_SCALE_DEFAULT,
+                    help="LEASE_SCALE 分母（默认 %(default)s，net_dhcp.c:41-58）")
+    ap.add_argument("--scratch", default="",
+                    help="副本构建目录（默认 mkdtemp 临时目录，成功后清理）")
     ap.add_argument("--serial", default=os.environ.get("SERIAL_LOG", "./serial.log"),
                     help="串口落盘路径（qemu_run.sh 已透传 SERIAL_LOG）")
     ap.add_argument("--json", default="", help="结构化结果 JSON 输出路径（CI 友好）")
     args = ap.parse_args()
+
+    if args.build_dhcp_scale_iso:
+        try:
+            build_dhcp_scale_iso(args.build_dhcp_scale_iso[0],
+                                 args.build_dhcp_scale_iso[1],
+                                 scale=args.scale,
+                                 scratch=args.scratch or None)
+            return EXIT_OK
+        except wl.Fail as e:
+            print("[dhcp-build] FAILED: %s" % e)
+            return EXIT_HARNESS
 
     if args.list:
         print("blackbox stages:")
