@@ -14,7 +14,7 @@ QEMUFLAGS = -cdrom os.iso -m 128M -display none -serial stdio -no-reboot -no-shu
 OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o kbdwait.o ide.o rtc.o usermode.o vfs.o net.o \
       elf.o # elf.o(code2): exec syscall 链接 elf_load 所需（elf.c 属其他代理实现）
 
-all: shell_bin.h sock_abi_bin.h os.iso
+all: shell_bin.h sock_abi_bin.h httpd_bin.h os.iso
 
 os.iso: cat-os.bin grub/grub.cfg
 	rm -rf iso
@@ -35,7 +35,7 @@ boot.o: boot.asm
 arch.o: arch.asm
 	$(AS) -f elf32 -o $@ $<
 
-%.o: %.c kernel.h paging.h multiboot.h net.h e1000.h shell_bin.h sock_abi_bin.h
+%.o: %.c kernel.h paging.h multiboot.h net.h e1000.h shell_bin.h sock_abi_bin.h httpd_bin.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 run: os.iso
@@ -44,10 +44,27 @@ run: os.iso
 check: os.iso
 	timeout 8s $(QEMU) $(QEMUFLAGS) || test $$? -eq 124
 
+# ── httpd 验收启动：slirp hostfwd 宿主 18082 -> guest:7000（TCP）─────────────
+# 端口方案注记（2026-08-26 httpd 回归设计端口 :7000）：
+# - guest TCP :80 契约归属 blackbox ring3 回显探针（net_suite tcp80:* 用例），
+#   httpd 不得占用；guest UDP :7000 属 ring3 UDP 回显探针，与 httpd 的
+#   TCP :7000 不冲突 —— 内核 UDP/TCP 分表（net.c udp_socks[]:342 vs
+#   tcp_conns[]:743），bind/listen 查表互不可见。
+# - 宿主侧不用 18081：该端口已被 tests/qemu_run.sh P_TCP81(18081->guest:81)
+#   占用（内核 banner 服务，blackbox tcp81:* 断言依赖），故选 18082。
+# - qemu_run.sh 属测试 harness 领地未加此 forward，故此处提供独立最小
+#   启动目标供 curl 验收；其余 hostfwd 需求仍走 qemu_run.sh。
+QEMUFLAGS_HTTPD = -cdrom os.iso -m 128M -display none -serial stdio -no-reboot -no-shutdown \
+                  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:18082-:7000 -device e1000,netdev=net0
+
+run-httpd: os.iso
+	$(QEMU) $(QEMUFLAGS_HTTPD)
+
 clean:
 	rm -rf *.o cat-os.elf cat-os.bin os.iso iso
 	rm -f shell_user.elf shell_user.bin shell_bin.h
 	rm -f sock_abi.elf sock_abi.bin sock_abi_bin.h sock_abi.o
+	rm -f httpd.elf httpd.bin httpd_bin.h httpd.o
 
 # ── code2: ring3 shell（shell_user.elf → shell_user.bin → shell_bin.h）───────
 # 与内核 CFLAGS 同族，另加 -fcf-protection=none：抑制 .note.gnu.property，
@@ -96,8 +113,32 @@ sock_abi_bin.h: sock_abi.elf sock_abi.bin
 	xxd -i sock_abi.elf > $@.tmp
 	{ printf '/*\n * sock_abi_bin.h —— 自动生成：stage4 sock_abi 测试 ELF32 内嵌数组\n * ⚠️ 请勿手改：由 Makefile 目标 sock_abi_bin.h 重新生成。\n * 内容：sock_abi_test.elf 全文（ELF32 i386 LSB ET_EXEC），加载契约同 shell_bin.h。\n */\n#ifndef CATOS_SOCK_ABI_BIN_H\n#define CATOS_SOCK_ABI_BIN_H\n#include <stdint.h>\n'; cat $@.tmp; printf '\n#endif /* CATOS_SOCK_ABI_BIN_H */\n'; } > $@ && rm -f $@.tmp
 
+# ── httpd 接线：ring3 HTTP 守护三件套（userland/httpd/httpd.c → 内嵌 ELF）────
+# 模式照抄 sock_abi 四件套；CFLAGS 同 SHELL 族（httpd.c 自洽零 libc 依赖，
+# README「接线需求清单」#1 即此约定）。链接地址选 0x500000：与 shell/sock_abi
+# 的 0x3ff000..0x404xxx 段位错开 —— 本内核单一共享页目录（elf.c 头注释），
+# httpd 需与常驻 shell 并存，段重叠即互相踩踏；0x500000 落用户区、前置 RO 段
+# (0x4ff000) 亦满足 elf_load 的 vaddr>=0x1000 校验。
+HTTPD_CFLAGS  = $(SHELL_CFLAGS)
+HTTPD_LDFLAGS = -m elf_i386 -nostdlib -static -e _start -Ttext=0x500000
 
-.PHONY: all run check clean
+httpd.o: userland/httpd/httpd.c
+	$(CC) $(HTTPD_CFLAGS) -c -o $@ $<
+
+httpd.elf: httpd.o
+	$(LD) $(HTTPD_LDFLAGS) -o $@ $<
+
+httpd.bin: httpd.elf
+	$(OBJCOPY) -O binary $< $@
+
+# 内嵌头：嵌入完整 ELF（xxd 数组名 httpd_elf/_len，供 kernel.c include 直启；
+# 与 syscall.c weak extern 命名约定一致，未来白名单注册同名即可）
+httpd_bin.h: httpd.elf httpd.bin
+	xxd -i httpd.elf > $@.tmp
+	{ printf '/*\n * httpd_bin.h —— 自动生成：ring3 HTTP 守护 ELF32 内嵌数组\n * ⚠️ 请勿手改：由 Makefile 目标 httpd_bin.h 重新生成。\n * 内容：httpd.elf 全文（ELF32 i386 LSB ET_EXEC，入口 _start=0x500000），\n * 加载契约同 shell_bin.h（elf_load 校验 ELF 魔数，仅认 PT_LOAD 段）。\n */\n#ifndef CATOS_HTTPD_BIN_H\n#define CATOS_HTTPD_BIN_H\n#include <stdint.h>\n'; cat $@.tmp; printf '\n#endif /* CATOS_HTTPD_BIN_H */\n'; } > $@ && rm -f $@.tmp
+
+
+.PHONY: all run run-httpd check clean
 
 # ── code9: 最小用户态 libc（libc/ 全新目录，零冲突追加；不动上方任何规则）──
 # 自检命令族（任务书）：gcc -m32 -ffreestanding -fno-builtin -nostdlib -c；

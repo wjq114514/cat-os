@@ -7,7 +7,14 @@ syscall 封装范式照抄 `tests/user_sock_abi/user_sock_abi_test.c` 的 `sc5` 
 
 ## 行为
 
-- 监听 **guest:80**（内核 `net_init` 已让出该端口，见 net.c 注释契约）。
+- 监听 **guest TCP :7000**（回归设计端口，2026-08-26：曾误绑 :80 与 blackbox
+  ring3 回显探针冲突——探针同样 bind(:80)，httpd 抢答致 roundtrip 收到 HTTP、
+  探针 bind 失败空转致 TCP MULTI 超时）。与 ring3 UDP 回显探针的 UDP:7000
+  **不冲突**：内核 UDP/TCP 分表——UDP 槽位 `udp_socks[]`（net.c:342-344，
+  查表 `udp_sock_by_port()`），TCP 槽位 `tcp_conns[]`/`tcp_socks[]`
+  （net.c:743-745，listen 查表 `tcp_conn_find_listen()`）；bind 系统调用按
+  socket 类型分流（net.c:918 SOCK_UDP_UNBOUND 分支只触 udp_socks），
+  同端口号跨协议互不可见。
 - 只解析请求行；**非 GET → 405**，畸形行/路径非 `/` 开头/含 `..`/长度>256 → 400，
   其余一律 **200 text/plain**，正文固定 `hello from cat-os httpd`。
 - 响应恒带 `Content-Length` + `Connection: close`，发完即 nr=28 close。
@@ -22,7 +29,7 @@ syscall 封装范式照抄 `tests/user_sock_abi/user_sock_abi_test.c` 的 `sc5` 
 | 5  | open("/dev/console", O_WRONLY=1)；失败返回 -1（非 errno），程序回退 fd=1 |
 | 12 | exit（仅 socket/bind/listen 初始化致命失败） |
 | 20 | socket(SOCK_STREAM=1) |
-| 21 | bind(fd, 80) |
+| 21 | bind(fd, 7000) |
 | 22 | listen(fd, 16) |
 | 23 | accept(fd)；空队列 -EAGAIN（忙等软化：每 64 次 EAGAIN 插一段短 spin，Y6' 缺口） |
 | 26 | send（收缩式部分写：游标推进 + 返 0 重试上限，宁截断不死循环） |
@@ -52,19 +59,24 @@ gcc -m32 -march=i486 -ffreestanding -fno-pic -fsyntax-only \
 2. 加载路径二选一：
    - kernel.c 内嵌 `elf_load(httpd_elf)` 引导直启（改 kernel.c 内嵌逻辑），或
    - 扩展 syscall.c sys_exec 白名单注册路径（如 "/bin/httpd" → weak 符号 `httpd_elf/_len`）。
-3. QEMU 启动参数沿用 tests/qemu_run.sh（hostfwd tcp:18080->:80 已就绪）。
+3. QEMU 启动参数：curl 验收走 `make run-httpd`（hostfwd tcp:127.0.0.1:18082 ->
+   guest:7000）。宿主端口不用 18081——它已被 tests/qemu_run.sh 的
+   P_TCP81(18081→guest:81 内核 banner 服务) 占用，blackbox tcp81:* 断言依赖；
+   qemu_run.sh 属测试 harness 领地，未加此 forward（后续由 harness owner 补
+   `hostfwd=tcp:127.0.0.1:${P_HTTPD:-18082}-:7000` 即可并入统一入口）。
 
 ## 验收步骤草案
 
 ```bash
-# 接线并启动 QEMU（tests/qemu_run.sh 或等价 hostfwd 配置）后：
-curl -s http://127.0.0.1:18080/
+# 终端 A：make run-httpd  # 等串口出现 "[HTTPD] listening on port 7000 ..."
+# 终端 B：
+curl -s http://127.0.0.1:18082/
 #   预期输出：hello from cat-os httpd
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18080/
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18082/
 #   预期输出：405
-printf 'GARBAGE\r\n\r\n' | nc -q1 127.0.0.1 18080 | head -1
+printf 'GARBAGE\r\n\r\n' | nc -q1 127.0.0.1 18082 | head -1
 #   预期输出：HTTP/1.0 400 Bad Request
-for i in $(seq 1 100); do curl -s http://127.0.0.1:18080/ >/dev/null; done
+for i in $(seq 1 100); do curl -s http://127.0.0.1:18082/ >/dev/null; done
 #   串口无 panic、无 fd 泄漏征兆（EMFILE）
 ```
 

@@ -75,7 +75,7 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
 | `sack_t8` | 序号跨 2^32 顺序交付（ACK==4）；回绕后 OOO/SACK=(0x10,0x1A)；过期段拒绝（有符号比较）；回绕前 dup 拒绝；回绕点重叠排队；级联完成 ACK==0x1A | 32 位序号回绕语义（SACK 加固组，含 harness 侧修正注记） |
 | `rst_l1` | 窗内非精确 RST→challenge-ACK 且连接存活；窗上方/窗下方 RST→静默丢弃；精确 seq RST→复位；关闭后数据遇 RST/no-listener | RST 有效性校验三态（移植自 ox_lifecycle_edge.L1，TCP 安全加固组） |
 | `tw_recycle` | 主动关闭完整路径 FIN_WAIT_2→`TIME_WAIT entered`→`TIME_WAIT expired`（串口顺序断言）→同端口三次握手重建成功且重推 banner | TW1/TW2 回填：TIME_WAIT 到期回收 + 端口复用（TW=200 ticks≈2s@100Hz，net.c:982/1019；整例约 8-12s） |
-| `backlog_probe` | 容量模型 listen(1)+A(1)+14 半开=16 槽占满后，第 16 个四元组的 SYN 被 `RST|ACK ack=ISN+1` 拒绝；串口恰一条 `conn table full, RST` 且零条 `accept queue full`（LISTEN TCB 自身占 1 槽 ⇒ pending 上限 15 < backlog 16，队列满分支 fresh-boot 结构性不可达）；既有 ESTABLISHED 连接数据照常被 ACK | TB1 回填：容量硬断言对照 net.h:67、net.c:364/660-668/765-767/816-822/1206（2026-08-25 修正旧模型漏算 listen 占槽）；SYN 分批注入规避 e1000 8 描述符环溢 |
+| `backlog_probe` | 容量模型动态推导：常驻 TCP listener 数 N 从串口 `[NET] TCP listen :` 行计数（现状 N=2：内核 ：81 + httpd :7000），n_half=TCP_MAX_CONNS(16, net.h:67)−N−A(1) 半开占满连接表后，下一四元组的 SYN 被 `RST|ACK ack=ISN+1` 拒绝；串口恰一条 `conn table full, RST` 且零条 `accept queue full`（LISTEN TCB 自身占槽 ⇒ pending 上限 16−N < backlog 16，队列满分支 fresh-boot 结构性不可达）；既有 ESTABLISHED 连接数据照常被 ACK | TB1 回填：容量硬断言对照 net.h:67、net.c tcp_listen/pending_count/conn-table-full 路径（2026-08-25 修正旧模型漏算 listen 占槽；2026-08-26 二次修正——kernel.c stage4 接线常驻 httpd(:7000) 后固定 `16−2` 失准，改为按串口监听行数动态推导，用例内先等 httpd 绑定再注入）；SYN 分批注入规避 e1000 8 描述符环溢 |
 | `l3b_race` | banner 突发（16×90B 全量入初始 cwnd）后同拍双 ACK：恰好 1 条 `TCP RTT sample=`、样本 ≥1 且 RTO≥30、安静期零补采 | L3B 回填：RTT 采样竞态单次计样（net.c:755/932-938/641-649），样本钳位为 commit 58d55a9 的回归哨兵；守卫窗前移至 banner 等待之前——窗内任何 `TCP RTO: re-xmit`（Karn 抑制必致零采样，含帧在宿主侧迟到 >300ms 的形态）按 harness 故障 rc=5 重试而非断言失败 |
 
 > 历史注记：TW1/TW2（TIME_WAIT 回收与同端口重建）、TB1（SYN backlog）、L3B（采样竞态）
@@ -111,6 +111,12 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
   历史教训：内核曾同时在 :80/:81 挂 LISTEN，2026-08-25 commit 6796bd6 起
   net.c 仅保留 `tcp_listen(81)`；若未来内核监听端口再变，改此环境变量即可，
   无需改用例代码。
+  另注（2026-08-26）：ring3 httpd 守护常驻 listen guest TCP :7000（kernel.c
+  stage4），属容量模型「常驻 listener」的一员（见 backlog_probe 行）；与
+  ring3 UDP 回显探针的 UDP:7000 不冲突——内核 UDP/TCP 分表（net.c
+  udp_socks[]:342 vs tcp_conns[]:743）。httpd 的 curl 验收 hostfwd 为
+  `tcp:127.0.0.1:18082->:7000`，由 `make run-httpd` 提供（18081 已被本表
+  P_TCP81→guest:81 占用；qemu_run.sh 属 harness 领地未加此 forward）。
 - **产物**：`*.serial`（串口原文证据）与 `*.json`（结构化结果）都落在 `CATOS_TEST_OUT`。
 
 ## 范围外（有意不做）

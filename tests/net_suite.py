@@ -869,23 +869,30 @@ def case_tw_recycle(S):
 def case_backlog_probe(S):
     """TB1 回填：连接表容量上限 —— 超额 SYN 被 RST|ACK 拒绝，既有连接不受影响。
 
-    容量模型（commit 36fd594 后对照源码修正；首跑 FAIL 根因 = 旧模型漏算
-    listen TCB 自身占槽，实测第 15 条半开即撞 conn-table-full）。源码依据：
-    - net.h:67  TCP_MAX_CONNS=16（tcp_conns[16]，net.c:364）；
-    - net.c:765-767 tcp_listen(:81) 经 tcp_conn_find_free() 取槽并置
-      used=true ⇒ **监听者本身常驻占 1 槽**（net_init net.c:1206 仅此一个
-      TCP listener）；
-    - net.c:660-668 tcp_pending_count() 只统计端口上 !accepted 的
-      SYN_RECEIVED|ESTABLISHED（LISTEN 态不计）⇒ 新引导下 pending 上限
-      =16-1=15 < backlog=16（net.c:767 c->backlog=TCP_MAX_CONNS），
-      故「accept queue full」分支（net.c:816-819）在 fresh-boot 单监听场景
-      结构性不可达：超额 SYN 必然通过队列检查后在连接表分配处被拒
-      （net.c:821-822 "[NET] TCP conn table full, RST"）。两分支各自打日志
-      后立即 return，对单个 SYN 严格互斥 —— 断言据此翻转：窗口内
-      conn-table-full 恰 1 条、accept-queue-full 为 0；
-    - 净容量模型：listen(1)+A(ESTABLISHED 未 accept)(1)+14 半开=16 槽占满，
-      第 16 个四元组（ovf）的裸 SYN 必被拒；两条拒绝路径回包同源于
-      tcp_send_rst_ack（net.c:818/822 → 684）：对无 ACK 的 SYN 回
+    容量模型（2026-08-26 起改为「常驻 socket 数」动态推导；沿革：
+    commit 36fd594 后首跑 FAIL 根因 = 旧模型漏算 listen TCB 自身占槽；
+    httpd-wire 接线后二跑 FAIL 根因 = kernel.c stage4 新增常驻 httpd 守护
+    （bind/listen :7000）再占 1 槽，实测第 14 条半开即撞 conn-table-full）。
+    源码依据：
+    - net.h:67  TCP_MAX_CONNS=16（tcp_conns[16]，net.c:364）——容量分母；
+    - net.c tcp_listen() 经 tcp_conn_find_free() 取槽并置 used=true ⇒
+      **每个监听者本身常驻占 1 槽**；且常驻 listener 数可从串口动态计数：
+      内核侧 listen 打 "[NET] TCP listen :<port>"（tcp_listen），ring3 侧
+      bind(nr=21) 在 net_socket_bind() 直接置 TCB=TCP_LISTEN 占槽、无内核
+      日志，以 httpd 自身 banner "[HTTPD] listening on port"（bind/listen
+      成功后打印）为占槽证据。现状两枚 —— 内核演示服务 ：81（net_init
+      tcp_listen(81)）+ ring3 httpd 守护 :7000（kernel.c stage4 phase3 exec，
+      回归设计端口，曾误绑 :80 与本套件 tcp80 回显探针冲突已纠正）；
+    - net.c tcp_pending_count() 只统计端口上 !accepted 的
+      SYN_RECEIVED|ESTABLISHED（LISTEN 态不计）⇒ pending 上限
+      =16-N(listen) < backlog=16（listen 时 c->backlog=TCP_MAX_CONNS），
+      故「accept queue full」分支在 fresh-boot 场景结构性不可达：超额 SYN
+      必然通过队列检查后在连接表分配处被拒（"[NET] TCP conn table full,
+      RST"）。两分支各自打日志后立即 return，对单个 SYN 严格互斥 ——
+      断言据此书写：窗口内 conn-table-full 恰 1 条、accept-queue-full 为 0；
+    - 净容量模型：listener(N)+A(ESTABLISHED 未 accept)(1)+(16-N-1) 半开
+      =16 槽占满，其后首个四元组（ovf）的裸 SYN 必被拒；
+      两条拒绝路径回包同源于 tcp_send_rst_ack：对无 ACK 的 SYN 回
       <SEQ=0><ACK=SEG.SEQ+1><RST|ACK>；
     - net.c:862-866 同四元组重复 SYN 仅重发 SYN-ACK ⇒ 半开连接须用不同源端口；
     - net.c:876-889 valid-seq RST 即时释放槽位（清理路径依据），不依赖
@@ -893,7 +900,38 @@ def case_backlog_probe(S):
     - e1000.c:8 RX/TX 环各仅 8 描述符 ⇒ SYN/RST 按 ≤5 一批注入防环溢丢帧。
     """
     dp = INJECT_DPORT
-    n_half = 16 - 2          # TCP_MAX_CONNS(net.h:67) - listen 占1(net.c:765-767) - A 占 1
+    # 常驻 TCP listener 数动态推导（依据见 docstring / net.h:67）：
+    #   n_half = TCP_MAX_CONNS(16) − 常驻 listener − A(基线 ESTABLISHED 占 1)
+    # 现状常驻两枚：内核 :81（net_init）+ httpd :7000（kernel.c stage4）。
+    # 信号面注记：两条监听路径的日志形态不同 ——
+    #   · 内核侧 net_init 走 tcp_listen()，每次成功监听打一行
+    #     "[NET] TCP listen :<port>"（net.c）；
+    #   · ring3 侧 bind(nr=21) 在 net_socket_bind() 的 SOCK_TCP_UNBOUND 分支
+    #     直接置 TCB=TCP_LISTEN 占槽（net.c），无内核日志；以服务自身
+    #     bind/listen 成功后的 banner 行 "[HTTPD] listening on port"
+    #     （userland/httpd/httpd.c）为占槽证据。
+    # httpd exec 晚于 shell（stage4 时序契约），故先等两路信号齐再注入，
+    # 避免在守护绑定前开跑导致模型少扣 1 槽。
+    deadline = time.time() + 30
+    n_listen = 0
+    while time.time() < deadline:
+        try:
+            with open(S.serial, "rb") as f:
+                blob = f.read()
+        except OSError:
+            blob = b""
+        n_listen = (blob.count(b"[NET] TCP listen :")
+                    + (1 if b"[HTTPD] listening on port" in blob else 0))
+        if n_listen >= 2:
+            break
+        time.sleep(0.25)
+    if n_listen < 1:
+        n_listen = 2      # 兜底：串口解析缺失时按当前已知常驻数（:81 + :7000）
+    S.note("resident_listeners",
+           "内核[NET] TCP listen: + ring3 [HTTPD] listening 共 %d 枚"
+           "（:81 + httpd :7000；等 httpd 绑定 %s）"
+           % (n_listen, "ok" if n_listen >= 2 else "timeout→兜底"))
+    n_half = 16 - n_listen - 1   # TCP_MAX_CONNS(net.h:67) − 常驻 listener − A 占 1
     sports = [31031 + i for i in range(n_half)]
     ovf_sport = 31031 + n_half
     w = wl.Wire(31030)
@@ -960,7 +998,8 @@ def case_backlog_probe(S):
             S.check("serial: 'conn table full' logged exactly once (binding constraint)",
                     s_ovf.count("TCP conn table full, RST") == 1,
                     "count=%d" % s_ovf.count("TCP conn table full, RST"))
-            S.check("serial: 'accept queue full' NOT hit (pending 15 < backlog 16, net.c:660-668)",
+            S.check("serial: 'accept queue full' NOT hit (pending %d < backlog 16, queue branch unreachable fresh-boot)"
+                    % n_half,
                     s_ovf.count("TCP accept queue full, RST") == 0, "")
 
             # 既有连接不受影响：A 上发数据须被正常 ACK 推进（ESTABLISHED 带载

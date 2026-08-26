@@ -20,8 +20,18 @@
  *                               （M0 全程持有该 fd，无需 nr=6 关闭；socket 关闭见 nr=28）
  *   socket 组（house ABI 五参封顶、无 sockaddr 结构，bind 直传端口号）：
  *     nr=20 socket(type)        type=1 SOCK_STREAM；表满 -EMFILE
- *     nr=21 bind(fd,port)       port=80（内核 net_init 已让出 :80，见 net.c net_init
- *                               注释「TCP :80 由 ring3 服务绑定」契约）
+ *     nr=21 bind(fd,port)       port=7000（设计端口回归 2026-08-26：曾误绑 :80 与
+ *                               blackbox ring3 回显探针冲突 —— 探针同样 bind(:80)，
+ *                               httpd 抢答使 roundtrip 收到 HTTP 而非回显、探针
+ *                               bind 失败空转致 TCP MULTI 永不完成；net_init 仅让出
+ *                               不监听，:80 契约归属探针。与 ring3 UDP 回显探针的
+ *                               UDP:7000 不冲突：内核 UDP/TCP 分表 —— UDP 槽位
+ *                               udp_socks[]/udp_handles[]，查表走 udp_sock_by_port()
+ *                               （net.c:342-344）；TCP 槽位 tcp_conns[]/tcp_socks[]/
+ *                               tcp_handles[]，listen 查表走 tcp_conn_find_listen()
+ *                               （net.c:743-745/1040）；bind 系统调用亦按 socket
+ *                               类型分流（net.c:918 SOCK_UDP_UNBOUND 分支只触
+ *                               udp_socks）。同端口号跨协议互不可见。）
  *     nr=22 listen(fd,backlog)  backlog=16（内部截到 TCP_MAX_CONNS=16，net.h:67）
  *     nr=23 accept(fd)          空队列返 -EAGAIN（非阻塞轮询语义，无 ring3 阻塞 accept）
  *     nr=26 send(fd,buf,len)    收缩式部分写契约（net.c tcp_send）：返回值可为部分字节数，
@@ -54,13 +64,13 @@
  *   · 栈预算：用户栈仅 1 页 4KB（elf.h:30-31，设计稿 §7-L7）→ 请求/响应缓冲全部放
  *     .bss 静态区，栈上只留小标量。
  *
- * ── 验收方法（QEMU hostfwd 已备：tests/qemu_run.sh，18080→guest:80）──────────
+ * ── 验收方法（QEMU hostfwd：make run-httpd，18082→guest:7000）──────────────
  *   orchestrator 接线并启动后，宿主机执行：
- *     curl -s http://127.0.0.1:18080/
+ *     curl -s http://127.0.0.1:18082/
  *       预期输出：hello from cat-os httpd
- *     curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18080/
+ *     curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18082/
  *       预期输出：405
- *     curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/bad path 畸形行
+ *     curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18082/bad path 畸形行
  *       （手工 nc 发垃圾行）预期输出：400
  *   串口应见 "[HTTPD]" 启动 banner 与逐连接日志；100 连接串行无 panic、无 fd 泄漏。
  */
@@ -85,7 +95,9 @@
 
 #define EAGAIN         (-11) /* CATOS_EAGAIN */
 
-#define HTTPD_PORT     80u   /* 内核 net_init 契约：ring3 服务专用端口 */
+#define HTTPD_PORT     7000u /* 设计端口（TCP）。勿改回 :80 —— 该端口契约归属
+                              * blackbox ring3 回显探针；UDP:7000 属另一探针，
+                              * 分表不冲突（见上方 nr=21 注释与 net.c 342/743） */
 #define LISTEN_BACKLOG 16u   /* TCP_MAX_CONNS（net.h:67），listen 内部自动截断 */
 
 #define REQ_MAX            2048u       /* 设计稿 §4.3 上限（用户栈仅 4KB → 缓冲在 .bss）*/
@@ -434,7 +446,7 @@ int main(void)
             "sock-close=28 | open=5 write=1 exit=12");
     log_ch('\n');
     log_flush();
-    log_line("listening on port 80 (QEMU hostfwd 18080 -> guest:80)");
+    log_line("listening on port 7000 (QEMU hostfwd 18082 -> guest:7000, make run-httpd)");
 
     lfd = s_socket(SOCK_STREAM_C);
     if (lfd <= 0)
