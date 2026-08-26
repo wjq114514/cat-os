@@ -20,6 +20,7 @@ static void syscall3(uint8_t **p,uint32_t nr,uint32_t a,uint32_t b,uint32_t c){m
 static void syscall5(uint8_t **p,uint32_t nr,uint32_t *v,uint8_t mem){static const uint8_t r[5]={3,1,2,6,7};movi(p,0,nr);for(uint8_t i=0;i<5;i++)if(mem&(1u<<i))movm(p,r[i],v[i]);else movi(p,r[i],v[i]);e8(p,0xCD);e8(p,0x80);}
 static void user_segments(uint8_t **p){movi(p,0,0x23);e8(p,0x8E);e8(p,0xD8);e8(p,0x8E);e8(p,0xC0);}
 static uint32_t jl(uint8_t **p){e8(p,0x0F);e8(p,0x8C);uint32_t x=(uint32_t)(*p);e32(p,0);return x;}
+static uint32_t je(uint8_t **p){e8(p,0x0F);e8(p,0x84);uint32_t x=(uint32_t)(*p);e32(p,0);return x;}
 static void patch(uint8_t *base,uint32_t at,uint32_t dst){int32_t d=(int32_t)(dst-(0x1000u+at+4));for(int i=0;i<4;i++)base[at+i]=(uint8_t)((uint32_t)d>>(8*i));}
 static void cmpzero(uint8_t **p){e8(p,0x83);e8(p,0xF8);e8(p,0);}
 static void cmpimm(uint8_t **p,uint32_t v){e8(p,0x3D);e32(p,v);}
@@ -28,28 +29,77 @@ static uint32_t jmp(uint8_t **p){e8(p,0xE9);uint32_t x=(uint32_t)(*p);e32(p,0);r
 static void copy_bytes(void *dst,const void *src,uint32_t n){uint8_t *d=dst;const uint8_t *s=src;for(uint32_t i=0;i<n;i++)d[i]=s[i];}
 static uint8_t user_code[8192];
 void enter_usermode(void){
-    enum{PATH_NULL=0x4100,PATH_CONSOLE=0x4200,PATH_KBD=0x4250,MSG_CONSOLE=0x4300,MSG_KBDOPEN=0x4320,MSG_KBDREAD=0x4340,KDBUF=0x4360,KBD_FD=0x4370,BUF=0x4400,SRCIP=0x4540,SRCPORT=0x4544,FD=0x4600,LEN=0x4604,LISTENFD=0x4608,MSG_UDP=0x4700,MSG_TCP=0x4710,MSG_ERRPASS=0x4728,MSG_ERRFAIL=0x4748,TARGET=0x4800,PINGOUT=0x4900,PINGSTAT=0x4A00,BAD_TARGET=0x4B00,BAD_PTR=0x5000};
+    enum{PATH_NULL=0x4100,PATH_CONSOLE=0x4200,PATH_KBD=0x4250,MSG_CONSOLE=0x4300,MSG_KBDOPEN=0x4320,MSG_KBDREAD=0x4340,MSG_KBDNT=0x434A,MSG_KBDHEX=0x4364,KDBUF=0x4370,KBD_FD=0x43B0,DBG=0x43B4,BUF=0x4400,SRCIP=0x4540,SRCPORT=0x4544,FD=0x4600,LEN=0x4604,LISTENFD=0x4608,MSG_UDP=0x4700,MSG_TCP=0x4710,MSG_ERRPASS=0x4728,MSG_ERRFAIL=0x4748,TARGET=0x4800,PINGOUT=0x4900,PINGSTAT=0x4A00,BAD_TARGET=0x4B00,BAD_PTR=0x5000,KBD_RETRIES=3};
     uintptr_t cp=pmm_alloc_page(),cp2=pmm_alloc_page(),dp=pmm_alloc_page(),sp=pmm_alloc_page(),vp=pmm_alloc_page();
     if(!cp||!cp2||!dp||!sp||!vp||map_page(0x1000,cp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x2000,cp2,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x4000,dp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0x700000,sp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)||map_page(0xB8000,vp,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER))panic("user mapping failed");
     uint8_t *u=user_code,*p=u;uint32_t v[5],a1,a2,a3,a4,a5,errj[16];uint32_t errn=0;
     user_segments(&p);
     syscall3(&p,5,PATH_NULL,2,0);steax(&p,FD);syscall3(&p,0,3,BUF,8);syscall3(&p,6,3,0,0);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_CONSOLE,16);syscall3(&p,6,3,0,0);syscall3(&p,1,3,BAD_PTR,4);
-    /* ring3 /dev/kbd probe. Diagnostics are written through the real console fd
-     * (saved in FD) so writes never target /dev/kbd (read-only). open() return
-     * is captured in KBD_FD (separate from FD so console stays valid). Exactly
-     * one non-blocking read() probes the queue; empty (0) falls through to the
-     * NOT_TESTED/EMPTY diagnostic, a negative return is an error and skips it.
-     * No shell, no blocking read, no busy-loop. */
+    /* ring3 /dev/kbd bounded probe. Reads through the real console fd
+     * (saved in FD) so /dev/kbd is never written to (read-only). KBD_FD
+     * is a separate fd so console survives kbd close. Up to 3 non-blocking
+     * reads: read<0=error, read==0=empty then retry, read>0=print count
+     * + bytes then done. Exhausted retries or error prints
+     * "kbd NOT_TESTED (3 tries)\n". No shell, no blocking read,
+     * no busy-loop. */
     syscall3(&p,5,PATH_KBD,0,0);steax(&p,KBD_FD);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);
-    v[0]=FD;v[1]=MSG_KBDOPEN;v[2]=21;syscall5(&p,1,v,1);
-    v[0]=KBD_FD;v[1]=KDBUF;v[2]=16;syscall5(&p,0,v,1);steax(&p,LEN);
-    cmpzero(&p);uint32_t kbd_ok=(uint32_t)((uint8_t*)jl(&p)-u);
-    v[0]=FD;v[1]=MSG_KBDREAD;v[2]=29;syscall5(&p,1,v,1);
-    v[0]=FD;v[1]=KDBUF;v[2]=LEN;syscall5(&p,1,v,5);
-    uint32_t kbd_ok_lbl=0x1000u+(uint32_t)(p-u);patch(u,kbd_ok,kbd_ok_lbl);
-    v[0]=KBD_FD;syscall5(&p,6,v,1);
+    v[0]=FD;v[1]=MSG_KBDOPEN;v[2]=21;v[3]=0;v[4]=0;
+    syscall5(&p,1,v,1);
+
+    /* retry loop entry: [DBG] = attempt# (0..KBD_RETRIES-1) */
+    movi(&p,0,0);                          // eax=0 so next insn stores 0
+    e8(&p,0x89);e8(&p,0x05);e32(&p,DBG);   // mov [DBG], eax
+    uint32_t retry_top=0x1000u+(uint32_t)(p-u);
+
+    /* read(KBD_FD, KDBUF, 64) -> EAX (ebx/esi/edi preserved by syscall5) */
+    v[0]=KBD_FD;v[1]=KDBUF;v[2]=64;v[3]=0;v[4]=0;
+    syscall5(&p,0,v,1);steax(&p,LEN);      // save read return
+
+    /* <0 -> error -> NOT_TESTED */
+    cmpimm(&p,0);uint32_t kbd_err_j=(uint32_t)((uint8_t*)jl(&p)-u);
+
+    /* ==0 -> empty -> inc counter, retry or NOT_TESTED */
+    cmpzero(&p);uint32_t kbd_empty_j=(uint32_t)((uint8_t*)je(&p)-u);
+
+    /* ---- success path (read>0): "kbd READ " + bytes + "\n" ---- */
+    v[0]=FD;v[1]=MSG_KBDREAD;v[2]=9;v[3]=0;v[4]=0;
+    syscall5(&p,1,v,1);                      // "kbd READ "
+    v[0]=FD;v[1]=KDBUF;v[2]=LEN;v[3]=0;v[4]=0;
+    syscall5(&p,1,v,1|4);                    // dump [LEN] bytes from KDBUF
+    movi(&p,0,0x0A);e8(&p,0x88);e8(&p,0x05);e32(&p,DBG+1); // [DBG+1]=\n
+    v[0]=FD;v[1]=DBG+1;v[2]=1;v[3]=0;v[4]=0;
+    syscall5(&p,1,v,1);                      // "\n"
+    uint32_t kbd_ok_jump=(uint32_t)((uint8_t*)jmp(&p)-u);
+
+    /* ---- empty path: inc counter; retry if <3 else NOT_TESTED ---- */
+    uint32_t kbd_empty=0x1000u+(uint32_t)(p-u);
+    e8(&p,0xFF);e8(&p,0x05);e32(&p,DBG);    // inc [DBG]
+    e8(&p,0x83);e8(&p,0x3D);e32(&p,DBG);e8(&p,KBD_RETRIES); // cmp dword [DBG], KBD_RETRIES
+    uint32_t kbd_retry_j=(uint32_t)((uint8_t*)jl(&p)-u);
+    uint32_t kbd_nt_jump=(uint32_t)((uint8_t*)jmp(&p)-u);
+
+    /* ---- NOT_TESTED path (error or exhausted) ---- */
+    uint32_t kbd_nt=0x1000u+(uint32_t)(p-u);
+    v[0]=FD;v[1]=MSG_KBDNT;v[2]=25;v[3]=0;v[4]=0;
+    syscall5(&p,1,v,1);                      // "kbd NOT_TESTED (3 tries)\n"
+
+    /* [FIX] kbd_done 必须位于 empty/retry/NOT_TESTED 三条路径之后：
+     * 旧版把标签紧贴在成功路径的 jmp 指令后，跳转目标==下一条指令，
+     * 成功读出后坠入空队列重试路径（假 NOT_TESTED 根因）。 */
+    uint32_t kbd_done=0x1000u+(uint32_t)(p-u);
+
+    /* close kbd (unified exit) */
+    v[0]=KBD_FD;v[1]=0;v[2]=0;v[3]=0;v[4]=0;
+    syscall5(&p,6,v,1);
+
+    /* patch jump targets */
+    patch(u,kbd_err_j,kbd_nt);
+    patch(u,kbd_empty_j,kbd_empty);
+    patch(u,kbd_retry_j,retry_top);
+    patch(u,kbd_ok_jump,kbd_done);
+    patch(u,kbd_nt_jump,kbd_nt);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);
     v[0]=99;syscall5(&p,23,v,0);cmpimm(&p,(uint32_t)-CATOS_EBADF);errj[errn++]=(uint32_t)((uint8_t*)jne(&p)-u);
     syscall3(&p,5,PATH_NULL,2,0);steax(&p,FD);v[0]=FD;syscall5(&p,23,v,1);cmpimm(&p,(uint32_t)-CATOS_ENOTSOCK);errj[errn++]=(uint32_t)((uint8_t*)jne(&p)-u);v[0]=FD;syscall5(&p,6,v,1);v[0]=FD;syscall5(&p,6,v,1);cmpimm(&p,(uint32_t)-CATOS_EBADF);errj[errn++]=(uint32_t)((uint8_t*)jne(&p)-u);
@@ -74,7 +124,7 @@ void enter_usermode(void){
     uint32_t acc_loop2=0x1000u+(uint32_t)(p-u);v[0]=LISTENFD;syscall5(&p,23,v,1);cmpzero(&p);a4=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,FD);
     uint32_t tcp_loop2=0x1000u+(uint32_t)(p-u);v[0]=FD;v[1]=BUF;v[2]=64;syscall5(&p,27,v,1);cmpzero(&p);a5=(uint32_t)((uint8_t*)jl(&p)-u);steax(&p,LEN);v[0]=FD;v[1]=BUF;v[2]=LEN;syscall5(&p,26,v,5);v[0]=FD;syscall5(&p,28,v,1);v[0]=LISTENFD;syscall5(&p,28,v,1);syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);syscall3(&p,1,3,MSG_TCP,20);syscall3(&p,6,3,0,0);e8(&p,0xEB);e8(&p,0xFE);
     patch(u,a1,udp_loop);patch(u,a2,acc_loop);patch(u,a3,tcp_loop);patch(u,a4,acc_loop2);patch(u,a5,tcp_loop2);
-    const char n[]="/dev/null",c[]="/dev/console",kbdp[]="/dev/kbd",t[]="10.0.2.2",bt[]="300.1.1.1",m[]="user console ok\n",ko[]="kbd handshake: ready\n",kr[]="kbd NOT_TESTED/EMPTY (1 try)\n",um[]="user UDP PASS\n",tm[]="user TCP MULTI PASS\n",ep[]="user socket ERRORS PASS\n",ef[]="user socket ERRORS FAIL\n";uint8_t *d=(uint8_t*)phys_to_virt(dp);for(unsigned i=0;i<sizeof(n);i++)d[PATH_NULL-0x4000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)d[PATH_CONSOLE-0x4000+i]=c[i];for(unsigned i=0;i<sizeof(kbdp);i++)d[PATH_KBD-0x4000+i]=kbdp[i];for(unsigned i=0;i<sizeof(t);i++)d[TARGET-0x4000+i]=t[i];for(unsigned i=0;i<sizeof(bt);i++)d[BAD_TARGET-0x4000+i]=bt[i];for(unsigned i=0;i<sizeof(m);i++)d[MSG_CONSOLE-0x4000+i]=m[i];for(unsigned i=0;i<sizeof(ko);i++)d[MSG_KBDOPEN-0x4000+i]=ko[i];for(unsigned i=0;i<sizeof(kr);i++)d[MSG_KBDREAD-0x4000+i]=kr[i];for(unsigned i=0;i<sizeof(um);i++)d[MSG_UDP-0x4000+i]=um[i];for(unsigned i=0;i<sizeof(tm);i++)d[MSG_TCP-0x4000+i]=tm[i];for(unsigned i=0;i<sizeof(ep);i++)d[MSG_ERRPASS-0x4000+i]=ep[i];for(unsigned i=0;i<sizeof(ef);i++)d[MSG_ERRFAIL-0x4000+i]=ef[i];for(unsigned i=0;i<16;i++)d[KDBUF-0x4000+i]=0;
+    const char n[]="/dev/null",c[]="/dev/console",kbdp[]="/dev/kbd",t[]="10.0.2.2",bt[]="300.1.1.1",m[]="user console ok\n",ko[]="kbd handshake: ready\n",kr[]="kbd READ ",kn[]="kbd NOT_TESTED (3 tries)\n",kh[]="kbd HEX: ",um[]="user UDP PASS\n",tm[]="user TCP MULTI PASS\n",ep[]="user socket ERRORS PASS\n",ef[]="user socket ERRORS FAIL\n";uint8_t *d=(uint8_t*)phys_to_virt(dp);for(unsigned i=0;i<sizeof(n);i++)d[PATH_NULL-0x4000+i]=n[i];for(unsigned i=0;i<sizeof(c);i++)d[PATH_CONSOLE-0x4000+i]=c[i];for(unsigned i=0;i<sizeof(kbdp);i++)d[PATH_KBD-0x4000+i]=kbdp[i];for(unsigned i=0;i<sizeof(t);i++)d[TARGET-0x4000+i]=t[i];for(unsigned i=0;i<sizeof(bt);i++)d[BAD_TARGET-0x4000+i]=bt[i];for(unsigned i=0;i<sizeof(m);i++)d[MSG_CONSOLE-0x4000+i]=m[i];for(unsigned i=0;i<sizeof(ko);i++)d[MSG_KBDOPEN-0x4000+i]=ko[i];for(unsigned i=0;i<sizeof(kr);i++)d[MSG_KBDREAD-0x4000+i]=kr[i];for(unsigned i=0;i<sizeof(kn);i++)d[MSG_KBDNT-0x4000+i]=kn[i];for(unsigned i=0;i<sizeof(kh);i++)d[MSG_KBDHEX-0x4000+i]=kh[i];for(unsigned i=0;i<sizeof(um);i++)d[MSG_UDP-0x4000+i]=um[i];for(unsigned i=0;i<sizeof(tm);i++)d[MSG_TCP-0x4000+i]=tm[i];for(unsigned i=0;i<sizeof(ep);i++)d[MSG_ERRPASS-0x4000+i]=ep[i];for(unsigned i=0;i<sizeof(ef);i++)d[MSG_ERRFAIL-0x4000+i]=ef[i];for(unsigned i=0;i<64;i++)d[KDBUF-0x4000+i]=0;
     if((uint32_t)(p-u)>sizeof(user_code))panic("user code too large");
     copy_bytes(phys_to_virt(cp),u,4096);copy_bytes(phys_to_virt(cp2),u+4096,4096);
     kputs("[OK] entering ring3\n");__asm__ volatile("pushl $0x23; pushl $0x700FFC; pushl $0x202; pushl $0x1B; pushl $0x1000; iret");
