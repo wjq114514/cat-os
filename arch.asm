@@ -48,12 +48,16 @@ isr_common:
  add esp,8
  iretd
 isr_common_error:
+ ; COW fork 接线修复（2026-08）：#PF 时 CPU 已压入真实错误码、stub 只补压了
+ ; vector，故 popa 后 add esp,8 恰好跳过 [vector][error_code]，ESP 即指向 EIP，
+ ; iretd 可正确返回重执行触发指令。原多出的一条 add esp,4 会吞掉 EIP——
+ ; iretd 把 CS 槽当 EIP 弹出，任何 #PF（含 ring3 COW 写陷阱）必三重故障；
+ ; 现与 isr_common 对无错误码向量的已验证算术严格对齐。
  pusha
  push esp
  call interrupt_dispatch
  add esp,4
  popa
  add esp,8
- add esp,4
  iretd
 section .note.GNU-stack noalloc noexec nowrite progbits
