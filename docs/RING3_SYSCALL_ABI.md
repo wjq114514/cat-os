@@ -1,5 +1,7 @@
 # Cat-OS Ring3 `int 0x80` 系统调用 ABI 文档
 
+> **修订记录（2026-08-26）**：依据 commit **289e9ce**（"kernel: remove nr==3 close alias — read(fd=3) no longer silently closes"；核对时工作区 HEAD=`fcc386e`）完成 L8 别名拆除的语义跟进——**nr==3 一律 read；close 仅保留 nr==6（VFS）/ nr==28（socket）**；另对照 `syscall.h` 核实 `CATOS_SYS_RESOLVE=31`、`CATOS_SYS_NET_STATS=32` 编号无误，本文档 §3.2 条目无缺漏。
+
 > **版本说明**：本文档基于 **HEAD=`0d4b58342a1350d81eef82eb128c0c6fcd9df27c`**（"input: blocking read for /dev/kbd with timeout"）**+ 工作区未提交变更**（`git status` 显示 `net.c`/`paging.c`/`syscall.c`/`vfs.c`/`usermode.c`/`OSDEV_PROJECT_NOTES.md` 存在未提交修改，其中 `syscall.c`/`vfs.c`/`paging.c` 的改动内容已包含进本文依据）整理。
 > **行号基准**：文中 `文件:行号` 均指**当前工作区文件内容**（含未提交改动）；源码内部注释引用的行号（如 `syscall.c:88` 提及的 "net.c:497"）可能因其他代理的并行改动而漂移，以本文标注的工作区实测行号为准。
 > **整理方式**：纯读码归纳，零源码改动；未经运行时复验的行为均标注 NOT_TESTED / 待核实。
@@ -13,7 +15,7 @@
 - [3. 系统调用编号表](#3-系统调用编号表)
   - [3.1 VFS 组（nr < 20，委托 vfs_syscall）](#31-vfs-组-nr--20委托-vfs_syscall)
   - [3.2 网络/Socket 组（nr ≥ 20，syscall_dispatch 直辖）](#32-网络socket-组-nr--20syscall_dispatch-直辖)
-  - [3.3 close 的三条路径与双重别名关系（L8）](#33-close-的三条路径与双重别名关系l8)
+  - [3.3 close 的两条路径与 L8 别名拆除记录](#33-close-的两条路径与-l8-别名拆除记录)
 - [4. 参数寄存器约定](#4-参数寄存器约定)
 - [5. 返回码约定](#5-返回码约定)
 - [6. 用户指针校验规则（user_access_ok 语义）](#6-用户指针校验规则user_access_ok-语义)
@@ -77,7 +79,7 @@ ring3 侧生成方式参考（只读旁证，非本 ABI 的规范来源）：`us
 |---|---|---|---|---|---|
 | 0 | read | a[0]=fd, a[1]=buf, a[2]=len | `vfs_read(fd,buf,len)`：fd 边界/空槽/kind≠FILE_VFS/无 read ops → `-EBADF(-9)`；buf 用户区不可写（w=1）→ `-EFAULT(-14)` | 成功=读取字节数 | vfs.c:68 |
 | 1 | write | a[0]=fd, a[1]=buf, a[2]=len | `vfs_write(fd,buf,len)`：buf 用户区不可读（w=0）→ `-EFAULT(-14)`；fd 校验同 read | 成功=写入字节数 | vfs.c:68 |
-| 3 | **close 别名②** | a[0]=fd | `vfs_close(a[0])` —— 与 nr==6 分支**逐字等价**（L8 双重别名，见 §3.3）。⚠️ 与 Linux x86-32（nr=3=read）冲突 | 0 / `-EBADF(-9)` | vfs.c:92（`if(nr==3)return vfs_close(a[0]);`） |
+| 3 | read（L8 别名已拆除） | a[0]=fd, a[1]=buf, a[2]=len | **一律 read，不再关闭 fd**（commit 289e9ce 移除 nr==3→`vfs_close` 兼容别名；close 仅 nr==6 VFS / nr==28 socket，见 §3.3）；参数与校验同 nr==0 | 成功=读取字节数 | commit 289e9ce（原文引用的 vfs.c:92 别名分支已删除，行号待复核） |
 | 5 | open | a[0]=path, a[1]=flags | 路径首字节预检 `user_access_ok(path,1,0)`；随后逐字节扫描 `'\0'`，每字节均做可达性预检；**长度 ≥ 256 → `-EFAULT(-14)`** | 成功=新 fd；失败=**`-1`（非 errno！）** | vfs.c:92；devfs 名单 vfs.c:20 |
 | 6 | **close 主号** | a[0]=fd | `vfs_close(a[0])`：负值/越界/空槽/kind≠FILE_VFS → `-EBADF(-9)`；成功清槽归还 | 0 / `-EBADF(-9)` | vfs.c:72, 92 |
 | 其他 (<20) | — | — | 无匹配 → `-ENOSYS(-38)` | — | vfs.c:92 尾部 |
@@ -126,25 +128,25 @@ ring3 参考：shell 内建 `resolve <host>` 命令（shell_user.c）。
 尾部追加，既有 12 项顺序不变（旧消费方按 cap=12 取快照仍完全兼容）。ring3 参考：shell
 内建 `netstat` 命令（shell_user.c，NS_* 索引已同步 NS_ARP_ENTRY_EXPIRED）。
 
-### 3.3 close 的三条路径与双重别名关系（L8）
+### 3.3 close 的两条路径与 L8 别名拆除记录
 
-综合 `syscall.c:167-188` 与 `vfs.c:78-91` 的审计结论（行为未改，仅文档化）：
+> **2026-08-26 语义修订（commit 289e9ce）**：nr==3 → `vfs_close` 兼容别名已拆除。现行语义：**nr==3 一律 read**（不再有任何关闭副作用）；**close 仅存两条路径——nr==6（VFS 文件）与 nr==28（socket-aware）**。下列图表均为拆除后现状；保留的行号级证据以 289e9ce 之前的工作区为基准标注。
 
 ```
                     ┌─ nr==28 (CATOS_SYS_CLOSE) ──► FILE_SOCKET ?
-                    │        是 → net_socket_close() ─成功(r==0)→ vfs_socket_close()   [唯一 socket-aware 路径]
-ring3 close ────────┤                 否 → vfs_close()
-                    ├─ nr==6 ────────────────────► vfs_close(a[0])   [主 close 号]
-                    └─ nr==3 ────────────────────► vfs_close(a[0])   [别名③，分支与 nr==6 逐字等价]
+ring3 close ────────┤        是 → net_socket_close() ─成功(r==0)→ vfs_socket_close()   [唯一 socket-aware 路径]
+                    └─ nr==6 ────────────────────► vfs_close(a[0])   [VFS 主 close 号]
+
+ring3 read（nr==0 或 nr==3）──────────────────► vfs_read(a[0],a[1],a[2])   [289e9ce 起 nr==3 一律 read，无关闭副作用]
 ```
 
 | 要点 | 结论 | 证据 |
 |---|---|---|
-| 主号/别名 | 主 close 号为 nr==6；nr==3 是第二分支，二者构成**双重别名** | vfs.c:92；syscall.c:171-173 |
-| 别名是否触及 socket | **否**。`vfs_close` 对 FILE_SOCKET 一律 `-EBADF(-9)`（vfs.c:72），故经 3/6 既不能关 socket、也不会绕过 TCP 清理造成泄漏 | vfs.c:72；syscall.c:174-177 |
+| close 号位 | close 仅 nr==6（VFS 文件主号）与 nr==28（FILE_SOCKET 走 net 清理、普通文件回落 `vfs_close`）；**nr==3 别名已拆除** | commit 289e9ce；vfs.c:72；syscall.c:174-177（行号为拆除前基准） |
+| nr==3 现行语义 | **一律 read（同 nr==0 读路径），read(fd==3) 不再静默关闭**。历史行为：该别名分支曾与 nr==6 逐字等价，且 `vfs_close` 对 FILE_SOCKET 一律 `-EBADF(-9)`（vfs.c:72），故别名从未能触及 socket | commit 289e9ce；vfs.c:72（历史行为引证） |
 | socket 正确关闭号 | 只有 nr==28 | syscall.c:168-170 |
-| ⚠️ ABI 兼容性警告 | Linux x86-32 中 nr==3=read(2)、nr==6=close(2)；本内核为 0=read/1=write/5=open 并把 **3 别名到 close** —— 按 Linux ABI 编写的程序若以 nr=3 调 read，实际效果是**关闭 a[0]** | vfs.c:86-90；syscall.c:178-181 |
-| 移除计划 | 属 ABI 变更，超出锁内授权，留协调者裁决（TODO 见两处注释） | vfs.c:90-91；syscall.c:181 |
+| ⚠️ ABI 兼容性（拆除后） | house nr==3=read 与 Linux x86-32（nr==3=read(2)、nr==6=close(2)）对齐，旧「nr=3 调 read 实为关闭 a[0]」冲突警告解除；**破坏性变更面**：拆除前依赖「nr=3 关闭 fd」语义的既有 ring3 代码自 289e9ce 起改获 read 行为 | commit 289e9ce |
+| 移除计划 | **已执行**：原「属 ABI 变更、超出锁内授权、留协调者裁决」事项由 289e9ce 终结（对应两处源码 TODO 注释的清理现状未逐一复核） | commit 289e9ce |
 | 既有审计附注 | `net_socket_close` 对已 SOCK_CLOSED 型返回 `-EBADF(-9)` 且不释放 fd，存在理论上的描述符滞留窗口（TODO(code2)：幂等释放或本层兜底，二选一） | syscall.c:184-187；net.c:554 |
 
 ---
