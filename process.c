@@ -619,6 +619,14 @@ static void schedule_next(void)
         next = &pcb[0];             /* 队列空 -> 回 idle/kernel 上下文 */
     }
     if (next == current) {
+        /* [FIX] 轮转/让出后唯一就绪者是自己：pick_next 已将其出队，若直接
+         * return 会留下"state=READY 却不在队列"的孤儿 —— 下个量子因
+         * state!=RUNNING 拒绝再入队，随后队列空回落 pcb[0]，该任务被永久
+         * 遗弃（单常驻任务每量子必现）。还原 RUNNING 以维持"current 恒
+         * RUNNING"不变式；exit 路径不会命中本分支（TERMINATED 不回队列）。 */
+        if (next->state == PROC_READY) {
+            next->state = PROC_RUNNING;
+        }
         return;
     }
 

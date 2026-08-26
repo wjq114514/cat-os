@@ -22,9 +22,20 @@ int irq_register_handler(uint8_t q,irq_handler_t fn,void *arg){if(q>=16||!fn||sl
 void irq_unregister_handler(uint8_t q){if(q<16){irq_set_mask(q);slots[q]=(irq_slot_t){0};}}
 static uint16_t pic_isr(void){outb(0x20,0x0B);outb(0xA0,0x0B);return (uint16_t)inb(0x20)|((uint16_t)inb(0xA0)<<8);}
 static bool timer_handler(uint8_t q,void *arg){(void)q;(void)arg;ticks++;net_poll();
-    /* stage4: boot 后延迟自动拉起 sock_abi 测试进程 + 时钟抢占轮转 */
-    stage4_autorun_tick();sched_preempt_tick();if(ticks<=3){kputs("[OK] PIT tick=");kput_dec(ticks);kputs(" vector=32\n");}return true;}
-static __attribute__((used)) void irq_dispatch(uint8_t q){if((q==7||q==15)&&!(pic_isr()&(1u<<q))){if(q==15)outb(0x20,0x20);return;}bool done=slots[q].fn&&slots[q].fn(q,slots[q].arg);if(!done&&!slots[q].warned){slots[q].warned=1;kputs("[WARN] unhandled IRQ ");kput_dec(q);kputs(" (further warnings suppressed)\n");}if(q>=8)outb(0xA0,0x20);outb(0x20,0x20);}
+    /* stage4: boot 后延迟自动拉起 sock_abi 测试进程。
+     * [FIX] 时钟抢占钩子移出本函数：context_switch 若发生在 irq_dispatch 发出
+     * EOI 之前，会把"尚未执行的 EOI+iret 尾声"连同当前内核栈一起快照进
+     * prev->ksp 搁浅，须等就绪队列清空回落 pcb[0] 才补发 —— 常驻 ring3 任务
+     * 永不退出时该补发永不到来，PIC ISR0 位滞留，全局中断停流
+     * （真机实证：irr=01 imr=fc isr=01，串口 I0+:200 I0-]:199）。
+     * 现由 irq_dispatch 在 EOI 之后统一触发抢占，见下函数尾部。 */
+    stage4_autorun_tick();if(ticks<=3){kputs("[OK] PIT tick=");kput_dec(ticks);kputs(" vector=32\n");}return true;}
+static __attribute__((used)) void irq_dispatch(uint8_t q){if((q==7||q==15)&&!(pic_isr()&(1u<<q))){if(q==15)outb(0x20,0x20);return;}bool done=slots[q].fn&&slots[q].fn(q,slots[q].arg);if(!done&&!slots[q].warned){slots[q].warned=1;kputs("[WARN] unhandled IRQ ");kput_dec(q);kputs(" (further warnings suppressed)\n");}if(q>=8)outb(0xA0,0x20);outb(0x20,0x20);
+    /* [FIX] EOI 已发出后才可能发生抢占切换：此后 context_switch 至多搁浅
+     * popa/iretd 尾声（由 schedule_next 的队列空回落 pcb[0] 路径安全补跑，
+     * 不影响 PIC 应答），中断流动不再依赖任何任务退出。仅 q==0 且 handler
+     * 已注册完成时触发，保持既有单核无嵌套语义。 */
+    if(q==0&&done)sched_preempt_tick();}
 static void pic_init(void){outb(0x20,0x11);outb(0xA0,0x11);outb(0x21,0x20);outb(0xA1,0x28);outb(0x21,4);outb(0xA1,2);outb(0x21,1);outb(0xA1,1);outb(0x21,0xFF);outb(0xA1,0xFF);kputs("[OK] PIC remapped IRQ0-15 -> vectors 0x20-0x2F; spurious IRQ7/15 detection active\n");}
 static void pit_init(void){uint32_t d=1193182u/100u;outb(0x43,0x36);outb(0x40,d);outb(0x40,d>>8);irq_register_handler(0,timer_handler,0);irq_clear_mask(0);kputs("[OK] PIT registered on IRQ0 at 100Hz\n");}
 void interrupts_init(void){uint16_t cs;uint64_t old;__asm__ volatile("sgdt %0":"=m"(old));__asm__ volatile("mov %%cs,%0":"=r"(cs));code_sel=cs;desc_ptr_t ng={(uint16_t)old,(uint32_t)gdt_copy};uint32_t base=old>>16;if(ng.limit>=sizeof(gdt_copy))panic("GRUB GDT too large");memcpy(gdt_copy,phys_to_virt(base),ng.limit+1u);arch_load_gdt(&ng);kputs("[OK] GRUB GDT relocated; CS=");kput_hex32(cs);kputs("\n");for(uint32_t i=0;i<256;i++)idt[i]=(gate_t){0};gate(0,isr_0,0x8E);gate(3,isr_3,0x8E);gate(14,isr_14,0x8E);gate(128,isr_128,0xEE);for(uint8_t i=0;i<16;i++)gate(32+i,irq_stubs[i],0x8E);desc_ptr_t id={(uint16_t)(sizeof(idt)-1),(uint32_t)idt};arch_load_idt(&id);kputs("[OK] IDT active; IRQ handler table initialized\n");pic_init();pit_init();}
