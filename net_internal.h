@@ -81,7 +81,7 @@ struct tcp_conn {
     uint16_t peer_mss;           /* 对端 SYN 中宣告的 MSS（0=未知，按 TCP_MSS 兜底） */
     uint8_t rxb[TCP_BUF_SIZE];   /* 接收缓冲 */
     uint32_t rxn;
-    struct { uint32_t seq; uint16_t len; bool used; uint8_t data[TCP_MSS]; } ooo[4];
+    struct { uint32_t seq; uint16_t len; bool used; uint8_t data[TCP_MSS]; } ooo[TCP_OOO_SLOTS];
     uint32_t ooo_bytes;
     bool sack_ok;
     uint32_t sack_left[2],sack_right[2];

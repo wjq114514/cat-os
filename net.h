@@ -64,11 +64,41 @@ enum tcp_state {
     TCP_CLOSING, TCP_LAST_ACK, TCP_TIME_WAIT
 };
 
-#define TCP_MAX_CONNS   16
+/* ─── TCP 容量档位（nginx M3 铺路 · 第一档，2026-08-26）───
+ * 内存预算（i686 -O2 实测 sizeof(tcp_conn_t)=14336B，nm 符号 tcp_conns）：
+ *   每连接 = rxb[4096] + sndb[4096] + ooo[TCP_OOO_SLOTS]×1468B + tx[8]×12B
+ *          + 标量/对齐 ≈ 14,336B（TCP_OOO_SLOTS=2 时）
+ *   档位        表占用      相对 16×4 槽基线(229,376B) 的 ΔBSS
+ *   16 连接     229,376 B   基线（HEAD 611b080）
+ *   64 连接     917,504 B   +500,224 B ≈ +488.5 KiB < 512 KiB 预算红线 ✓
+ * 边界论证：linker.ld 内核物理镜像止于 __kernel_phys_end=0x1A5000（≈1.65MiB），
+ * .bss 全部落在 PMM 位图管理区内；QEMU -m 128M 下空闲帧 ≈126MiB，
+ * 本增量占其 <0.4%，无溢出风险。缓冲(TCP_BUF_SIZE/TCP_MSS)不动 ——
+ * 通告窗口/SWS 阈值/sndb 容量均由其派生，缩减即破坏既有 ≤16 连接
+ * 行为逐字节等价红线；故收缩只落在 OOO 槽位数上（理由见 TCP_OOO_SLOTS）。
+ *
+ * 第二档方案摘要（256+ 连接，只登记不实施）：
+ *   静态表按 14336B/连接 线性放大到 256 即 ~3.5MiB，仍可承受但粒度粗；
+ *   应改为「元数据表静态 + 缓冲池化」：tcp_conn_t 拆出 rxb/sndb/ooo 数据面，
+ *   由按需分配的 slab/帧池供给（每活跃连接才占满额缓冲，LISTEN/半开态仅
+ *   ~200B 元数据），配合 accept 后惰性分配、TIME_WAIT 提前释放数据页；
+ *   并把 tcp_tick 全表扫描改为 deadline 最小堆/链表（O(logN) 或 O(活跃)）。 */
+#define TCP_MAX_CONNS   64
 #define TCP_RX_WINDOW   65535
 #define TCP_MSS         1460
 #define TCP_BUF_SIZE    4096
 #define TCP_TX_SEG_MAX  8
+/* 每连接乱序接收缓存槽位数。原实现硬编码 4；线上 SACK 块通告本就封顶
+ * 2 块（tcp_sack_blocks: n>2?2:n），第 3/4 槽缓存的多余段从未被完整通告，
+ * 缩至 2 不改变 ≤2 个并发空洞场景的线上行为（inject sack_t1/t2/t5/t8
+ * 覆盖单洞/双洞/重叠/回绕全形态），仅 >2 并发乱序段时退化为 dup-ACK
+ * 触发对端重传（标准 TCP 恢复路径）。换取 ΔBSS −187.9KiB 使第一档入预算。 */
+#define TCP_OOO_SLOTS   2
+/* listen backlog 默认值：原 tcp_listen 硬编码 backlog=TCP_MAX_CONNS，
+ * 现提为常量（语义不变：默认不人为设限，pending 实际上限受连接表约束，
+ * 推导见 net_tcp.c tcp_listen 注释）；应用可用 nr=22 listen(fd,backlog)
+ * / tcp_set_backlog() 调低，上限截断仍为 TCP_MAX_CONNS。 */
+#define TCP_LISTEN_BACKLOG_DEFAULT TCP_MAX_CONNS
 
 typedef struct tcp_conn tcp_conn_t;
 

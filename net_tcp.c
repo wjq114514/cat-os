@@ -51,7 +51,7 @@ static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn)
         opt+=olen;n-=olen;
     }
 }
-static uint32_t tcp_sack_blocks(tcp_conn_t *c){uint32_t n=0;for(int i=0;i<4;i++)if(c->ooo[i].used)n++;return n>2?2:n;}
+static uint32_t tcp_sack_blocks(tcp_conn_t *c){uint32_t n=0;for(uint32_t i=0;i<TCP_OOO_SLOTS;i++)if(c->ooo[i].used)n++;return n>2?2:n;}
 static uint32_t tcp_build_opts(tcp_conn_t *c,uint8_t *o,uint8_t flags){
     uint32_t n=0;
     if(flags&TCP_FLAG_SYN){
@@ -63,7 +63,7 @@ static uint32_t tcp_build_opts(tcp_conn_t *c,uint8_t *o,uint8_t flags){
         o[n++]=2;o[n++]=4;o[n++]=(uint8_t)(TCP_MSS>>8);o[n++]=(uint8_t)TCP_MSS;
     }
     if((flags&TCP_FLAG_SYN)&&c->sack_ok){o[n++]=1;o[n++]=1;o[n++]=4;o[n++]=2;}
-    else if((flags&TCP_FLAG_ACK)&&c->sack_ok){uint32_t blocks=tcp_sack_blocks(c);if(blocks){o[n++]=1;o[n++]=1;o[n++]=5;o[n++]=(uint8_t)(2+8*blocks);for(int i=0;i<4&&blocks;i++)if(c->ooo[i].used){uint32_t a=hton32(c->ooo[i].seq),b=hton32(c->ooo[i].seq+c->ooo[i].len);memcpy_u(o+n,&a,4);n+=4;memcpy_u(o+n,&b,4);n+=4;blocks--;}}}
+    else if((flags&TCP_FLAG_ACK)&&c->sack_ok){uint32_t blocks=tcp_sack_blocks(c);if(blocks){o[n++]=1;o[n++]=1;o[n++]=5;o[n++]=(uint8_t)(2+8*blocks);for(uint32_t i=0;i<TCP_OOO_SLOTS&&blocks;i++)if(c->ooo[i].used){uint32_t a=hton32(c->ooo[i].seq),b=hton32(c->ooo[i].seq+c->ooo[i].len);memcpy_u(o+n,&a,4);n+=4;memcpy_u(o+n,&b,4);n+=4;blocks--;}}}
     while(n&3){o[n++]=1;}return n;
 }
 static void tcp_rx_append(tcp_conn_t *c,const uint8_t *data,uint32_t len){if(c->rxn+len<=TCP_BUF_SIZE){memcpy_u(c->rxb+c->rxn,data,len);c->rxn+=len;}}
@@ -73,7 +73,7 @@ static void tcp_merge_ooo(tcp_conn_t *c){
     bool again;
     do{
         again=false;
-        for(int i=0;i<4;i++){
+        for(uint32_t i=0;i<TCP_OOO_SLOTS;i++){
             uint32_t end;
             if(!c->ooo[i].used)continue;
             end=c->ooo[i].seq+c->ooo[i].len;
@@ -97,8 +97,8 @@ static bool tcp_queue_ooo(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_
     uint32_t end=seq+len;if(len==0||len>TCP_MSS||c->ooo_bytes+len>TCP_BUF_SIZE)return false;
     if(!tcp_seq_after(end,c->rcv_nxt))return false;
     if(!tcp_seq_after(seq,c->rcv_nxt)){uint32_t trim=c->rcv_nxt-seq;seq+=trim;data+=trim;len-=trim;}
-    for(int i=0;i<4;i++)if(c->ooo[i].used&&tcp_seq_before(seq,c->ooo[i].seq+c->ooo[i].len)&&tcp_seq_before(c->ooo[i].seq,seq+len))return false;
-    for(int i=0;i<4;i++)if(!c->ooo[i].used){c->ooo[i].used=true;c->ooo[i].seq=seq;c->ooo[i].len=(uint16_t)len;memcpy_u(c->ooo[i].data,data,len);c->ooo_bytes+=len;return true;}
+    for(uint32_t i=0;i<TCP_OOO_SLOTS;i++)if(c->ooo[i].used&&tcp_seq_before(seq,c->ooo[i].seq+c->ooo[i].len)&&tcp_seq_before(c->ooo[i].seq,seq+len))return false;
+    for(uint32_t i=0;i<TCP_OOO_SLOTS;i++)if(!c->ooo[i].used){c->ooo[i].used=true;c->ooo[i].seq=seq;c->ooo[i].len=(uint16_t)len;memcpy_u(c->ooo[i].data,data,len);c->ooo_bytes+=len;return true;}
     return false;
 }
 static bool tcp_accept_data(tcp_conn_t *c,uint32_t seq,const uint8_t *data,uint32_t len){
@@ -367,13 +367,20 @@ int tcp_send(socket_t *s,const uint8_t *data,uint32_t len);
 void tcp_close(socket_t *s);
 socket_t *tcp_listen(uint16_t port){
     tcp_conn_t *c=tcp_conn_find_free();if(!c)return NULL;
-    c->used=true;c->state=TCP_LISTEN;c->backlog=TCP_MAX_CONNS;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;c->dead=false;
+    /* backlog 语义（第一档容量任务同步项）：默认值从硬编码 TCP_MAX_CONNS
+     * 提为可配置常量 TCP_LISTEN_BACKLOG_DEFAULT（net.h），本调用点语义不变。
+     * 半开队列容量推导：pending(=SYN_RECEIVED|ESTABLISHED 未 accept) 按
+     * 端口受 c->backlog 封顶；但每个常驻 listener 自身占 1 槽，且全表只有
+     * TCP_MAX_CONNS 槽 ⇒ 单端口 fresh-boot 实际 pending 上限 =
+     * min(backlog, TCP_MAX_CONNS − 常驻 listener 数 − 已建立占用)，超额 SYN
+     * 在 backlog 分支被 RST；表满则在 conn table full 分支被 RST。 */
+    c->used=true;c->state=TCP_LISTEN;c->backlog=TCP_LISTEN_BACKLOG_DEFAULT;c->lport=port;c->peer_ip=0;c->peer_port=0;c->accepted=false;c->dead=false;
     c->rxn=0;c->snd_used=0;c->snd_una=c->snd_nxt=c->snd_isn=0;c->rto_deadline=0;c->rto_backoff=0;c->tw_until=0;c->persist_deadline=0;c->persist_backoff=0;
     tcp_tx_reset(c);
     tcp_cc_init(c);     /* cc_init 不覆盖 rto_attempts/ooo/sack 状态 */
     c->rto_attempts=0;  /* 问题5[INFO]: 清上一世连接残留 R2 计数 */
     c->peer_mss=0;c->adv_win=0;c->sack_ok=false;c->sack_n=0;   /* 问题5[INFO]: 清 MSS/通告窗/SACK 协商残留 */
-    for(int i=0;i<4;i++)c->ooo[i].used=false;   /* 问题5[INFO]: 清 OOO 记分板(兼 SACK 块来源) */
+    for(uint32_t i=0;i<TCP_OOO_SLOTS;i++)c->ooo[i].used=false;   /* 问题5[INFO]: 清 OOO 记分板(兼 SACK 块来源) */
     c->ooo_bytes=0;
     c->test_sent=false;c->test_closed=false;
     for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_socks[i].type){tcp_socks[i].type=SOCK_TCP_LISTEN;tcp_socks[i].tcp.conn=c;break;}
@@ -636,7 +643,12 @@ void tcp_handle(const uint8_t *seg,uint32_t seglen,uint32_t src_ip){
     }
 }
 
-/* 每 tick 处理：RTO 重传 + TIME_WAIT 到期释放（Linux tcp_retransmit_timer 简化版） */
+/* 每 tick 处理：RTO 重传 + TIME_WAIT 到期释放（Linux tcp_retransmit_timer 简化版）
+ * 复杂度论证（第一档容量任务）：全表线性扫描 O(TCP_MAX_CONNS)。64 连接 ×
+ * 100Hz = ≤6400 次/秒迭代；空闲槽位一次仅「读 used 标志 + 分支」（~5 cycle），
+ * 活跃但无事可做的连接再多几次比较/减法，满载最坏 ≈0.2M cycle/s，
+ * 占 i686@100MHz 预算 <0.3%，且 kputs 仅事件触发（RTO/TW 到期/persist）。
+ * 二档 256+ 时按 net.h 第二档方案改为 deadline 堆，本档不引入该复杂度。 */
 void tcp_tick(void){
     for(int i=0;i<TCP_MAX_CONNS;i++){
         tcp_conn_t *c=&tcp_conns[i];if(!c->used)continue;
