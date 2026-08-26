@@ -33,6 +33,7 @@ static process_t *current;      /* 正在运行的上下文，process_init 后�
 
 static void schedule_next(void);
 static void process_trampoline(void);
+static int process_alloc_slot(void);
 
 /* ---------------------------------------------------------------------------
  * TSS esp0 更新 —— 不触碰锁定的 usermode.c：
@@ -220,6 +221,160 @@ static void __attribute__((noreturn)) sched_idle(void)
 /* ---------------------------------------------------------------------------
  * 公开 API。
  * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * COW fork（契约全文见 process.h process_fork 注释）。
+ *
+ * 三段式实现：
+ *   process_fork          —— 汇编包装器：入口处捕获父进程调用点的完整寄存器
+ *                            现场（callee-saved×4 + eflags + 返回地址槽），
+ *                            调 C 核心，父路径原样弹回现场后 ret（eax=子 pid）；
+ *   process_fork_kernel   —— C 核心：COW 克隆地址空间 + 克隆内核栈尾 +
+ *                            组装子进程首派发镜像 + 入就绪队列；
+ *   fork_child_resume_stub —— 子进程首次被 context_switch 派发时的 eip：
+ *                            从栈顶魔数槽恢复调用点 esp、清 eax 后 ret，
+ *                            精确落在"call process_fork 的下一条指令"。
+ *
+ * 子进程栈镜像布置（自高向低；克隆区与镜像区零重叠）：
+ *   c_top-len .. c_top-1   父 [调用点RA槽, 栈顶) 的逐字节镜像（len 同偏移）
+ *   im[0..4]               edi/esi/ebx/ebp/eflags（cap 捕获值）
+ *   im[5]                  &fork_child_resume_stub   （context_switch 的 ret 目标）
+ *   im[6]                  magic = c_top-len         （stub 用 (%esp) 取走）
+ *   child->ksp = &im[0]
+ *
+ * 对照 linux-ref/kernel/fork.c：copy_process()(复制)+wake_up_new_task()(入队)
+ * 对应本核心；ret_from_fork 恢复对应 stub；父直接拿到 pid 对应 fork 返回约定。
+ * ------------------------------------------------------------------------- */
+extern void fork_child_resume_stub(void);   /* 下方内联汇编定义 */
+
+int process_fork_kernel(const uint32_t *cap);
+
+__asm__(
+    ".text\n"
+    ".align 4\n"
+    "fork_child_resume_stub:\n\t"
+    "movl (%esp), %esp\n\t"     /* 栈顶即魔数槽（im[6] 已被 ret 消费） */
+    "xorl %eax, %eax\n\t"       /* 子进程返回值恒 0 */
+    "ret\n\t"
+);
+
+/* 不用 C 写包装器的原因：编译器前奏（push 寄存器/帧指针省略策略）会让
+ * "调用点现场"的捕获点漂移；汇编保证捕获恰在函数入口，语义稳定。 */
+__asm__(
+    ".text\n"
+    ".align 4\n"
+    ".globl process_fork\n"
+    ".type process_fork, @function\n"
+    "process_fork:\n\t"
+    "pushfl\n\t"
+    "pushl %ebp\n\t"
+    "pushl %ebx\n\t"
+    "pushl %esi\n\t"
+    "pushl %edi\n\t"            /* esp=cap：[edi][esi][ebx][ebp][eflags][RA][caller…] */
+    "pushl %esp\n\t"
+    "call process_fork_kernel\n\t"
+    "addl $4, %esp\n\t"
+    "popl %edi\n\t"
+    "popl %esi\n\t"
+    "popl %ebx\n\t"
+    "popl %ebp\n\t"
+    "popfl\n\t"                 /* 含 IF 在内的父现场统一由此恢复（核心内 cli） */
+    "ret\n\t"
+    ".size process_fork, .-process_fork\n"
+);
+
+/* fd_table 取舍说明（任务书要求写明）：本内核 VFS fd 表为全局单例
+ * （vfs.c fds[VFS_MAX_FD]，PCB 无 per-process 字段），fork 取浅共享——
+ * 零拷贝零引用计数，父子与全体既有进程共用同一打开文件集合；
+ * 代价是无独立 fd 空间/close 传播。每进程 fd 表涉及禁区 vfs.c 改动，
+ * 与 syscall 编号一并留待下一轮统一规划。 */
+int process_fork_kernel(const uint32_t *cap)
+{
+    process_t *parent;
+    process_t *child;
+    uintptr_t kstack;
+    uint32_t child_pd = 0u;
+    uint32_t cr3_now;
+    uintptr_t p_tail, p_top, c_top, len;
+    uint32_t *im;
+    int slot;
+
+    if (!current || current == &pcb[0]) {       /* idle/内核主上下文不可为父 */
+        kputs("[WARN] fork: rejected (no runnable parent)\n");
+        return -1;
+    }
+    parent = current;
+    if (parent->ctx_type != PROC_CTX_KERNEL || parent->kstack_phys == 0u) {
+        /* ring3 fork 属下一轮 syscall 接线（需在 int80 中断帧上克隆）。 */
+        kputs("[WARN] fork: kernel-context only this round\n");
+        return -1;
+    }
+
+    __asm__ volatile("cli" ::: "memory");   /* 至入队完成；IF 由包装器 popfl 还原 */
+
+    slot = process_alloc_slot();
+    if (slot < 0) {
+        kputs("[WARN] fork: process table full\n");
+        return -1;
+    }
+    kstack = pmm_alloc_page();
+    if (!kstack) {
+        memset(&pcb[slot], 0, sizeof(pcb[slot]));
+        return -12;                             /* ENOMEM */
+    }
+
+    /* 父地址空间取 cr3 实值而非 parent->as.page_dir：legacy 进程
+     * （page_dir==0 共享内核目录跑 shell/sock_abi 的现网形态）同样可 fork。 */
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_now));
+    if (paging_clone_address_space(cr3_now, &child_pd) != 0) {
+        memset(&pcb[slot], 0, sizeof(pcb[slot]));
+        pmm_free_page(kstack);
+        return -12;                             /* clone 内部已自回滚 */
+    }
+
+    /* 内核栈尾克隆：父 [调用点, 栈顶) → 子同偏移。溢出防御上限留 64B。 */
+    p_tail = (uintptr_t)cap + 5u * sizeof(uint32_t);    /* RA 槽 = 调用点 esp */
+    p_top = (uintptr_t)phys_to_virt(parent->kstack_phys) + PAGE_SIZE;
+    c_top = (uintptr_t)phys_to_virt(kstack) + PAGE_SIZE;
+    len = p_top - p_tail;
+    if (len == 0u || len > PAGE_SIZE - 64u) {
+        paging_destroy_address_space(child_pd);
+        memset(&pcb[slot], 0, sizeof(pcb[slot]));
+        pmm_free_page(kstack);
+        return -1;
+    }
+    memcpy((void *)(c_top - len), (const void *)p_tail, len);
+
+    child = &pcb[slot];
+    memcpy(child, parent, sizeof(*child));  /* 结构整体复制后改写差异字段 */
+
+    /* 子首派发 context_switch 镜像（槽序=恢复序列，布局论证见函数头）。 */
+    im = (uint32_t *)(c_top - len - 7u * sizeof(uint32_t));
+    im[0] = cap[0];
+    im[1] = cap[1];
+    im[2] = cap[2];
+    im[3] = cap[3];
+    im[4] = cap[4];                                     /* eflags（含 IF） */
+    im[5] = (uint32_t)(uintptr_t)&fork_child_resume_stub;
+    im[6] = (uint32_t)(c_top - len);                    /* magic 槽 */
+    child->ksp = (uint32_t)(uintptr_t)im;
+
+    child->pid = (uint32_t)slot;                        /* 下标即 pid（既有约定） */
+    child->as.page_dir = child_pd;                      /* 私有 COW 目录 */
+    child->kstack_phys = (uint32_t)kstack;
+    child->next_ready = NULL;
+    child->state = PROC_READY;
+    ready_enqueue(child);
+
+    kputs("[OK] COW fork: parent pid=");
+    kput_dec(parent->pid);
+    kputs(" child pid=");
+    kput_dec((uint32_t)slot);
+    kputs(" pd=");
+    kput_hex32(child_pd);
+    kputs("\n");
+    return slot;                        /* 父进程经包装器拿到 eax=子 pid */
+}
 
 /* 任务书要求标记串：" [OK] process scheduler initialized"。 */
 void process_init(void)
@@ -421,6 +576,20 @@ void exit_process(int pid)
 
     p->state = PROC_TERMINATED;
 
+    /* [COW] 私有地址空间回收（fork 子进程路径）：用户页 ref-- 归零才还 PMM，
+     * 内核半区共享不动（paging.c destroy）。page_dir==0 的 legacy 进程
+     * （shell/sock_abi/探针，跑共享内核目录）不进此分支 —— 现有行为不变。
+     * 自杀路径必须先切回内核目录再销毁：销毁会拆掉正踩着的用户映射；
+     * 切表安全的前提是内核半区在所有目录逐字相同（clone 语义保证）。 */
+    if (p->as.page_dir != 0u && p->as.page_dir != paging_kernel_pd_phys()) {
+        if (current == p) {
+            __asm__ volatile("movl %0, %%cr3"
+                             :: "r"(paging_kernel_pd_phys()) : "memory");
+        }
+        paging_destroy_address_space(p->as.page_dir);
+        p->as.page_dir = 0u;
+    }
+
     if (current != p) {
         if (p->kstack_phys != 0u) {
             pmm_free_page(p->kstack_phys);
@@ -470,6 +639,21 @@ static void schedule_next(void)
     if (next->kstack_phys != 0u) {
         arch_set_tss_esp0((uint32_t)(uintptr_t)phys_to_virt(next->kstack_phys) +
                           PAGE_SIZE);
+    }
+
+    /* [COW] 地址空间切换：引入私有页目录（fork 子）后，context_switch 只换栈
+     * 不换表，必须在此刷新 cr3 —— 共享目录进程(as.page_dir==0)落内核目录，
+     * 私有目录进程落其自身目录。mov cr3 隐式 flush 非 GLOBAL 项；内核半区
+     * 在所有目录中逐字相同（clone 保证），故本函数后续代码执行不受影响。 */
+    {
+        uint32_t want_cr3 = (next->as.page_dir != 0u)
+                                ? next->as.page_dir
+                                : paging_kernel_pd_phys();
+        uint32_t have_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(have_cr3));
+        if (have_cr3 != want_cr3) {
+            __asm__ volatile("movl %0, %%cr3" :: "r"(want_cr3) : "memory");
+        }
     }
 
     if (next->ksp == 0u) {

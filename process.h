@@ -62,4 +62,39 @@ void     sched_launch(void);
 void     exit_process(int pid);
 uint32_t process_current_pid(void);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * COW fork 内核侧核心（对照 linux-ref/kernel/fork.c kernel_clone()/copy_process()
+ * 的"复制-入队-双返回"骨架，不照搬代码；本轮不接 syscall 编号，供下一轮
+ * int 0x80 包装或内核例程直接调用）。
+ *
+ * 契约：
+ *   int pid = process_fork(void);
+ *   if (pid < 0)  { 仅父进程会看到：-1 上下文非法 / -12 ENOMEM }
+ *   if (pid == 0) { 子进程执行流 } else { 父进程：pid=子 pid }
+ *
+ * 返回值布置（寄存器约定）：
+ *   - 父进程：普通 C 返回，eax=子 pid（slot 下标即 pid，同 create_process）；
+ *     callee-saved/eflags 由包装器现场恢复，对调用方等价一次普通函数调用。
+ *   - 子进程：首次被调度时经 fork_child_resume_stub 恢复到"调用点之后"
+ *     （call process_fork 的下一条指令），eax 强制 0；ebx/esi/edi/ebp/eflags
+ *     与父在调用点的活值逐一相同（包装器入口捕获）；内核栈 [调用点, 栈顶)
+ *     区间逐字节镜像到子栈同偏移 —— 子的后续 C 执行环境与父完全同构。
+ *
+ * 资源语义：
+ *   - 地址空间：paging_clone_address_space() COW 克隆（可写用户页父子共享
+ *     RO+COW、ref=2；写自陷时私有化）；子拥有独立页目录与内核栈页。
+ *   - fd_table 取舍：本内核 VFS fd 表是全局单例（vfs.c fds[VFS_MAX_FD]，
+ *     PCB 无该字段），fork 采用浅共享（零拷贝零计数）——所有进程共享同一
+ *     打开文件集合，任一 close 全体可见。引入每进程 fd 表需改禁区 vfs.c，
+ *     与 syscall 编号一并留待下一轮。
+ *   - 调度：子 PROC_READY 入就绪队列尾，由既有 schedule_next()/抢占 tick
+ *     自然派发（调度器入口零改动）；首次派发走 context_switch 标准路径。
+ *
+ * 限制（本轮）：
+ *   - 仅 PROC_CTX_KERNEL 例程上下文可调（pcb[0]/idle 拒绝）；
+ *   - ring3 fork 需下一轮 syscall 接线：在 int80 中断帧上克隆
+ *     （child 帧 eax=0、parent 帧 eax=pid），复用本轮 clone/fault 地基。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+int process_fork(void);
+
 #endif /* CATOS_PROCESS_H */
