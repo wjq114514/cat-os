@@ -103,7 +103,7 @@ ring3 侧生成方式参考（只读旁证，非本 ABI 的规范来源）：`us
 | 29 | ping | a[0]=目标文本(≤16B), a[1]=out, a[2]=out_len, a[3]=id(u16), a[4]=seq(u16) | 文本不可读/out 不可写 → EFAULT；非法地址走「写错误串入 out」而非错误码（既定演示语义） | `net_parse_ipv4` + `net_ping` | syscall.c:189-193 |
 | 30 | ping_stats | a[0]=out, a[1]=out_len | out 不可写 → EFAULT | `net_ping_stats` | syscall.c:194-196 |
 | 31 | resolve | a[0]=name(域名文本，≤64B), a[1]=out_ip*(u32×1) | name 首字节不可读 / 扫描中任一字节不可读 → EFAULT；65B 内无终止 NUL（长度>64）→ EINVAL；out4 不可写 → EFAULT；成功(返回0)才写 *out_ip | `net_dns_resolve`（net.c） | syscall.c nr=31 分支；net.h NETDNS_E* |
-| 32 | net_stats | a[0]=out(struct net_stats*), a[1]=cap(条目数,u32) | cap 先截断到 NET_STATS_COUNT(12) 再按 cap×4B 预检 out 可写 → EFAULT（截断先行，杜绝超大 cap×4 无符号回绕绕审）；cap==0 不触碰用户内存返回 0 | `net_stats_snapshot` | syscall.c:386-396；net.c:1212-1218；net.h:74-95 |
+| 32 | net_stats | a[0]=out(struct net_stats*), a[1]=cap(条目数,u32) | cap 先截断到 NET_STATS_COUNT(13) 再按 cap×4B 预检 out 可写 → EFAULT（截断先行，杜绝超大 cap×4 无符号回绕绕审）；cap==0 不触碰用户内存返回 0 | `net_stats_snapshot` | syscall.c:386-396；net.c arp_tick/net_stats_snapshot；net.h:75-97 |
 | 其他 (≥20) | — | — | `-ENOSYS(-38)` | — | syscall.c:197 |
 
 **nr=31 补充说明**（阶段5 第二棒）：向 DHCP option 6 学得的 resolver（无 DHCP 时回落
@@ -116,9 +116,11 @@ slirp 惯例 `10.0.2.3`，见 net.c `g_dns`）发送 RD=1 的 A/IN 查询（UDP:
 rcode!=0。串口观测：成功 `[NET] DNS <name> -> <ip>`，失败 `[NET] DNS <name> fail (<原因>)`。
 ring3 参考：shell 内建 `resolve <host>` 命令（shell_user.c）。
 
-**nr=32 补充说明**（阶段5 任务1）：out 按 `struct net_stats` 字段序线性接收计数器
-（12×uint32 连续无填充，字段布局即 ABI，见 net.h:80-94）；成功返回**写入条目数**
-`min(cap, 12)`。ring3 参考：shell 内建 `netstat` 命令（shell_user.c）。
+**nr=32 补充说明**（阶段5 任务1；字段序随阶段5 第三棒尾追加更新）：out 按 `struct net_stats`
+字段序线性接收计数器（13×uint32 连续无填充，字段布局即 ABI，见 net.h:80-97）；成功返回
+**写入条目数** `min(cap, 13)`。第 13 项 `arp_entry_expired` 为阶段5 第三棒（ARP 老化）
+尾部追加，既有 12 项顺序不变（旧消费方按 cap=12 取快照仍完全兼容）。ring3 参考：shell
+内建 `netstat` 命令（shell_user.c，NS_* 索引已同步 NS_ARP_ENTRY_EXPIRED）。
 
 ### 3.3 close 的三条路径与双重别名关系（L8）
 
@@ -225,7 +227,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | ping(29) | 字节数（非法地址写串而非报错，syscall.c:190-192）/ `-EFAULT` |
 | ping_stats(30) | 字节数 / `-EFAULT` |
 | resolve(31) | 0（写 *out_ip）/ `-EFAULT`(name/out 审计) / `-EINVAL`(域名非法·长度>64·响应畸形) / `-ENETUNREACH`(未配置 resolver) / `-ETIMEDOUT` / `-ECONNREFUSED`(rcode!=0) |
-| net_stats(32) | 条目数(≤12，cap 截断后直通) / `-EFAULT` / cap==0 → 0（不触碰用户内存） |
+| net_stats(32) | 条目数(≤13，cap 截断后直通) / `-EFAULT` / cap==0 → 0（不触碰用户内存） |
 
 ---
 
@@ -255,7 +257,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 | recv | buf, len | 1 | syscall.c:164 |
 | ping | 目标文本 16 字节(w=0)；out,out_len(w=1) | 混合 | syscall.c:193 |
 | ping_stats | out, out_len（w=1；out_len 参与 `n<=0xBFC00000-v` 上界判断，合法入参无整数溢出） | 1 | syscall.c:194-195 |
-| net_stats | out, cap×4B（w=1；cap 先截断到 NET_STATS_COUNT=12 再审计，上界恒 ≤48B 无回绕） | 1 | syscall.c:386-396 |
+| net_stats | out, cap×4B（w=1；cap 先截断到 NET_STATS_COUNT=13 再审计，上界恒 ≤52B 无回绕） | 1 | syscall.c:386-396 |
 | open(nr==5, vfs.c:92) | path 首字节 1B(w=0)；此后**逐字节**预检直到 '\0'；累计长度 sl≥256 → `-EFAULT` | 0 | vfs.c:92 |
 | read/write(nr==0/1) | vfs_read 对 buf(n,w=1)；vfs_write 对 buf(n,w=0)。注意 vfs_write 的检查**先于** fd 校验执行（顺序事实，vfs.c:68） | 见左 | vfs.c:68 |
 

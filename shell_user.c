@@ -67,8 +67,9 @@ static int32_t sys_exit(uint32_t status)
 #define CATOS_SYS_EXEC 11u
 #define CATOS_SYS_EXIT 12u
 /* 阶段5 任务1：网络统计快照（syscall.h CATOS_SYS_NET_STATS）。
- * 契约：net_stats(out,cap) → 成功返回写入条目数(≤min(cap,12))，
- * 失败 -EFAULT；条目序 = 内核 struct net_stats 字段序（见下方 NS_* 索引）。 */
+ * 契约：net_stats(out,cap) → 成功返回写入条目数(≤min(cap,13))，
+ * 失败 -EFAULT；条目序 = 内核 struct net_stats 字段序（见下方 NS_* 索引）。
+ * 阶段5 第三棒尾追加 NS_ARP_ENTRY_EXPIRED（内核 arp_entry_expired 同步）。 */
 #define CATOS_SYS_NET_STATS 32u
 /* 阶段5 第二棒：最小 DNS 解析（syscall.h CATOS_SYS_RESOLVE，nr=31）。
  * 契约：resolve(name,out4) → 0 成功且 *out4=IPv4(网络序)；负 errno 失败：
@@ -79,7 +80,9 @@ enum {
     NS_ARP_REQ_OUT, NS_ARP_REPLY_IN, NS_ARP_RESOLVE_MISS, NS_IP_CSUM_ERR,
     NS_ETHERTYPE_UNKNOWN, NS_UDP_NO_LISTENER, NS_RX_DROP_FULL,
     NS_TCP_RST_SENT, NS_TCP_RTO_REXMIT, NS_TCP_SACK_REXMIT,
-    NS_TCP_PERSIST_PROBE, NS_ICMP_ECHO_OUT, NS_COUNT
+    NS_TCP_PERSIST_PROBE, NS_ICMP_ECHO_OUT,
+    NS_ARP_ENTRY_EXPIRED,   /* 阶段5 第三棒：内核 arp_entry_expired 尾追加，勿重排既有索引 */
+    NS_COUNT
 };
 static int32_t sys_net_stats(uint32_t *buf, uint32_t cap)
 {
@@ -225,7 +228,8 @@ static void cmd_help(void)
 static const char *const ns_names[NS_COUNT] = {
     "arp_req_out", "arp_reply_in", "arp_resolve_miss", "ip_csum_err",
     "ethertype_unknown", "udp_no_listener", "rx_drop_full", "tcp_rst_sent",
-    "tcp_rto_rexmit", "tcp_sack_rexmit", "tcp_persist_probe", "icmp_echo_out"
+    "tcp_rto_rexmit", "tcp_sack_rexmit", "tcp_persist_probe", "icmp_echo_out",
+    "arp_entry_expired"
 };
 static void cmd_netstat(void)
 {

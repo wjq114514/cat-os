@@ -74,10 +74,12 @@ typedef struct tcp_conn tcp_conn_t;
 
 /* ─── 网络统计（阶段5 观测基建）───
  * 唯一实例 static 于 net.c。字段布局即 ABI：net_stats_snapshot() 按字段序
- * 线性导出（12×uint32 连续无填充），ring3 nr=32 依赖此序，勿增删/重排字段。
+ * 线性导出（13×uint32 连续无填充），ring3 nr=32 依赖此序，勿重排/删字段；
+ * 新增计数只准尾部追加并同步 shell_user.c NS_* 索引与
+ * docs/RING3_SYSCALL_ABI.md nr=32 条目（arp_entry_expired 即尾追加范例）。
  * 写上下文仅 PIT IRQ0(net_poll) / 主循环 / syscall(cli)，单核对齐 u32
  * 自增天然原子，免锁；ISR 路径零分配零格式化。 */
-#define NET_STATS_COUNT 12u
+#define NET_STATS_COUNT 13u
 struct net_stats {
     uint32_t arp_req_out;        /* arp_request: ARP 请求帧成功提交 TX */
     uint32_t arp_reply_in;       /* arp_handle: 收到指向本机的 ARP reply */
@@ -91,6 +93,7 @@ struct net_stats {
     uint32_t tcp_sack_rexmit;    /* tcp_tx_retransmit_lost: SACK 选择性重传 */
     uint32_t tcp_persist_probe;  /* tcp_tick: 零窗口 persist 探测(1B) */
     uint32_t icmp_echo_out;      /* icmp_handle: echo reply 成功发出 */
+    uint32_t arp_entry_expired;  /* arp_tick: stale 表项探测超时回收(阶段5 第三棒) */
 };
 int net_stats_snapshot(struct net_stats *out, uint32_t cap);
 
