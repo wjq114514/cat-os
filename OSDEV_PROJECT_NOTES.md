@@ -96,3 +96,88 @@ nginx 移植是最终验证目标（master/worker + 事件循环模型，热路�
   - `74a52f5`：TCP 发送确认与重传状态机
 - 当前工作树：`net.c` 有未提交修改（TCP :81 测试入口 + TIME_WAIT 日志增强）
 - 当前 Codex/HAPI session：`21c58f8e`（用户配置为 5.6 luna max；HAPI 状态页显示模型为 `default`，未能独立确认底层模型名）
+
+## 键盘交互进展（2026-08-24）
+
+### 已完成并验证（有真实 QEMU/QMP 证据）
+- **用户指针安全加固** (`a6d3bbe fix: validate user open path`)
+  - 消除了 `CR2=0x11` page fault，user open path 现在做完整安全校验
+- **usermode.c 构建修复** (`72d8358`)
+  - 删除重复且未完成的 `append_read_diag` helper（implicit vprintf decl + redefinition）
+  - `make clean && make`：退出码 0，0 warning/error
+- **kbd 探针 fd 修复** (`b0c1fc7 usermode: add observable kbd probe`)
+  - 串口原文：`kbd handshake: ready` + `kbd read ok` + `user socket ERRORS PASS`
+  - fd 处理修复，消息长度精确匹配
+- **PS/2 扫描码映射修复** (`3910a93 input: fix PS/2 scancode table alignment`)
+  - **Bug**：旧实现用字符串表 `lo[s-2]`，`'a'`(0x1E) 取 `lo[28]='g'` → QMP 注入 `a` 被解码为 `g`
+  - **修复**：改为按扫描码直接索引的 64 字节表，`0x1E='a'`、`0x30='b'`，Shift 上档表 `0x1E='A'`
+  - 真实 QEMU + QMP `input-send-event` 注入验证（全部 PASS）：
+    | 注入 | 期望 | 串口读出 | 判定 |
+    |:----:|:----:|:--------:|:----:|
+    | `a` | `a` | `a` read_ret=1 | **PASS** |
+    | `b` | `b` | `b` read_ret=1 | **PASS** |
+    | `1` | `1` | `1` read_ret=1 | **PASS** |
+    | `shift+a` | `A` | `A` read_ret=1 | **PASS** |
+    | `a,b,1,shift+a` | `ab1A` | `ab1A` read_ret=4 | **PASS** |
+  - 验证脚本：`/tmp/catos_kbd_verify.py`，证据文件：`/tmp/catos-kbd-verify/*.serial`
+- **ring3 `/dev/kbd` 非阻塞空队列读取**：PASS
+  - 串口原文：`kbd NOT_TESTED/EMPTY (1 try)` → 队列空时正确返回 0，不崩溃
+- **网络基线回归**：PASS（ping 3/3、0% 丢包，socket 错误处理全通过）
+- 无 page fault、`CR2`、panic 或 CPU exception
+
+### 未提交改动（工作树）
+- `usermode.c`：line echo probe（3 次有限重试版本，+61/-15）
+  - 新增 `je` (jump equal) helper
+  - kbd 探针从一次性读取改为 3 次有限重试循环
+  - 增加计数器、`MSG_KBDNT`("kbd NOT_TESTED (3 tries)
+")、`MSG_KBDHEX`("kbd HEX: ")
+  - **状态**：代码已写，构建通过，但尚未用 QMP 实测验证非空读取场景
+- 备份文件：`usermode.c.preprobe`、`vfs.c.user-unstaged.bak`（未跟踪）
+
+### 已知问题与缺陷
+1. **break 码处理不完整**：`keyboard.c` 的 `kh()` 只按 `s&0x7f` 匹配 0x2A/0x36（Shift），普通键 break 码会进入 make 路径 → 长按/连击重复字符风险
+2. **E0 扩展扫描码状态机未实现**：箭头键、Num、Ctrl/Alt 等扩展键无法正确映射或静默丢失；E0+F0 断码可能按 0xF0 误处理
+3. **Tab、Backspace 缺项**：扫描码在表中为 0 被忽略
+4. **非阻塞读取时序脆弱**：QMP 注入与 ring3 唯一一次非阻塞 read 之间存在竞态窗口，单次读取容易错过注入字符
+5. **阻塞式 `/dev/kbd` read 未实现**：当前 `keyboard_getchar()` 纯非阻塞，队列空直接返回 -1，无 yield/sleep/wakeup 机制
+
+### 阻塞问题（自动化开发环境）
+- **本地模型 RPM 限流**：Qwen 3.8 27B 持续 `429 rpm exhausted` / `token plan limit exhausted`，已持续数天，子代理无法执行任何任务
+- **子代理无 admin 权限**：QQ `1105693640`（Scheduler）不在 AstrBot `admins` 列表，`astrbot_execute_shell` / `astrbot_execute_python` 被拒
+- **HAPI codex 不可用**：session `21c58f8e` 可能已失效或模型配额耗尽
+- **建议**：把 Scheduler QQ 加入 admins 列表（WebUI → Config → General Config），或换用在线模型处理关键任务
+
+### 后续计划（优先级排序）
+1. **验证并提交 line echo probe**：对当前未提交的 `usermode.c` 3-retry 版本做全新 QEMU + QMP 注入实测，确认非空读取场景后提交
+2. **实现最小 shell 骨架**：在 `usermode.c` 中实现 `help`/`exit` 命令循环，循环读取 `/dev/kbd`，回车匹配命令，用 QMP 注入 `help
+` 和 `exit
+` 实测
+3. **实现阻塞式 `/dev/kbd` read**：在 `keyboard_getchar()` 中增加 yield/sleep 机制（需 kernel 侧 scheduler 配合），或用 PIT 计数等待
+4. **修复 break 码处理**：在 `keyboard.c` 的 `kh()` 中正确识别普通键 break（0xF0 前缀或 `s&0x80`），避免长按重复
+5. **实现 E0 扩展扫描码状态机**：处理 `0xE0` 前缀序列，支持箭头键、Ctrl/Alt 等扩展键
+6. **补充 Tab/Backspace 映射**：在扫描码表中增加 0x0F(Tab)、0x0E(Backspace) 的处理
+7. **回到阶段 D 网络协议栈完善**：socket API、拥塞控制（慢启动/拥塞避免/Reno）、SACK、RTT 精确估算、DHCP 租约续期
+---
+
+## 2026-08-25 自动化推进收工总结（蓝叶指令：全线停工）
+
+### 本次推进成果（阶段1~4 全部落地，HEAD=df995a8）
+- 阶段1 SACK 边界: 6796bd6
+- 阶段2 TCP 生命周期: 09fb9b4 等5commit（RFC5961 RST三分/EADDRINUSE/stale-SYN回收/RTO放弃/no_listener RST+ACK）
+- 阶段3 窗口与阻塞: b6a7db5（persist timer/SWS避免/MSS宣告解析/零窗口/recv开窗ACK/EAGAIN+ECONNRESET）+ 58d55a9 Karn亚tick RTT钳位(RFC 6298)
+- 阶段4 用户态ELF exec: c38a72f（sock_abi内嵌ELF+TSS/exit生命周期修复+socket ABI测试基建81断言）+ e56d018 inject SYN断言修正
+- 收尾: df995a8 SYN半初始化TCB竞态修复（四元组最先落位，sack_t8僵尸连接根因）
+
+### 最终测试证据（全部真机 QEMU 串口背书）
+- blackbox 19/19 | inject 6例全PASS | lifecycle L1 10/10、L3A 6/6、L4 6/6
+- user_sock_abi: 81 PASS / 0 FAIL / 4 skip（ring3 真机跑通）
+- 崩溃修复链闭环：exit后park绷带 -> TSS根因修复 -> 绷带拆除 -> S5e EMSGSIZE优先级 -> SYN竞态重排
+
+### 工作区遗留状态
+- usermode.c、本笔记：用户区未提交改动（按约定保留）
+- 未跟踪：.opencode/、opencode.json（运行器配置）、备份文件x2
+- /tmp 下测试脚本（TW1/TW2/TB1/RSTL2/L3B harness修复版）未入库，如需长期保留应搬入 tests/
+
+### 停工声明
+- 查岗 cron 已删除，所有子代理任务终止，不再派发新任务
+- 下次开工建议：L3B采样竞态脚本入库、TW/TB harness从/tmp迁移进tests/、keyboard break码/E0扩展码（见上文已知问题）

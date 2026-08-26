@@ -148,33 +148,86 @@ static uintptr_t mmap_entry_end32(const struct multiboot_mmap_entry *entry) {
     return entry->addr_low + entry->len_low;
 }
 
+/* ── 物理内存探测（物理机铺路第一步）────────────────────────────────────────
+ * 上界来源逐级回退：E820 等价 mmap(bit6) → mem_upper(bit0) → 保守 128M。
+ * mem_top_kb（全局）保存探测所得最大可用物理上界，单位 KB、含 1MiB 以下
+ * 常规段；随后经直映窗口 MAX_DIRECT_MAP_PHYS 收敛 —— 即内核实际可管理
+ * 的物理上界（>768MiB 实机场景下报告值为窗口顶）。PMM 管理容量、
+ * 直映射页目录均由此驱动，不再假设固定内存档位。 */
+uint32_t mem_top_kb;
+
+#define MEM_TOP_FALLBACK_KB (128u * 1024u)
+
+static void report_mem_source(const char *source, uint32_t top_kb) {
+    kputs("[MEM] source=");
+    kputs(source);
+    kputs(" top=");
+    kput_dec(top_kb);
+    kputs("KB\n");
+}
+
 static uintptr_t discover_memory_limit(const struct multiboot_info *mbi) {
-    uintptr_t limit = 16u * 1024u * 1024u;
+    const char *source = "fallback";
+    uint32_t top_kb = MEM_TOP_FALLBACK_KB;
+    int probed = 0;
 
-    if ((mbi->flags & MULTIBOOT_INFO_MEMORY) != 0) {
-        limit = (uintptr_t)(mbi->mem_upper + 1024u) * 1024u;
-    }
-
-    if ((mbi->flags & MULTIBOOT_INFO_MEM_MAP) != 0) {
+    /* 首选 bit6 mmap：逐条扫描取 type=1 区间的最大 end（64 位区间仅取
+     * 低 32 位内部分；残缺条目 size<24 视为表损坏，停扫退下一级来源，
+     * 兼防 size==0 死循环）。 */
+    if ((mbi->flags & MULTIBOOT_INFO_MEM_MAP) != 0 &&
+        mbi->mmap_length >= sizeof(struct multiboot_mmap_entry)) {
+        uintptr_t best_end = 0;
         uintptr_t mmap_end = mbi->mmap_addr + mbi->mmap_length;
-        for (uintptr_t p = mbi->mmap_addr; p < mmap_end;) {
+        for (uintptr_t p = mbi->mmap_addr;
+             p + sizeof(struct multiboot_mmap_entry) <= mmap_end;) {
             const struct multiboot_mmap_entry *entry =
                 (const struct multiboot_mmap_entry *)phys_to_virt(p);
+            if (entry->size < sizeof(*entry) - sizeof(entry->size)) {
+                break;
+            }
             uintptr_t end = mmap_entry_end32(entry);
-            if (entry->type == MULTIBOOT_MEMORY_AVAILABLE && end > limit) {
-                limit = end;
+            if (entry->type == MULTIBOOT_MEMORY_AVAILABLE && end > best_end) {
+                best_end = end;
             }
             p += entry->size + sizeof(entry->size);
         }
+        if (best_end != 0) {
+            uintptr_t kb = best_end >> 10; /* 先移位再进位：避开 +1023 回绕 */
+            if ((best_end & 0x3FFu) != 0) {
+                ++kb;
+            }
+            top_kb = (uint32_t)kb;
+            source = "mmap";
+            probed = 1;
+        }
     }
 
+    /* 无有效 mmap 时回退 bit0 mem_upper：只计 1MiB 以上，补回低位常规段。 */
+    if (!probed && (mbi->flags & MULTIBOOT_INFO_MEMORY) != 0 &&
+        mbi->mem_upper != 0u) {
+        top_kb = mbi->mem_upper + 1024u;
+        source = "upper";
+        probed = 1;
+    }
+
+    /* 两级都不可用：保守 128M 兜底（与 QEMU 默认验收档一致）。
+     * KB 域先收敛再移位：mmap 区间饱和 0xFFFFFFFF 时 top_kb 可达 2^22，
+     * 直接 <<10 在 32 位域回绕为 0 —— 4GiB 实机会被误报成 4MiB 下限。 */
+    if (top_kb > (MAX_DIRECT_MAP_PHYS >> 10)) {
+        top_kb = MAX_DIRECT_MAP_PHYS >> 10;
+    }
+    uintptr_t limit = (uintptr_t)top_kb << 10;
     if (limit > MAX_DIRECT_MAP_PHYS) {
         limit = MAX_DIRECT_MAP_PHYS;
     }
     if (limit < 4u * 1024u * 1024u) {
         limit = 4u * 1024u * 1024u;
     }
-    return align_down(limit, PAGE_SIZE);
+    limit = align_down(limit, PAGE_SIZE);
+
+    mem_top_kb = (uint32_t)(limit >> 10);
+    report_mem_source(source, mem_top_kb);
+    return limit;
 }
 
 static void pmm_init(uint32_t mbi_phys) {

@@ -84,6 +84,13 @@ uintptr_t pmm_managed_limit(void);
 uint32_t pmm_total_pages(void);
 uint32_t pmm_free_pages(void);
 
+/* ── 物理内存探测（物理机铺路第一步，paging_init 时解析 multiboot info）─────
+ * 来源逐级回退：mmap(bit6, E820 等价) → mem_upper(bit0) → 保守 128M，
+ * 启动串口打印 `[MEM] source=<mmap|upper|fallback> top=<N>KB`。
+ * 单位 KB、含 1MiB 以下常规段；已按直映窗口收敛（≤768MiB），
+ * 即内核实际可管理的物理上界 —— 其他模块应读此值而非假设内存档位。 */
+extern uint32_t mem_top_kb;
+
 /* ── 物理页引用计数（COW fork 地基，4KB 粒度）──────────────────────────────
  * 存储：paging.c 静态 BSS 数组 page_refcnt[MAX_MANAGED_PAGES]（uint8_t，
  * 768MiB 预算 → 196608 × 1B = 192KiB；128MiB 实机仅前 32768 项有意义）。
