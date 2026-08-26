@@ -68,7 +68,8 @@ int vfs_open(const char*p,uint32_t fl){for(unsigned i=0;i<sizeof(nodes)/sizeof(n
 int vfs_read(int fd,void*b,uint32_t n){if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_VFS||!fds[fd]->inode->ops->read)return -9;if(!user_access_ok((uintptr_t)b,n,1))return -14;return fds[fd]->inode->ops->read(fds[fd],b,n);}int vfs_write(int fd,const void*b,uint32_t n){if(!user_access_ok((uintptr_t)b,n,0))return -14;if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_VFS||!fds[fd]->inode->ops->write)return -9;return fds[fd]->inode->ops->write(fds[fd],b,n);}
 /* L2：放开 fd<3 拒绝（0-2 现为合法 std 槽位，须可关闭归还）；边界/kind 校验保持：
  * 负值/越界/空槽 → -EBADF(-9)；FILE_SOCKET → -EBADF（socket 只能经 nr==28 或
- * vfs_socket_close 关闭，维持 syscall.c「L8」审计注记：别名 3/6 不触及 socket）。 */
+ * vfs_socket_close 关闭；L8 的 nr==3 close 别名已于 2026-08-26 拆除改挂 read，
+ * 见 vfs_syscall 注记）。 */
 int vfs_close(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;if(fds[fd]->kind!=FILE_VFS)return -9;fds[fd]=0;return 0;}
 /* L2：socket 安装走共享分配器（原 for(fd=3..) 内联版）；耗尽契约保持 -EMFILE(-24)。 */
 int vfs_socket_install(void *sock){int fd=vfs_fd_alloc(FILE_SOCKET,O_RDWR,0,sock);return fd<0?-24:fd;}
@@ -76,17 +77,19 @@ void *vfs_socket_get(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=F
 int vfs_socket_close(int fd){if(!vfs_socket_get(fd))return -9;fds[fd]=0;return 0;}
 int vfs_fd_exists(int fd){return fd>=0&&fd<VFS_MAX_FD&&fds[fd]!=0;}
 int32_t vfs_syscall(uint32_t nr,const uint32_t*a){
-  /* ── L8 别名核实结论（仅文档化，行为未改）────────────────────────────
-   * nr==6 与 nr==3 均直接 vfs_close(a[0]) —— 二者构成双重 close 别名，
-   * 分支体逐字等价（核实于 HEAD=0d4b583 本函数原 21 行）。
-   *  - 主 close 号为 nr==6；nr==28(CATOS_SYS_CLOSE, syscall.c:188) 才是唯一
-   *    socket-aware 关闭路径（net_socket_close 成功后接 vfs_socket_close）。
-   *    vfs_close 对 FILE_SOCKET 一律 -EBADF（本文件 vfs_close），故经 3/6 关闭
-   *    既不能关 socket、也不会绕过 TCP 清理造成泄漏 —— 别名只作用于普通文件 fd。
-   *  - ⚠️ ABI 差异警示：Linux x86-32 系统调用号 3=read(2)、4=write(2)、5=open(2)、
-   *    6=close(2)（linux-ref arch/x86/entry/syscalls/syscall_32.tbl）；本内核为
-   *    0=read/1=write/5=open 并把 3 别名到 close。按 Linux ABI 编写的 ring3 程序
-   *    若以 nr=3 调 read，实际效果是关闭 a[0]。与 syscall.c「L8」审计注记一致；
-   *    移除别名或改挂 read 属 ABI 变更，超出本次锁内授权（L8 要求为文档化），
-   *    留协调者裁决。 */
-  if(nr==5){if(!user_access_ok(a[0],1,0))return -14;uint32_t sl=1;while(sl<256&&user_access_ok(a[0]+sl,1,0)&&((char*)a[0])[sl]!=0)sl++;if(sl>=256)return -14;return vfs_open((const char*)a[0],a[1]);}if(nr==6)return vfs_close(a[0]);if(nr==3)return vfs_close(a[0]);if(nr==0)return vfs_read(a[0],(void*)a[1],a[2]);if(nr==1)return vfs_write(a[0],(const void*)a[1],a[2]);return -38;}
+  /* ── L8 别名拆除（2026-08-26，NGINX_GAP_ANALYSIS §5 D4/硬阻塞项落地）──────
+   * 历史动机（考古）：L2 之前 fd 分配器内联 for(fd=3..) 永久跳过 0-2，「3 号=
+   *   首个可用 fd」时代留下的便捷 close 别名（HEAD=0d4b583 时 nr==6 与 nr==3
+   *   分支体逐字等价，构成双重别名）。
+   * 本次变更：nr==3 不再走 vfs_close，改挂 read 路径（与 nr==0 同一 vfs_read）。
+   *   - 编号对齐依据 linux-ref arch/x86/entry/syscalls/syscall_32.tbl：
+   *     Linux x86-32 为 3=read/4=write/5=open/6=close；本内核 VFS ABI 为
+   *     0=read/1=write/5=open/6=close —— 5/6 本与 Linux 一致，nr==3 改挂 read 后，
+   *     按 Linux ABI 写的 ring3 代码 read(fd=3) 不再静默关 fd（地雷排除）。
+   *   - close 语义不变：nr==6 关普通文件；socket 唯一关闭号仍是 nr==28
+   *     （CATOS_SYS_CLOSE，socket-aware 路径）；vfs_close 对 FILE_SOCKET 一律
+   *     -EBADF 的 kind 隔离保持不变。
+   *   - 兼容性核实：全仓 grep 无任何 ring3 调用方使用 nr==3（shell_user.c/
+   *     usermode.c/libc/userland/httpd.c 均守 nr==28 或 nr==6），移除零破坏；
+   *     sock_abi 套件新增 S7s-S7v 断言锁定新语义（tests/README.md 有变更记录）。 */
+  if(nr==5){if(!user_access_ok(a[0],1,0))return -14;uint32_t sl=1;while(sl<256&&user_access_ok(a[0]+sl,1,0)&&((char*)a[0])[sl]!=0)sl++;if(sl>=256)return -14;return vfs_open((const char*)a[0],a[1]);}if(nr==6)return vfs_close(a[0]);if(nr==0||nr==3)return vfs_read(a[0],(void*)a[1],a[2]);if(nr==1)return vfs_write(a[0],(const void*)a[1],a[2]);return -38;}

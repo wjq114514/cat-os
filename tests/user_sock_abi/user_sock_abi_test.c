@@ -45,6 +45,11 @@
 #define NR_SEND      26u
 #define NR_RECV      27u
 #define NR_CLOSE28   28u
+#define NR_READ      0u
+#define NR_READ_L32  3u   /* Linux x86-32 read(2) 号；2026-08-26 L8 别名拆除后
+                            * 与 nr==0 同走 vfs_read，不再是 close 别名 */
+#define NR_OPEN      5u
+#define NR_CLOSE6    6u   /* 普通文件关闭号（不感知 socket，kind 隔离 -EBADF） */
 #define NR_WRITE     1u
 #define NR_EXIT      12u
 
@@ -343,7 +348,7 @@ static void suite_fd_lifecycle(void)
     uint32_t cap;
     const int32_t kept_cap = (int32_t)(sizeof(kept) / sizeof(kept[0]));
 
-    section("S7 close/double-close/fd-exhaustion/L8-alias/recycle");
+    section("S7 close/double-close/fd-exhaustion/nr3-read(L8-defused)/recycle");
 
     f = s_socket(SOCK_DGRAM_C);  chk_cond("S7a", "setup_udp_fd", f > 0);
     r = s_close(f);              chk("S7b", "close_socket_nr28_ok", r, 0);
@@ -361,6 +366,28 @@ static void suite_fd_lifecycle(void)
     h2 = s_socket(SOCK_DGRAM_C); chk_cond("S7k", "reopen_fd", h2 > 0);
     chk_cond("S7l", "lowest_free_slot_reuse(vfs_fd_alloc-L2-policy)", h2 > 0 && h2 == h);
     r = s_close(h2);             chk("S7m", "close(reused_fd)", r, 0);
+
+    /* L8 拆除回归（2026-08-26，内核 vfs.c 同步变更）：nr==3 已从 close 别名
+     * 改挂 read 路径（Linux x86-32 read(2)=3）。用 open("/dev/null") 的普通
+     * 文件 fd 连续两次 nr==3 读：旧别名下第一次即关 fd、第二次必 EBADF；
+     * 新语义两次均返回 0（nullread），随后 nr==6 正常关闭、再读得 EBADF ——
+     * 四条联合锁定「nr==3=read / nr==6=close / 关闭后 nr==3 尊重 EBADF」。
+     * 注意：断言的是返回值而非 iobuf 内容（nullread 不写缓冲）。 */
+    {
+        int32_t nfd = sc5(NR_OPEN, (uint32_t)(uintptr_t)"/dev/null", 2u /*O_RDWR*/, 0, 0, 0);
+        chk_cond("S7s", "open_devnull_plain_fd", nfd >= 0);
+        if (nfd >= 0) {
+            r = sc5(NR_READ_L32, (uint32_t)nfd, (uint32_t)(uintptr_t)iobuf, 16u, 0, 0);
+            chk("S7t", "nr3_is_read_not_close(first_call_returns_0)", r, 0);
+            r = sc5(NR_READ_L32, (uint32_t)nfd, (uint32_t)(uintptr_t)iobuf, 16u, 0, 0);
+            chk("S7u", "fd_survives_nr3_call(close_alias_removed)", r, 0);
+            r = sc5(NR_CLOSE6, (uint32_t)nfd, 0, 0, 0, 0);
+            info_call("S7z5", "nr6_close(plain_file_still_works)", r);
+            r = sc5(NR_READ_L32, (uint32_t)nfd, (uint32_t)(uintptr_t)iobuf, 16u, 0, 0);
+            chk("S7v", "nr3_read_after_close_ebadf(read_path_validation)", r, EBADF);
+        }
+    }
+
 
     /* TCP 连接表耗尽：net_init 基线已占 listener(:81)（工作区 net.c:1162，
      * :80 处注释态），usermode 探针可能另占；故成功数断言为相对区间 [1,16]。 */

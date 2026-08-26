@@ -2,7 +2,8 @@
  * ── code5 改动范围声明（Cat-OS 并行任务，文件锁：仅本文件可改）─────────────
  * M2 错误码混叠修复（sendto/recvfrom/send/recv 的错误传递骨架）
  * L1 listen-before-bind 语义（修复点在 net.c → 仅 TODO 注释）
- * L8 close 双重别名关系文档化（nr==3 ↔ nr==6 ↔ nr==28）
+ * L8 nr==3 close 别名已拆除（2026-08-26，vfs.c 落地）：nr==3 改挂 read 路径；
+ *    close 仅剩 nr==6（普通文件）与 nr==28（socket-aware），见 CATOS_SYS_CLOSE 处
  * 各入口 EFAULT/EBADF/ENOTSOCK/EINVAL 严格性审计注释
  * net.c / vfs.c / usermode.c / paging.c 均属其他代理，需要配合处以 TODO(code2) 标注。
  */
@@ -243,8 +244,8 @@ static int proc_syscall(uint32_t nr, const uint32_t *a)
 /* int 0x80 调用约定（据 interrupts.c interrupt_dispatch 核实）：
  *   EAX = 系统调用号；EBX,ECX,EDX,ESI,EDI → a[0..4]；a[5] 恒 0（用户态只有
  *   5 个传参寄存器）；n 恒为 6；返回值经 sign-extend 写回 EAX，负值为 -errno。
- * nr<20 整体委托 vfs_syscall（VFS 兼容 ABI：0=read/1=write/5=open/6=close，
- * 含 close 双别名，详见 nr==28 处 L8 说明块）。 */
+ * nr<20 整体委托 vfs_syscall（VFS 兼容 ABI：0/3=read（3 为 Linux x86-32 read 号，
+ * L8 close 别名已拆除）/1=write/5=open/6=close，详见 nr==28 处 L8 说明块）。 */
 int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
     (void)n;if(!a)return -CATOS_EFAULT; /* 防御性守卫：现调用点 a 恒为内核栈数组非空 */
     /* code2: 进程类 nr=11..13 先于 VFS 兼容层分发。vfs_syscall 对未知 nr
@@ -353,23 +354,22 @@ int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a){
         if(bad_user((void*)a[1],a[2],1))return -CATOS_EFAULT;
         return sock_xlate(tcp_recv(s,(uint8_t*)a[1],a[2]),-CATOS_EAGAIN);
     }
-    /* ── L8: close 的三条路径与双重别名关系 ──────────────────────────────
+    /* ── L8: close 的路径与别名拆除记录（2026-08-26）────────────────────
      * ① nr==28（CATOS_SYS_CLOSE，本 case）：唯一 socket-aware 关闭路径。
      *    fd 为 FILE_SOCKET → net_socket_close()（触发 TCP FIN / UDP 槽释放）
      *    成功后再 vfs_socket_close() 释放描述符；否则回落 vfs_close()（普通文件）。
-     * ② nr==6：vfs_syscall（vfs.c:21）直接 vfs_close(a[0]) —— 不感知 socket。
-     * ③ nr==3：vfs.c:21 中与 nr==6 逐字等价的第二分支（同为 vfs_close(a[0])），
-     *    即 nr==6 ↔ nr==3 构成双重别名。
-     * 关系与风险注记（审计结论）：
-     *   - vfs_close 对 FILE_SOCKET 一律 -EBADF（vfs.c:16 kind!=FILE_VFS→-9），
-     *     故 ②③ 不能用来关 socket、也不会绕过 socket 清理造成泄漏；别名只作用于
-     *     普通文件描述符。socket 的正确关闭号只有 nr==28。
-     *   - ⚠️ ABI 兼容性警告：Linux x86-32 中 nr==3 是 read(2)、nr==6 才是 close(2)；
-     *     本内核 VFS ABI 却为 0=read/1=write/5=open/6=close 并把 3 别名到 close。
-     *     按 Linux ABI 编写的 ring3 程序若以 nr=3 调 read，实际会关闭 fd。
-     *     TODO(vfs.c 所有者，本文件锁内不动 vfs.c): 建议移除 nr==3 别名或改挂 read。
+     * ② nr==6：vfs_syscall 直接 vfs_close(a[0]) —— 普通文件关闭号，不感知 socket。
+     * ③ nr==3：曾是 ② 的逐字等价 close 别名（L8 双重别名地雷），2026-08-26 起
+     *    改挂 read 路径（与 nr==0 同一 vfs_read），对齐 Linux x86-32 编号
+     *    （3=read/4=write/5=open/6=close，syscall_32.tbl）。按 Linux ABI 写的
+     *    ring3 代码 read(fd=3) 不再误关 fd；全仓无遗留 nr==3-as-close 调用方。
+     *    sock_abi 套件 S7s-S7v 锁定新语义（tests/user_sock_abi/）。
+     * 关系与风险注记（审计结论，仍有效）：
+     *   - vfs_close 对 FILE_SOCKET 一律 -EBADF（kind!=FILE_VFS→-9），故 ② 与
+     *     nr==3-read 都不能关 socket、也不会绕过 TCP 清理造成泄漏；socket 的
+     *     正确关闭号只有 nr==28。
      *   - interrupts.c:31 对 nr==6 打印 "[OK] user syscall close fd=3 ..." 仅为
-     *     探针演示日志（fd 恰为 3），与别名机制无关。
+     *     探针演示日志（fd 恰为 3），与已拆除的别名机制无关。
      * 审计附注：net_socket_close 对 SOCK_CLOSED 型返回 -EBADF(-9) 且不释放 fd，
      * 存在理论上的描述符滞留窗口（如 accept 失败 abort 之后）；契约属 net.c。
      * TODO(code2): net_socket_close 对已 CLOSED 型应幂等释放或由本层兜底

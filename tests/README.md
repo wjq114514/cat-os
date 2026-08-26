@@ -96,8 +96,10 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
 | L1 | listen-before-bind 应 `-EINVAL`（缺 autobind） | L1 组 |
 | L2 | fd 分配策略（0-2 std 流占用+最低空闲+kind 隔离，code7 已落地） | P01–P09 回归 |
 | L6 | 零长缓冲误报 EFAULT（code6 已修复，n==0 放行） | 回归项 |
-| L8 | close 双重别名关系（nr==3↔6↔28，已文档化） | 回归项 |
+| L8 | nr==3 close 别名已拆除（2026-08-26 vfs.c：nr==3 改挂 read，Linux x86-32 编号对齐）；close 仅 nr==6（普通文件）/ nr==28（socket-aware） | sock_abi S7s–S7v 回归锁定 |
 | M1/M3/M4/L3/L4/L5/L7 | 仅登记（SOCKET_API.md 口径：待核实，以协调者清单为准） | — |
+
+> 变更记录（2026-08-26）：L8 地雷拆除——内核 nr==3 由 close 别名改为 read 路径（vfs.c，对齐 Linux x86-32 编号），sock_abi 套件 S7 组新增 S7s–S7v 四断言锁定「nr==3=read / nr==6=close / fd 存活 / 关闭后 EBADF」，断言总数 85→89（PASS 81→85，skip 4 不变）；既有断言无一依赖旧「nr==3 即 close」语义（原 nr==3 用例为零，S7g 走 nr==6 保持不变）。
 
 ## CI 化要点
 
