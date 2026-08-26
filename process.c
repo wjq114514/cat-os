@@ -511,9 +511,24 @@ void sched_yield(void)
 /* 时钟抢占钩子（stage4）：量子到期且就绪队列非空时轮转一次。
  * 量子取 100 tick（100Hz PIT => 1s）：单行串口 write 最长 ~224 字符 × ~87µs/字符
  * ≈ 19ms << 一个时间片，保证测试 marker 行不被抢占撕裂（可 grep）。
- * pcb[0]（内核/idle 上下文）免重入队：其 ksp 快照即 IRQ 现场本身，
- * schedule_next() 队列空时自然回落 pcb[0] 续跑 iret 尾声；状态保持 RUNNING
- * 属良性捷径，与 exit_process 的 idle 兜底路径同构（注释明示防误改）。 */
+ *
+ * [STARVATION-FIX 2026-08-26] pcb[0] 与其他 RUNNING 上下文同等入队轮转。
+ * 旧实现豁免 prev==pcb[0] 的重入队，CPU 归还完全依赖 schedule_next() 的
+ * "队列空回落 pcb[0]" 兜底（本文件 schedule_next: pick_next()==NULL 分支）；
+ * stage4 常驻 shell REPL（pid=2，for(;;) 轮询 stdin 永不退出）入队后
+ * ready_head 永非空 → 兜底永不可达 → 寄居在 pcb[0] 上下文上的 enter_usermode()
+ * ring3 探针（usermode.c iret 直入，无独立 PCB；其恢复点即 pcb[0].ksp 的
+ * IRQ 快照）自 shell 首派发起被永久饿死 —— 真机实证：shell 横幅后再无探针
+ * 输出、UDP7000/TCP80 无监听、blackbox 18→13（verify4/blackbox2.serial
+ * L362-L374 切换轨迹）。修复语义：
+ *  - 入队安全性：pcb[0].ksp 与普通进程同为 context_switch 在 IRQ 栈上拍的
+ *    快照，出队续跑即 unwind popfl/pops/iretd 尾声，机制与普通被抢进程全同构；
+ *  - 首派发帧（process_init build_initial_frame → trampoline → sched_idle）
+ *    在首次"切离 pcb[0]"时即被 ksp 快照覆盖，永不消费，无坠入纯 hlt 死循环路径；
+ *  - next==current 自弹分支（schedule_next [FIX]）对 pcb[0] 同样成立，
+ *    "current 恒 RUNNING" 不变式保持；
+ *  - exit_process(pid<=0) 早退守卫确保 pcb[0] 永不被终态回收。
+ * sched_yield() 对 pcb[0] 的让出拒绝保持不变（idle 无自愿让出场景）。 */
 #define SCHED_PREEMPT_QUANTUM_TICKS 100u
 static uint32_t preempt_tick_cnt;
 
@@ -530,9 +545,9 @@ void sched_preempt_tick(void)
     }
 
     process_t *prev = current;
-    if (prev && prev != &pcb[0] && prev->state == PROC_RUNNING) {
+    if (prev && prev->state == PROC_RUNNING) {
         prev->state = PROC_READY;
-        ready_enqueue(prev);
+        ready_enqueue(prev);        /* 含 pcb[0]：见上方 STARVATION-FIX */
     } else if (!prev) {
         return;
     }
@@ -633,13 +648,6 @@ static void schedule_next(void)
     process_t *prev = current;
     current = next;
     next->state = PROC_RUNNING;
-
-    /* [DBG-TEMP] 调度切换观测（定位 exit 后 iret 崩溃，诊断完删除） */
-    kputs("[DBG] sw prev="); kput_hex32((uint32_t)(uintptr_t)prev);
-    kputs(" pnxt="); kput_hex32((uint32_t)(uintptr_t)next);
-    kputs(" pksp="); kput_hex32(prev ? prev->ksp : 0u);
-    kputs(" nksp="); kput_hex32(next->ksp);
-    kputs("\n");
 
     /* stage4 抢占语义：每次切换进程都必须刷新 TSS.esp0 到新进程的私有内核栈，
      * 否则下一个 int0x80/IRQ 会落到旧进程的内核栈上（已被回收/释放）导致踩踏。

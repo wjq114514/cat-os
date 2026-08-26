@@ -121,5 +121,14 @@ void keyboard_init(void){while(ib(0x64)&1)(void)ib(0x60);ob(0x64,0xAA);for(volat
  * again later. The ring is only written by the IRQ1 handler; reads happen in
  * normal context, so a -1/0 return is a transient low-water state, not an
  * error and not end-of-stream.
+ *
+ * Multi-reader policy (defined 2026-08-26): the ring is a single shared
+ * byte stream for every open /dev/kbd fd. Each byte is delivered exactly
+ * once, to whichever reader polls first (FCFS); there is no per-reader
+ * queue, no exclusivity and no wakeup routing. Concurrent readers each
+ * block independently inside vfs kread's bounded kbdwait window, so one
+ * blocked reader never occupies or starves another. Current consumers:
+ * stdin(fd0) held by the resident shell REPL plus a temporary second fd
+ * during the enter_usermode() probe handshake (closed after 3 reads).
  */
 int keyboard_getchar(void){if(t==h)return -1;return q[t++];}

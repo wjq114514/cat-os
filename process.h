@@ -33,7 +33,11 @@ typedef struct { uint32_t page_dir, heap_base, stack_top; } address_space_t;
 typedef enum { PROC_CTX_KERNEL = 0, PROC_CTX_USER } proc_ctx_t;
 
 /* 任务书规定：进程表上限 32。下标即 pid；pcb[0] 为内核/idle 保留位
- * （Linux idle_task 对应物，core.c:3977 同概念），永不入就绪队列。 */
+ * （Linux idle_task 对应物，core.c:3977 同概念）。[STARVATION-FIX 2026-08-26]
+ * pcb[0] 不再绝对免入队：IRQ0 抢占量子到期时与其他 RUNNING 上下文同等
+ * 重入队轮转（sched_preempt_tick）——寄居其上的 enter_usermode() ring3 探针
+ * 依赖该路径在常驻 shell REPL 存活期间继续获得 CPU（详见 process.c
+ * sched_preempt_tick 注释）；就绪队列空时仍由 schedule_next() 兜底回落。 */
 #define MAX_PROCESSES 32u
 
 typedef struct process {

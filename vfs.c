@@ -14,6 +14,17 @@
 static file_t *fds[VFS_MAX_FD]; static uint32_t rnd=0x12345678;
 static int nullread(struct file*f,void*b,uint32_t n){(void)f;(void)b;(void)n;return 0;} static int nullwrite(struct file*f,const void*b,uint32_t n){(void)f;(void)b;return (int)n;}
 static int conwrite(struct file*f,const void*b,uint32_t n){(void)f;const char*p=b;for(uint32_t i=0;i<n;i++){char c=p[i];if(c) {char s[2]={c,0};kputs(s);}}return n;}
+/* ── /dev/kbd 多读者策略（2026-08-26 明确化，最小改动=零行为变更）──────────
+ * 所有打开的 /dev/kbd fd 共享 keyboard.c 的同一 IRQ1 环形缓冲：
+ *   1) 每字节恰交付给一名读者 —— 先轮询到者先得（FCFS），无独占/排队/唤醒
+ *      机制（本内核无 sleep/wakeup 原语，见 keyboard.c 读语义注记）；
+ *   2) 各读者的 kbdwait 阻塞窗（KBD_BLOCK_TIMEOUT_MS，墙钟 tick 计费）
+ *      相互独立，互不占坑：A 读者阻塞不影响 B 读者同刻读到新键；
+ *   3) 现网读者面：vfs_init 预装的 stdin(fd0)=shell REPL 常驻轮询 +
+ *      enter_usermode() 探针握手期临时第二 fd（读完即 close 收敛为单读者）；
+ *      注入键序依赖「探针 kbd 握手先于 shell 独占读」的时序契约。
+ * 不选「后开者拒绝」（会杀死探针握手——stdin fd0 先开）与「每读者队列」
+ * （需 file_t 侧 per-fd 缓冲 + 派发策略，超出病灶最小集）。 */
 static int kread(struct file*f,void*b,uint32_t n){(void)f;uint8_t*p=b;uint32_t i=0;if(!n)return 0;int c=keyboard_getchar_blocking(KBD_BLOCK_TIMEOUT_MS);if(c<0)return 0;p[i++]=(uint8_t)c;while(i<n){c=keyboard_getchar();if(c<0)break;p[i++]=(uint8_t)c;}return (int)i;}
 static int zread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++)((uint8_t*)b)[i]=0;return n;} static int urread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++){rnd=rnd*1664525u+1013904223u;((uint8_t*)b)[i]=(uint8_t)(rnd>>24);}return n;}
 static const file_ops_t noops={nullread,nullwrite,0},conops={0,conwrite,0},kop={kread,0,0},zops={zread,0,0},uops={urread,0,0};
