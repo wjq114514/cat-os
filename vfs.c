@@ -3,6 +3,13 @@
 #include "keyboard.h"
 #include "kbdwait.h"
 #include "paging.h"
+#include "fat16.h"
+/* ── M-B0 领地注记：fat16.c 以 #include 并入本翻译单元 ────────────────────
+ * 本轮任务领地仅 ide/vfs/fat16 六文件，Makefile（OBJS 列表）不在其列，
+ * 无法追加 fat16.o；故以单翻译单元方式并入（fat16.c 全部内部符号为
+ * static，无命名泄漏）。遗留接线项：Makefile OBJS 增加 fat16.o 后删除
+ * 本 include 即可还原标准布局。 */
+#include "fat16.c"
 #include <stdint.h>
 /* ── L2 fd 分配策略（code7 改动，依据见各函数注释）──────────────────────
  * fds[] 为文件(FILE_VFS)与 socket(FILE_SOCKET) 共享的描述符表，容量
@@ -29,6 +36,81 @@ static int kread(struct file*f,void*b,uint32_t n){(void)f;uint8_t*p=b;uint32_t i
 static int zread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++)((uint8_t*)b)[i]=0;return n;} static int urread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++){rnd=rnd*1664525u+1013904223u;((uint8_t*)b)[i]=(uint8_t)(rnd>>24);}return n;}
 static const file_ops_t noops={nullread,nullwrite,0},conops={0,conwrite,0},kop={kread,0,0},zops={zread,0,0},uops={urread,0,0};
 static inode_t nodes[]={{VFS_CHR,0,"/dev/null",&noops,0},{VFS_CHR,0,"/dev/console",&conops,0},{VFS_CHR,0,"/dev/kbd",&kop,0},{VFS_CHR,0,"/dev/zero",&zops,0},{VFS_CHR,0,"/dev/urandom",&uops,0}};
+/* ── M-B0 块设备注册表（仿 chr 静态节点模式：注册即占一 inode 槽）──────────
+ * 与 chr 的差异仅在填充时机 —— chr 编译期静态初始化，blk 由驱动（ide.c
+ * mbr_scan）在 vfs_init 之前经 vfs_blk_register 运行期追加。节点 file_ops
+ * 用 no-op 占位（read=EOF/write 拒绝）：raw 块 IO 走 blk_ops_t 内核直调，
+ * fd 化访问留待 nr=36 接线时再定语义。 */
+static const blk_ops_t *g_blks_ops[VFS_BLK_MAX]; static void *g_blks_drv[VFS_BLK_MAX];
+static inode_t g_blks_ino[VFS_BLK_MAX]; static int g_blkn;
+static int blknop_read(struct file*f,void*b,uint32_t n){(void)f;(void)b;(void)n;return 0;}
+static const file_ops_t blknops={blknop_read,0,0};
+int vfs_blk_register(const char*name,const blk_ops_t*ops,void*drv){
+  if(!name||!ops||g_blkn>=VFS_BLK_MAX)return -1;
+  g_blks_ops[g_blkn]=ops;g_blks_drv[g_blkn]=drv;
+  g_blks_ino[g_blkn]=(inode_t){VFS_BLK,0,name,&blknops,0};
+  return g_blkn++;}
+int vfs_blk_count(void){return g_blkn;}
+inode_t *vfs_blk_get(int i){return(i>=0&&i<g_blkn)?&g_blks_ino[i]:0;}
+void *vfs_blk_drv(int i){return(i>=0&&i<g_blkn)?g_blks_drv[i]:0;}
+/* ── M-B0 FAT16 只读挂载：路径决策 = /mnt/fat 前缀路由 ────────────────────
+ * 备选两案：「独立目录节点」需为每个 FAT 目录维护动态 inode 树 + 父子
+ * 解析，代价远高于「前缀路由」——后者只需在 vfs_open 尾部加一个字符串
+ * 前缀分支，fd 层复用既有 FILE_VFS 通道（file_t.pos/private 全部现成）。
+ * 故取前缀路由（fs-design 两可方案中实现代价最小者）。语义：
+ *   open("/mnt/fat/<8.3 路径>") → fat16_lookup 解析 → 只读 fd；
+ *   write 一律拒绝（只读先行）；根目录本身不可 open（无目录 fd 语义）。
+ * 单挂载点（首个通过 BPB 校验的块设备），多卷 mount 表留待 VFS 后续。 */
+#define FAT_OPEN_MAX 8
+typedef struct{int used;fat16_dirent_t de;} fatfh_t;
+static fatfh_t fatfh[FAT_OPEN_MAX]; static void *g_fatmnt;
+static int fat_read(struct file*f,void*b,uint32_t n){
+  fatfh_t*h=f->private;if(!h)return -9;
+  int r=fat16_read_file(g_fatmnt,&h->de,f->pos,b,n);
+  if(r>0)f->pos+=(uint32_t)r;
+  return r;}                                      /* pos 由本 op 自管（chr 族同例） */
+static int fat_close(struct file*f){fatfh_t*h=f->private;if(h)h->used=0;return 0;}
+static const file_ops_t fatfops={fat_read,0,fat_close};
+static inode_t fattpl={VFS_REG,0,"/mnt/fat",&fatfops,0}; /* 模板 inode；真实 size 在 dirent */
+/* fs_autoprobe —— 挂载入口。kernel.c 本轮禁改（启动流程不动），故探测
+ * 挂在 vfs_init 尾部自动执行：按注册顺序遍历块设备逐个尝试 fat16_mount
+ * (ops,0)（分区设备窗口已在 ide.c 绑定故 part_lba=0；整盘设备参与探测
+ * 以覆盖 superfloppy），首个通过 BPB 合法性闸门者胜出。
+ * 无盘/非 FAT 环境：全部失败 ⇒ 静默返回，零日志不 panic（设计硬要求）。 */
+static void fs_selfcheck(void*m);
+static void fs_autoprobe(void){
+  for(int i=0;i<g_blkn;i++){
+    void*h=fat16_mount(g_blks_ops[i],0);
+    if(!h)continue;
+    g_fatmnt=h;
+    kputs("[FS] FAT16 mounted: ");kputs(fat16_label(h));
+    kputs(" ");kput_dec(fat16_file_count(h));kputs(" files\n");
+    fs_selfcheck(h);
+    return;
+  }
+}
+/* ⚠️ TEMP(M-B0 验收自检，临时代码)：内核态读根目录首个文件名/大小并抽读
+ * 正文头部；另验一条子目录簇链（SUBDIR/INNER.TXT 为测试镜像固定内容）。
+ * 验收后处置建议：整体移除；若需保留能力，应转正为 ring3 shell 的 ls/cat
+ * 底座（走 /mnt/fat fd 路径），而非内核态打印。 */
+static void fs_selfcheck(void*m){
+  fat16_dirent_t d;
+  if(fat16_root_enum(m,0,&d))return;
+  kputs("[FS][selftest] root[0]=\"");kputs(d.name);
+  kputs("\" size=");kput_dec(d.size);kputs("\n");
+  uint8_t buf[17]={0};                            /* >16B 聚合初始化可能派发 paging.c memset，链接安全 */
+  int r=fat16_read_file(m,&d,0,buf,16);
+  if(r>0){for(int i=0;i<r;i++)if(buf[i]<0x20||buf[i]>0x7E)buf[i]='.';
+    buf[r]=0;kputs("[FS][selftest] head=\"");kputs((const char*)buf);kputs("\"\n");}
+  if(fat16_lookup(m,"SUBDIR/INNER.TXT",&d)==0){
+    kputs("[FS][selftest] SUBDIR/INNER.TXT size=");kput_dec(d.size);
+    uint8_t nb[9]={0,0,0,0,0,0,0,0,0};
+    int rn=fat16_read_file(m,&d,0,nb,8);
+    if(rn>0){for(int i=0;i<rn;i++)if(nb[i]<0x20||nb[i]>0x7E)nb[i]='.';
+      kputs(" body=\"");kputs((const char*)nb);kputs("\"");}
+    kputs("\n");
+  }
+}
 /* L2 共享分配器：线性扫描最低空闲槽位并占用。
  * 依据：linux-ref fs/file.c:569 alloc_fd()（start 起 find_next_fd 取最低空闲位）
  *   及 fs/file.c:616 __get_unused_fd_flags()→alloc_fd(0,nofile,flags)——扫描
@@ -73,15 +155,38 @@ void vfs_init(void){kputs("[OK] VFS mounted /dev (devfs)\n");
     kputs(ok?"[VFS-FD] selftest PASS a=3 b=4 c=5 d=4 e=6 f=3\n"
             :"[VFS-FD] selftest FAIL\n");
   }
+  fs_autoprobe();   /* M-B0：FAT16 自动探测挂载（无盘/非 FAT 静默跳过） */
 }
-/* L2：分配改经 vfs_fd_alloc（原实现内联 for(fd=3..) 且永久跳过 0-2）。 */
-int vfs_open(const char*p,uint32_t fl){for(unsigned i=0;i<sizeof(nodes)/sizeof(nodes[0]);i++){const char*a=p,*b=nodes[i].name;while(*a&&*a==*b){a++;b++;}if(!*a&&!*b)return vfs_fd_alloc(FILE_VFS,fl,&nodes[i],0);}return -1;}
+/* L2：分配改经 vfs_fd_alloc（原实现内联 for(fd=3..) 且永久跳过 0-2）。
+ * M-B0 追加两段解析（顺序：chr 静态节点 → 块设备注册表 → /mnt/fat 前缀）：
+ *   1) 块设备名（/dev/hda、/dev/hda1..4）精确命中 → no-op 占位 fd；
+ *   2) "/mnt/fat/" 前缀 → fat16_lookup 路径解析，失败按既有契约统一 -1
+ *      （open 错误码细分留待 nr=36 ABI 定稿，本层不抢跑）。 */
+int vfs_open(const char*p,uint32_t fl){
+  for(unsigned i=0;i<sizeof(nodes)/sizeof(nodes[0]);i++){const char*a=p,*b=nodes[i].name;while(*a&&*a==*b){a++;b++;}if(!*a&&!*b)return vfs_fd_alloc(FILE_VFS,fl,&nodes[i],0);}
+  for(int i=0;i<g_blkn;i++){const char*a=p,*b=g_blks_ino[i].name;while(*a&&*a==*b){a++;b++;}if(!*a&&!*b)return vfs_fd_alloc(FILE_VFS,fl,&g_blks_ino[i],0);}
+  if(g_fatmnt){const char*a=p,*b="/mnt/fat/";while(*a&&*a==*b){a++;b++;}
+    if(!*b){
+      fatfh_t*h=0;for(int i=0;i<FAT_OPEN_MAX;i++)if(!fatfh[i].used){h=&fatfh[i];break;}
+      if(h&&fat16_lookup(g_fatmnt,a,&h->de)==0){
+        h->used=1;
+        int fd=vfs_fd_alloc(FILE_VFS,fl,&fattpl,h);
+        if(fd>=0)return fd;
+        h->used=0;return -1;                     /* fd 耗尽 */
+      }
+      return -1;                                 /* ENOENT / 槽耗尽 */
+    }}
+  return -1;}
 int vfs_read(int fd,void*b,uint32_t n){if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_VFS||!fds[fd]->inode->ops->read)return -9;if(!user_access_ok((uintptr_t)b,n,1))return -14;return fds[fd]->inode->ops->read(fds[fd],b,n);}int vfs_write(int fd,const void*b,uint32_t n){if(!user_access_ok((uintptr_t)b,n,0))return -14;if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_VFS||!fds[fd]->inode->ops->write)return -9;return fds[fd]->inode->ops->write(fds[fd],b,n);}
 /* L2：放开 fd<3 拒绝（0-2 现为合法 std 槽位，须可关闭归还）；边界/kind 校验保持：
  * 负值/越界/空槽 → -EBADF(-9)；FILE_SOCKET → -EBADF（socket 只能经 nr==28 或
  * vfs_socket_close 关闭；L8 的 nr==3 close 别名已于 2026-08-26 拆除改挂 read，
  * 见 vfs_syscall 注记）。 */
-int vfs_close(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;if(fds[fd]->kind!=FILE_VFS)return -9;fds[fd]=0;return 0;}
+int vfs_close(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;if(fds[fd]->kind!=FILE_VFS)return -9;
+  /* M-B0：补发 inode close 钩子（fat 句柄槽释放依赖此；既有 chr 节点
+   * close 成员恒为 0，守卫后零行为变更）。 */
+  if(fds[fd]->inode->ops&&fds[fd]->inode->ops->close)fds[fd]->inode->ops->close(fds[fd]);
+  fds[fd]=0;return 0;}
 /* L2：socket 安装走共享分配器（原 for(fd=3..) 内联版）；耗尽契约保持 -EMFILE(-24)。 */
 int vfs_socket_install(void *sock){int fd=vfs_fd_alloc(FILE_SOCKET,O_RDWR,0,sock);return fd<0?-24:fd;}
 void *vfs_socket_get(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_SOCKET)return 0;return fds[fd]->private;}
