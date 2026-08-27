@@ -33,4 +33,13 @@ inode_t *vfs_blk_get(int i);
 void vfs_init(void); int vfs_open(const char *,uint32_t); int vfs_read(int,void *,uint32_t); int vfs_write(int,const void *,uint32_t); int vfs_close(int); int32_t vfs_syscall(uint32_t,const uint32_t *);
 int vfs_socket_install(void *sock); void *vfs_socket_get(int fd); int vfs_socket_close(int fd);
 int vfs_fd_exists(int fd);
+/* Wave 1: POSIX 补全 ───────────────────────────────────────────── */
+int vfs_lseek(int fd, int32_t offset, int whence);
+int vfs_fstat(int fd, void *user_stat);
+int vfs_dup2(int oldfd, int newfd);
+int vfs_fcntl(int fd, int cmd, int arg);
+int vfs_ioctl(int fd, int cmd, int arg);
+int vfs_writev(int fd, const void *iovec_user, int iovcnt);
+int vfs_fd_readable(int fd);
+int vfs_fd_writable(int fd);
 #endif

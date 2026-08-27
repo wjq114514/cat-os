@@ -9,7 +9,7 @@ typedef struct{uint16_t limit;uint32_t base;}__attribute__((packed)) desc_ptr_t;
 typedef struct{uint16_t lo,sel;uint8_t zero,type;uint16_t hi;}__attribute__((packed)) gate_t;
 typedef struct{uint32_t edi,esi,ebp,saved_esp,ebx,edx,ecx,eax,vector,error_code,eip,cs,eflags;} interrupt_frame_t;
 typedef struct{irq_handler_t fn;void *arg;uint8_t warned;} irq_slot_t;
-static gate_t idt[256];static uint8_t gdt_copy[64]__attribute__((aligned(16)));static irq_slot_t slots[16];volatile uint32_t ticks;uint16_t code_sel;
+static gate_t idt[256];static uint8_t gdt_copy[64]__attribute__((aligned(16)));static irq_slot_t slots[16];volatile uint32_t ticks;uint32_t boot_epoch;uint16_t code_sel;
 extern void arch_load_idt(const desc_ptr_t *);extern void arch_load_gdt(const desc_ptr_t *);
 #define D(n) extern void isr_##n(void)
 D(0);D(3);D(14);D(128);D(32);D(33);D(34);D(35);D(36);D(37);D(38);D(39);D(40);D(41);D(42);D(43);D(44);D(45);D(46);D(47);

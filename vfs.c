@@ -192,6 +192,149 @@ int vfs_socket_install(void *sock){int fd=vfs_fd_alloc(FILE_SOCKET,O_RDWR,0,sock
 void *vfs_socket_get(int fd){if(fd<0||fd>=VFS_MAX_FD||!fds[fd]||fds[fd]->kind!=FILE_SOCKET)return 0;return fds[fd]->private;}
 int vfs_socket_close(int fd){if(!vfs_socket_get(fd))return -9;fds[fd]=0;return 0;}
 int vfs_fd_exists(int fd){return fd>=0&&fd<VFS_MAX_FD&&fds[fd]!=0;}
+
+/* ── Wave 1: POSIX syscall 实现 ─────────────────────────────────── */
+
+/* struct catos_stat 内核侧布局（与 user space 一致） */
+struct catos_stat {
+    uint32_t st_dev, st_ino, st_mode, st_nlink;
+    uint32_t st_uid, st_gid, st_rdev;
+    uint32_t st_size, st_blksize, st_blocks;
+};
+#define S_IFCHR  0x2000u
+#define S_IFREG  0x8000u
+#define S_IFSOCK 0xC000u
+
+int vfs_fstat(int fd, void *user_stat){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;
+    if(!user_access_ok((uintptr_t)user_stat, sizeof(struct catos_stat), 1))return -14;
+    struct catos_stat st={0};
+    file_t *f=fds[fd];
+    if(f->kind==FILE_SOCKET){
+        st.st_mode=S_IFSOCK;
+    }else if(f->kind==FILE_VFS&&f->inode){
+        if(f->inode->type==VFS_CHR) st.st_mode=S_IFCHR;
+        else st.st_mode=S_IFREG;
+        st.st_size=f->inode->size;
+        st.st_dev=0;
+    }
+    st.st_nlink=1;
+    memcpy(user_stat,&st,sizeof(st));
+    return 0;
+}
+
+int vfs_lseek(int fd, int32_t offset, int whence){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;
+    file_t *f=fds[fd];
+    if(f->kind==FILE_SOCKET)return -29; /* ESPIPE */
+    if(!f->inode)return -9;
+    if(f->inode->type==VFS_CHR){
+        /* 设备文件：/dev/null 允许 seek（但无意义），其他设备 -ESPIPE */
+        return -29;
+    }
+    uint32_t newpos;
+    switch(whence){
+    case 0: /* SEEK_SET */
+        newpos=(uint32_t)offset;
+        break;
+    case 1: /* SEEK_CUR */
+        newpos=f->pos+(uint32_t)offset;
+        break;
+    case 2: /* SEEK_END */
+        newpos=f->inode->size+(uint32_t)offset;
+        break;
+    default:
+        return -22; /* EINVAL */
+    }
+    /* 越界检查：不允许回绕到负数 */
+    if(whence!=2&&(int32_t)newpos<0)return -22;
+    f->pos=newpos;
+    return (int)newpos;
+}
+
+int vfs_dup2(int oldfd, int newfd){
+    if(oldfd<0||oldfd>=VFS_MAX_FD||!fds[oldfd])return -9;
+    if(newfd<0||newfd>=VFS_MAX_FD)return -9;
+    if(oldfd==newfd)return newfd;
+    /* 关闭 newfd 如果已打开 */
+    if(fds[newfd]){
+        if(fds[newfd]->kind==FILE_VFS){
+            if(fds[newfd]->inode&&fds[newfd]->inode->ops&&fds[newfd]->inode->ops->close)
+                fds[newfd]->inode->ops->close(fds[newfd]);
+        }
+        /* socket 不走 vfs_close（需要 nr=28），此处仅释放 fd 槽位 */
+        fds[newfd]=0;
+    }
+    fds[newfd]=fds[oldfd];
+    return newfd;
+}
+
+int vfs_fcntl(int fd, int cmd, int arg){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;
+    file_t *f=fds[fd];
+    switch(cmd){
+    case 1: /* F_GETFD */ return 0;
+    case 2: /* F_SETFD */ return 0;
+    case 3: /* F_GETFL */ return (int)f->flags;
+    case 4: /* F_SETFL */ f->flags=(uint32_t)arg; return 0;
+    default: return -22; /* EINVAL */
+    }
+}
+
+int vfs_ioctl(int fd, int cmd, int arg){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;
+    switch(cmd){
+    case 0x5413: { /* TIOCGWINSZ */
+        if(!user_access_ok((uintptr_t)arg, 8, 1))return -14;
+        uint16_t *p=(uint16_t*)(uintptr_t)arg;
+        p[0]=24; p[1]=80; p[2]=0; p[3]=0;
+        return 0;
+    }
+    case 0x541B: return 0; /* FIONREAD: no buffered data */
+    default: return -25; /* ENOTTY */
+    }
+}
+
+/* iovec entry for writev */
+struct catos_iovec { void *iov_base; uint32_t iov_len; };
+#define CATOS_UIO_MAXIOV 16
+
+int vfs_writev(int fd, const void *iovec_user, int iovcnt){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return -9;
+    if(iovcnt<0||iovcnt>CATOS_UIO_MAXIOV)return -22;
+    uint32_t total=0;
+    for(int i=0;i<iovcnt;i++){
+        struct catos_iovec iov;
+        if(!user_access_ok((uintptr_t)iovec_user+i*sizeof(struct catos_iovec), sizeof(struct catos_iovec), 0))
+            return -14;
+        memcpy(&iov,(const char*)iovec_user+i*sizeof(struct catos_iovec),sizeof(iov));
+        if(iov.iov_len==0)continue;
+        if(!user_access_ok((uintptr_t)iov.iov_base, iov.iov_len, 0))return -14;
+        int r=vfs_write(fd,iov.iov_base,iov.iov_len);
+        if(r<0)return r;
+        total+=(uint32_t)r;
+        if((uint32_t)r<iov.iov_len)break; /* short write */
+    }
+    return (int)total;
+}
+
+int vfs_fd_readable(int fd){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return 0;
+    file_t *f=fds[fd];
+    if(f->kind!=FILE_VFS)return 0;
+    if(f->inode&&f->inode->type==VFS_CHR&&f->inode->ops&&f->inode->ops->read)return 1;
+    if(f->inode&&f->inode->type==VFS_REG)return 1;
+    return 0;
+}
+
+int vfs_fd_writable(int fd){
+    if(fd<0||fd>=VFS_MAX_FD||!fds[fd])return 0;
+    file_t *f=fds[fd];
+    if(f->kind!=FILE_VFS)return 0;
+    if(f->inode&&f->inode->type==VFS_CHR&&f->inode->ops&&f->inode->ops->write)return 1;
+    if(f->inode&&f->inode->type==VFS_REG)return 1;
+    return 0;
+}
 int32_t vfs_syscall(uint32_t nr,const uint32_t*a){
   /* ── L8 别名拆除（2026-08-26，NGINX_GAP_ANALYSIS §5 D4/硬阻塞项落地）──────
    * 历史动机（考古）：L2 之前 fd 分配器内联 for(fd=3..) 永久跳过 0-2，「3 号=

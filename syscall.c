@@ -12,6 +12,8 @@
 #include "net.h"
 #include "vfs.h"
 #include "paging.h"
+#include "process.h"
+#include "interrupts.h"
 
 /* ── code2 改动范围声明（Cat-OS 并行任务，文件锁：本文件追加修改）───────
  * exec/exit/wait 进程类系统调用（nr=11..13）：
@@ -367,13 +369,167 @@ static int32_t syscall_signal_deliver(int32_t r)
     return r;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Wave 1: nginx M2 阻塞缺口补齐 — 时间 / poll / POSIX 补全
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* gettimeofday(struct timeval *, NULL) — nr=196 ──────────────────────
+ * struct timeval { long sec; long usec; }  8 bytes on i686。
+ * timezone 参数通常 NULL 忽略（Linux 同：若非 NULL 预检 8B 可写）。 */
+static int sys_gettimeofday(const uint32_t *a){
+    if(a[0]==0u)return 0;
+    if(bad_user((void*)(uintptr_t)a[0],8u,1))return -CATOS_EFAULT;
+    uint32_t *tv=(uint32_t*)(uintptr_t)a[0];
+    tv[0]=boot_epoch+(ticks/100u);
+    tv[1]=(ticks%100u)*10000u;
+    if(a[1]!=0u){ /* timezone 非 NULL 也要写 */
+        if(bad_user((void*)(uintptr_t)a[1],8u,1))return -CATOS_EFAULT;
+        uint32_t *tz=(uint32_t*)(uintptr_t)a[1];
+        tz[0]=0; tz[1]=0; /* UTC */
+    }
+    return 0;
+}
+
+/* clock_gettime(clockid_t, struct timespec *) — nr=263 ───────────────
+ * CLOCK_REALTIME=0, CLOCK_MONOTONIC=1。
+ * struct timespec { long sec; long nsec; }  8 bytes on i686。 */
+static int sys_clock_gettime(const uint32_t *a){
+    if(bad_user((void*)(uintptr_t)a[1],8u,1))return -CATOS_EFAULT;
+    uint32_t *ts=(uint32_t*)(uintptr_t)a[1];
+    if(a[0]==0u){ /* CLOCK_REALTIME */
+        ts[0]=boot_epoch+(ticks/100u);
+        ts[1]=(ticks%100u)*10000000u;
+    }else if(a[0]==1u){ /* CLOCK_MONOTONIC */
+        ts[0]=ticks/100u;
+        ts[1]=(ticks%100u)*10000000u;
+    }else{
+        return -22;
+    }
+    return 0;
+}
+
+/* poll(fds, nfds, timeout_ms) — nr=168 ──────────────────────────────
+ * 最小阻塞轮询：遍历 fd 集检查就绪事件。
+ * timeout_ms: 0=非阻塞, -1=无限等待, >0=毫秒超时。 */
+static short poll_check_fd(int fd, short events){
+    short re=0;
+    socket_t *s=sock_fd(fd);
+    if(s){
+        if(s->type==SOCK_TCP_ESTAB){
+            if(events&CATOS_POLLIN) re|=CATOS_POLLIN;
+            if(events&CATOS_POLLOUT) re|=CATOS_POLLOUT;
+        }else if(s->type==SOCK_TCP_LISTEN){
+            if(events&CATOS_POLLIN) re|=CATOS_POLLIN;
+        }
+        return re;
+    }
+    if(vfs_fd_readable(fd)){
+        if(events&CATOS_POLLIN) re|=CATOS_POLLIN;
+    }
+    if(vfs_fd_writable(fd)){
+        if(events&CATOS_POLLOUT) re|=CATOS_POLLOUT;
+    }
+    if(!re&&!vfs_fd_exists(fd))re=CATOS_POLLERR;
+    return re;
+}
+
+static int sys_poll(const uint32_t *a){
+    struct catos_pollfd *ufds=(struct catos_pollfd*)(uintptr_t)a[0];
+    uint32_t nfds=a[1];
+    int32_t timeout_ms=(int32_t)a[2];
+    if(nfds==0u)return 0;
+    uint32_t size=nfds*sizeof(struct catos_pollfd);
+    if(bad_user(ufds,size,1))return -CATOS_EFAULT;
+    uint32_t start_tick=ticks;
+    uint32_t timeout_ticks=(timeout_ms<0)?0xFFFFFFFFu:((uint32_t)timeout_ms/10u);
+    for(;;){
+        int ready=0;
+        for(uint32_t i=0;i<nfds;i++){
+            struct catos_pollfd pfd;
+            memcpy(&pfd,(char*)ufds+i*sizeof(struct catos_pollfd),sizeof(pfd));
+            pfd.revents=poll_check_fd(pfd.fd,pfd.events);
+            if(pfd.revents)ready++;
+            ((struct catos_pollfd*)((char*)ufds+i*sizeof(struct catos_pollfd)))->revents=pfd.revents;
+        }
+        if(ready>0)return ready;
+        if(timeout_ms==0)return 0;
+        if(ticks-start_tick>=timeout_ticks)return 0;
+        __asm__ volatile("sti;hlt");
+    }
+}
+
+/* brk(addr) — nr=45 ──────────────────────────────────────────────────
+ * 最小实现：返回固定 break（ELF 默认 0x404000），后续接线 mmap 后升级。 */
+static int sys_brk(const uint32_t *a){
+    (void)a;
+    return 0x404000;
+}
+
+/* mmap2 — nr=192 ─────────────────────────────────────────────────────
+ * 最小匿名 mmap：MAP_ANONYMOUS|MAP_PRIVATE → 分配物理页并映射。 */
+static int sys_mmap2(const uint32_t *a){
+    uint32_t length=a[1];
+    if(length==0u)return -22;
+    uint32_t pages=(length+4095u)/4096u;
+    uint32_t vaddr=a[0];
+    if(vaddr==0u){
+        static uint32_t next_mmap=0x500000u;
+        vaddr=next_mmap;
+        next_mmap+=pages*4096u;
+    }
+    for(uint32_t i=0;i<pages;i++){
+        uintptr_t phys=pmm_alloc_page();
+        if(!phys)return -12;
+        memset((void*)phys,0,4096);
+        if(map_page(vaddr+i*4096u,(uintptr_t)phys,_PAGE_PRESENT|_PAGE_RW|_PAGE_USER)<0){
+            pmm_free_page(phys);
+            return -12;
+        }
+    }
+    return (int)vaddr;
+}
+
+/* munmap — nr=91: stub ──────────────────────────────────────────────── */
+static int sys_munmap(const uint32_t *a){(void)a;return 0;}
+
+/* dup2(oldfd, newfd) — nr=63 ───────────────────────────────────────── */
+static int sys_dup2(const uint32_t *a){return vfs_dup2((int)a[0],(int)a[1]);}
+
+/* fcntl(fd, cmd, arg) — nr=55 ──────────────────────────────────────── */
+static int sys_fcntl(const uint32_t *a){return vfs_fcntl((int)a[0],(int)a[1],(int)a[2]);}
+
+/* ioctl(fd, cmd, arg) — nr=54 ──────────────────────────────────────── */
+static int sys_ioctl(const uint32_t *a){return vfs_ioctl((int)a[0],(int)a[1],(int)a[2]);}
+
+/* fstat(fd, statbuf) — nr=197 ──────────────────────────────────────── */
+static int sys_fstat(const uint32_t *a){return vfs_fstat((int)a[0],(void*)(uintptr_t)a[1]);}
+
+/* lseek(fd, offset, whence) — nr=19 ────────────────────────────────── */
+static int sys_lseek(const uint32_t *a){return vfs_lseek((int)a[0],(int32_t)a[1],(int)a[2]);}
+
+/* writev(fd, iovec, iovcnt) — nr=146 ───────────────────────────────── */
+static int sys_writev(const uint32_t *a){return vfs_writev((int)a[0],(void*)(uintptr_t)a[1],(int)a[2]);}
+
 static int32_t syscall_dispatch_nr(uint32_t nr,uint32_t n,const uint32_t *a){
     (void)n;if(!a)return -CATOS_EFAULT; /* 防御性守卫：现调用点 a 恒为内核栈数组非空 */
     /* code2: 进程类 nr=11..13 / 33..35 先于 VFS 兼容层与 socket 表分发。
      * vfs_syscall 对未知 nr 返回 -ENOSYS（vfs.c default 分支），nr=33..35 落
      * 其「其他(<20)? 否」之外且主 switch 无分支，前置拦截统一走 proc_syscall。 */
     if((nr>=11u&&nr<=13u)||(nr>=CATOS_SYS_FORK&&nr<=CATOS_SYS_KILL))return proc_syscall(nr,a);
-    if(nr<20)return vfs_syscall(nr,a);
+    /* Wave 1: nr<20 新增 POSIX 补全 —— 先走本层再回落 VFS 兼容层 */
+    if(nr==19u)return sys_lseek(a);          /* LSEEK */
+    if(nr==45u)return sys_brk(a);            /* BRK */
+    if(nr==54u)return sys_ioctl(a);          /* IOCTL */
+    if(nr==55u)return sys_fcntl(a);          /* FCNTL */
+    if(nr==63u)return sys_dup2(a);           /* DUP2 */
+    if(nr==91u)return sys_munmap(a);         /* MUNMAP */
+    if(nr==146u)return sys_writev(a);        /* WRITEV */
+    if(nr==168u)return sys_poll(a);          /* POLL */
+    if(nr==192u)return sys_mmap2(a);         /* MMAP2 */
+    if(nr==196u)return sys_gettimeofday(a);  /* GETTIMEOFDAY */
+    if(nr==197u)return sys_fstat(a);         /* FSTAT */
+    if(nr==263u)return sys_clock_gettime(a); /* CLOCK_GETTIME */
+    if(nr<20u)return vfs_syscall(nr,a);
     switch(nr){
     /* socket(type)：a[0]=type（house ABI 无 domain/protocol 形参）。
      * 白名单外 → -EINVAL（Linux 对非法 type 报 EPROTOTYPE/EPROTONOSUPPORT 族，

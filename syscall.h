@@ -17,6 +17,11 @@
 #define CATOS_ENOENT 2
 #define CATOS_E2BIG 7
 #define CATOS_ECHILD 10
+#define CATOS_ENOSPC 28
+#define CATOS_ESPIPE 29
+#define CATOS_ENOTTY 25
+#define CATOS_ENOTSUP 95
+#define CATOS_ENOMEM 12
 #define CATOS_AF_INET 2
 #define CATOS_SOCK_DGRAM 2
 #define CATOS_SOCK_STREAM 1
@@ -43,6 +48,24 @@
 #define CATOS_SYS_WAITPID 34
 #define CATOS_SYS_KILL 35
 #define CATOS_ETIMEDOUT 110
+/* ── Wave 1 新增（nginx M2 事件 + 时间 + POSIX 补全）───────────────── */
+#define CATOS_SYS_GETTIMEOFDAY  196
+#define CATOS_SYS_CLOCK_GETTIME 263
+#define CATOS_SYS_POLL          168
+#define CATOS_SYS_LSEEK         19
+#define CATOS_SYS_FSTAT         197
+#define CATOS_SYS_DUP2          63
+#define CATOS_SYS_FCNTL         55
+#define CATOS_SYS_IOCTL         54
+#define CATOS_SYS_WRITEV        146
+#define CATOS_SYS_MMAP2         192
+#define CATOS_SYS_MUNMAP        91
+#define CATOS_SYS_BRK           45
+/* struct catos_pollfd (for poll nr=168) */
+#define CATOS_POLLIN   0x001
+#define CATOS_POLLOUT  0x004
+#define CATOS_POLLERR  0x008
+struct catos_pollfd { int fd; short events; short revents; };
 void syscall_init(void);
 int32_t syscall_dispatch(uint32_t,uint32_t,const uint32_t *);
 int user_range_ok(uint32_t,uint32_t);

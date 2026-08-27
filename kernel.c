@@ -164,6 +164,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
     keyboard_init();
     ide_init();
     rtc_init();
+    boot_epoch = rtc_get_epoch();
     usermode_init();
     vfs_init();
     interrupts_enable();kputs("[OK] pre-enter_usermode\n");
