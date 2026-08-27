@@ -114,6 +114,10 @@ struct tcp_conn {
                                     send/recv 据此上报 -ECONNRESET 而非假 EAGAIN；
                                     复用点 tcp_listen()/SYN 接收路径显式清零，
                                     net_socket_open() 整体清零，不泄漏到新连接 */
+    /* ── Wave 2: 性能优化字段 ─────────────────────────────────────── */
+    bool nodelay;                /* TCP_NODELAY=1: 禁用 Nagle，立即发送 */
+    uint8_t rcv_wscale;          /* 接收窗口缩放因子（RFC 7323） */
+    uint8_t snd_wscale;          /* 发送窗口缩放因子 */
 };
 extern tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 extern socket_t tcp_handles[TCP_MAX_CONNS];

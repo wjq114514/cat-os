@@ -11,8 +11,8 @@ LDFLAGS = -m elf_i386 -T linker.ld -nostdlib
 QEMUFLAGS = -cdrom os.iso -m 128M -display none -serial stdio -no-reboot -no-shutdown \
             -netdev user,id=net0 -device e1000,netdev=net0
 
-OBJS = boot.o arch.o kernel.o paging.o interrupts.o syscall.o process.o netring.o pci.o e1000.o keyboard.o kbdwait.o ide.o rtc.o usermode.o vfs.o net.o net_arp.o net_icmp.o net_udp.o net_dhcp.o net_dns.o net_tcp.o \
-      elf.o # elf.o(code2): exec syscall 链接 elf_load 所需（elf.c 属其他代理实现）
+OBJS = boot.o arch.o kernel/kernel.o kernel/paging.o kernel/interrupts.o kernel/syscall.o kernel/process.o net/netring.o drivers/pci.o drivers/e1000.o drivers/keyboard.o drivers/kbdwait.o drivers/ide.o drivers/rtc.o kernel/usermode.o fs/vfs.o net/net.o net/net_arp.o net/net_icmp.o net/net_udp.o net/net_dhcp.o net/net_dns.o net/net_tcp.o \
+      kernel/elf.o # elf.o(code2): exec syscall 链接 elf_load 所需（elf.c 属其他代理实现）
 
 all: shell_bin.h sock_abi_bin.h httpd_bin.h os.iso
 
@@ -35,8 +35,19 @@ boot.o: boot.asm
 arch.o: arch.asm
 	$(AS) -f elf32 -o $@ $<
 
-%.o: %.c kernel.h paging.h multiboot.h net.h net_internal.h e1000.h shell_bin.h sock_abi_bin.h httpd_bin.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+# 通用规则：kernel/ drivers/ fs/ net/ 子目录下的 .c → .o
+# -I. 确保根目录的 shell_bin.h / sock_abi_bin.h / httpd_bin.h 可被找到
+kernel/%.o: kernel/%.c kernel/*.h shell_bin.h sock_abi_bin.h httpd_bin.h
+	$(CC) $(CFLAGS) -I. -Ikernel -Ifs -Inet -Idrivers -c -o $@ $<
+
+drivers/%.o: drivers/%.c drivers/*.h kernel/*.h
+	$(CC) $(CFLAGS) -I. -Ikernel -Ifs -Inet -Idrivers -c -o $@ $<
+
+fs/%.o: fs/%.c fs/*.h kernel/*.h
+	$(CC) $(CFLAGS) -I. -Ikernel -Ifs -Inet -Idrivers -c -o $@ $<
+
+net/%.o: net/%.c net/*.h kernel/*.h drivers/*.h
+	$(CC) $(CFLAGS) -I. -Ikernel -Ifs -Inet -Idrivers -c -o $@ $<
 
 run: os.iso
 	$(QEMU) $(QEMUFLAGS)
@@ -61,7 +72,7 @@ run-httpd: os.iso
 	$(QEMU) $(QEMUFLAGS_HTTPD)
 
 clean:
-	rm -rf *.o cat-os.elf cat-os.bin os.iso iso
+	rm -rf boot.o arch.o kernel/*.o drivers/*.o fs/*.o net/*.o cat-os.elf cat-os.bin os.iso iso
 	rm -f shell_user.elf shell_user.bin shell_bin.h
 	rm -f sock_abi.elf sock_abi.bin sock_abi_bin.h sock_abi.o
 	rm -f httpd.elf httpd.bin httpd_bin.h httpd.o

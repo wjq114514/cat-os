@@ -23,6 +23,14 @@ static void tcp_parse_opts(tcp_conn_t *c,const uint8_t *opt,uint32_t n,bool syn)
     while(n){uint8_t kind=opt[0];if(kind==0)break;if(kind==1){opt++;n--;continue;}if(n<2||opt[1]<2||opt[1]>n)break;
         uint8_t olen=opt[1];
         if(kind==4&&olen==2&&syn)c->sack_ok=true;
+        if(kind==3&&olen==3&&syn){
+            /* RFC 7323 §2: Window Scale option（kind=3, len=3, shift.cnt=1 byte）
+             * 仅在 SYN 中有效。shift.cnt 范围 [0,14]，对应缩放 1..16384。
+             * 本栈窗口最大 65535×16384 ≈ 1GiB（足够 nginx 单连接）。 */
+            uint8_t shift = opt[2];
+            if (shift > 14) shift = 14;  /* clamp to max */
+            c->rcv_wscale = shift;
+        }
         if(kind==2&&olen==4&&syn){
             /* 阶段3 MSS/窗口边界：记录对端宣告 MSS（RFC 9293 §3.7.1：
              * "the other side should send no segments larger than the

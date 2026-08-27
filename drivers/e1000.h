@@ -8,4 +8,7 @@ void e1000_get_mac(uint8_t out[6]);
  * 失败返回 NULL；组好帧后调用 submit(len) 提交并推进 TDT。 */
 uint8_t *e1000_tx_alloc(void);
 int e1000_tx_submit(uint32_t len);
+/* 零拷贝 TX 提交（Wave 2 新增）：直接引用物理地址缓冲区。
+ * 物理地址须 16 字节对齐（e1000 描述符硬件要求）。 */
+int e1000_tx_submit_buf(uint32_t phys_addr, uint32_t len);
 #endif
