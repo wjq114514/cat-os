@@ -80,3 +80,29 @@ int udp_recvfrom(socket_t *s,uint32_t *src_ip,uint16_t *src_port,uint8_t *buf,ui
     u->head=u->n;
     return (int)dlen;
 }
+
+short udp_socket_poll(socket_t *s, short events)
+{
+    udp_sock_t *u;
+    short revents = 0;
+
+    if (!s || (s->type != SOCK_UDP && s->type != SOCK_UDP_UNBOUND))
+        return NET_POLLNVAL;
+
+    if (s->type == SOCK_UDP_UNBOUND)
+        return 0;
+
+    u = (s->udp.slot < UDP_SLOTS && udp_socks[s->udp.slot].used)
+        ? &udp_socks[s->udp.slot] : udp_sock_by_port(s->udp.lport);
+    if (!u)
+        return NET_POLLERR | NET_POLLHUP;
+
+    /* A queued datagram is the UDP equivalent of readable stream data.
+     * A bound Cat-OS UDP socket has no local send queue, so sendto() can
+     * accept a datagram whenever the descriptor is valid. */
+    if ((events & NET_POLLIN) && u->n)
+        revents |= NET_POLLIN;
+    if (events & NET_POLLOUT)
+        revents |= NET_POLLOUT;
+    return revents;
+}

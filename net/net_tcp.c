@@ -203,7 +203,6 @@ socket_t *tcp_accept_socket(socket_t *s){
     }
     return NULL;
 }
-
 int tcp_set_backlog(socket_t *s,uint32_t backlog){
     if(!s||s->type!=SOCK_TCP_LISTEN||!s->tcp.conn)return -22;
     if(backlog==0)backlog=1;
@@ -283,6 +282,52 @@ static uint32_t tcp_pending_count(uint16_t port){
     }
     return n;
 }
+
+short tcp_socket_poll(socket_t *s, short events)
+{
+    tcp_conn_t *c;
+    short revents = 0;
+
+    if (!s || (s->type != SOCK_TCP_LISTEN && s->type != SOCK_TCP_ESTAB))
+        return NET_POLLNVAL;
+
+    c = s->tcp.conn;
+    if (!c)
+        return NET_POLLERR | NET_POLLHUP;
+
+    if (s->type == SOCK_TCP_LISTEN) {
+        /* Linux's inet_csk_listen_poll() reports POLLIN only when the
+         * accept queue contains a completed connection. */
+        if (c->used && c->state == TCP_LISTEN &&
+            (events & NET_POLLIN) && tcp_pending_count(c->lport))
+            revents |= NET_POLLIN;
+        return revents;
+    }
+
+    /* A reset/retired TCB is an error condition, not an endlessly writable
+     * socket.  Error and hangup are returned regardless of requested bits,
+     * as poll(2) specifies for these unmaskable conditions. */
+    if (c->dead)
+        return NET_POLLERR | NET_POLLHUP;
+    if (!c->used || c->state == TCP_CLOSED)
+        return NET_POLLHUP;
+
+    /* tcp_recv() returns queued bytes, or EOF after the peer FIN has moved
+     * the TCB to CLOSE_WAIT/LAST_ACK/TIME_WAIT. */
+    if ((events & NET_POLLIN) &&
+        (c->rxn || c->state == TCP_CLOSE_WAIT || c->state == TCP_LAST_ACK ||
+         c->state == TCP_TIME_WAIT))
+        revents |= NET_POLLIN;
+
+    /* tcp_send() consumes the local send buffer even while the peer window
+     * is closed, so local free space is the exact writable predicate here. */
+    if ((events & NET_POLLOUT) && c->state == TCP_ESTABLISHED &&
+        c->snd_used < TCP_BUF_SIZE)
+        revents |= NET_POLLOUT;
+
+    return revents;
+}
+
 void tcp_drop_pending(uint16_t port){
     for(int i=0;i<TCP_MAX_CONNS;i++){
         tcp_conn_t *c=&tcp_conns[i];
@@ -805,6 +850,7 @@ void tcp_close(socket_t *s){
             c->snd_nxt+=1;
             c->state=TCP_LAST_ACK;tcp_rto_arm(c);
         }
+        c->accepted=false;
     }
     s->type=SOCK_CLOSED;
 }

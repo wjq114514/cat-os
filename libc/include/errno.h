@@ -8,9 +8,12 @@
 #ifndef CATOS_LIBC_ERRNO_H
 #define CATOS_LIBC_ERRNO_H
 
+#define ENOENT  2  /* No such file or directory */
+#define EFAULT 14  /* Bad address */
 #define EINVAL 22 /* 无效参数 */
 #define ERANGE 34 /* 数值结果超范围 */
 
 extern int errno;
+int *__errno_location(void);
 
 #endif /* CATOS_LIBC_ERRNO_H */

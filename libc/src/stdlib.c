@@ -6,7 +6,7 @@
  *   socket 族 20..30，无 brk/mmap/sbrk。故分配器为纯用户态实现：
  *   静态池落在本文件 .bss，链接后位于 [0x400000,...) 用户合法区
  *   （user_range_ok，syscall.c：下限 0x400000）。
- *   池 64 KiB + 程序镜像（shell 实测约 9 KB）« 用户栈页 0x700000，
+ *   池 512 KiB + 程序镜像（shell 实测约 9 KB）« 用户栈页 0x700000，
  *   距栈底余量 >600 KiB，无碰撞风险。
  *
  * 算法：bump 式首适应 + 空闲链表 + 物理相邻合并。
@@ -37,7 +37,7 @@ typedef struct catos_block {
     unsigned int magic;             /* 已初始化标记（防野指针/重复释放） */
 } catos_block_t;
 
-#define CATOS_HEAP_POOL_BYTES (64u * 1024u)
+#define CATOS_HEAP_POOL_BYTES (512u * 1024u)
 #define CATOS_ALIGN           16u
 /* sizeof(catos_block_t)==12（i386）→ 头部对齐上取整到 16 */
 #define CATOS_HDR_BYTES \
@@ -295,4 +295,101 @@ unsigned long strtoul(const char *nptr, char **endptr, int base)
         return 0UL - mag; /* 无符号回绕，良定义（含 mag>LONG_MAX 情形） */
     }
     return mag;
+}
+
+/* ── random() — simple LCG (glibc constants) ── */
+static unsigned long long random_seed = 1;
+
+void srandom(unsigned int seed)
+{
+    random_seed = seed;
+}
+
+long random(void)
+{
+    random_seed = random_seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (long)(unsigned long)(random_seed >> 33);
+}
+
+int rand(void)
+{
+    return (int)(random() & 0x7FFFFFFF);
+}
+
+void srand(unsigned int seed)
+{
+    srandom(seed);
+}
+
+/* ── realpath() — simplified: just copy path ── */
+char *realpath(const char *path, char *resolved)
+{
+    if (resolved == (char *)0) return (char *)0;
+    const char *s = path;
+    char *d = resolved;
+    while (*s) *d++ = *s++;
+    *d = '\0';
+    return resolved;
+}
+
+/* ── qsort() — simple insertion sort (fine for small arrays) ── */
+void qsort(void *base, size_t nmemb, size_t size,
+           int (*compar)(const void *, const void *))
+{
+    char *b = (char *)base;
+    size_t i, j;
+    char tmp[256]; /* stack buffer for swap */
+
+    for (i = 1; i < nmemb; i++) {
+        for (j = i; j > 0; j--) {
+            if (compar(b + (j - 1) * size, b + j * size) > 0) {
+                size_t k;
+                for (k = 0; k < size && k < sizeof(tmp); k++)
+                    tmp[k] = b[(j - 1) * size + k];
+                for (k = 0; k < size && k < sizeof(tmp); k++)
+                    b[(j - 1) * size + k] = b[j * size + k];
+                for (k = 0; k < size && k < sizeof(tmp); k++)
+                    b[j * size + k] = tmp[k];
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+int atoi(const char *s)
+{
+    return (int)strtol(s, (char **)0, 10);
+}
+
+long atol(const char *s)
+{
+    return strtol(s, (char **)0, 10);
+}
+
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+              int (*compar)(const void *, const void *))
+{
+    size_t lo = 0, hi = nmemb;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const void *p = (const char *)base + mid * size;
+        int c = compar(key, p);
+        if (c == 0) return (void *)p;
+        if (c < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return (void *)0;
+}
+
+int abs(int x) { return x < 0 ? -x : x; }
+long labs(long x) { return x < 0 ? -x : x; }
+
+int system(const char *cmd) { (void)cmd; return -1; }
+int atexit(void (*func)(void)) { (void)func; return 0; }
+int on_exit(void (*func)(int, void *), void *arg) { (void)func; (void)arg; return 0; }
+
+long long strtoll(const char *nptr, char **endptr, int base)
+{
+    return (long long)strtol(nptr, endptr, base);
 }

@@ -125,5 +125,7 @@ tcp_conn_t *tcp_conn_find_listen(uint16_t port);
 void tcp_drop_pending(uint16_t port);
 void tcp_cc_init(tcp_conn_t *c);
 void tcp_tx_reset(tcp_conn_t *c);
+short tcp_socket_poll(socket_t *s, short events);
+short udp_socket_poll(socket_t *s, short events);
 
 #endif

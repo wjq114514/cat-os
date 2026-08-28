@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Patch ngx_auto_config.h for Cat-OS i686."""
+
+from pathlib import Path
+
+config = """\
+#define NGX_CONFIGURE "cat-os-crossbuild"
+#define NGX_COMPILER  "cat-os cross-gcc"
+#define NGX_HAVE_GCC_ATOMIC 1
+#define NGX_HAVE_C99_VARIADIC_MACROS 1
+#define NGX_HAVE_GCC_VARIADIC_MACROS 1
+#define NGX_HAVE_GCC_BSWAP64 1
+#undef NGX_HAVE_EPOLL
+#undef NGX_HAVE_CLEAR_EVENT
+#undef NGX_HAVE_EPOLLRDHUP
+#undef NGX_HAVE_EPOLLEXCLUSIVE
+#undef NGX_HAVE_EVENTFD
+#undef NGX_HAVE_SYS_EVENTFD_H
+#undef NGX_HAVE_SENDFILE
+#undef NGX_HAVE_SENDFILE64
+#undef NGX_HAVE_O_PATH
+#undef NGX_HAVE_O_DIRECT
+#undef NGX_HAVE_ALIGNED_DIRECTIO
+#undef NGX_HAVE_POSIX_FADVISE
+#undef NGX_HAVE_PR_SET_DUMPABLE
+#undef NGX_HAVE_PR_SET_KEEPCAPS
+#undef NGX_HAVE_CAPABILITIES
+#undef NGX_HAVE_SCHED_SETAFFINITY
+#undef NGX_HAVE_GNU_CRYPT_R
+#undef NGX_HAVE_BPF
+#undef NGX_HAVE_SO_COOKIE
+#undef NGX_HAVE_UDP_SEGMENT
+#undef NGX_HAVE_STRERRORDESC_NP
+#define NGX_HAVE_NONALIGNED 1
+#define NGX_CPU_CACHE_LINE 32
+#define NGX_KQUEUE_UDATA_T (void *)
+#define NGX_HAVE_STATFS 1
+#undef NGX_HAVE_STATVFS
+#undef NGX_HAVE_DLOPEN
+#define NGX_HAVE_SCHED_YIELD 1
+#define NGX_HAVE_REUSEPORT 1
+#undef NGX_HAVE_TRANSPARENT_PROXY
+#define NGX_HAVE_IP_BIND_ADDRESS_NO_PORT 1
+#define NGX_HAVE_IP_PKTINFO 1
+#undef NGX_HAVE_IPV6_RECVPKTINFO
+#undef NGX_HAVE_IP_MTU_DISCOVER
+#undef NGX_HAVE_IPV6_MTU_DISCOVER
+#undef NGX_HAVE_IPV6_DONTFRAG
+#define NGX_HAVE_DEFERRED_ACCEPT 1
+#define NGX_HAVE_KEEPALIVE_TUNABLE 1
+#undef NGX_HAVE_TCP_FASTOPEN
+#undef NGX_HAVE_TCP_INFO
+#define NGX_HAVE_ACCEPT4 1
+#define NGX_HAVE_UNIX_DOMAIN 1
+#define NGX_PTR_SIZE 4
+#define NGX_SIG_ATOMIC_T_SIZE 4
+#define NGX_HAVE_LITTLE_ENDIAN 1
+#define NGX_MAX_SIZE_T_VALUE 2147483647L
+#define NGX_SIZE_T_LEN (sizeof("-2147483648") - 1)
+#define NGX_MAX_OFF_T_VALUE 2147483647L
+#define NGX_OFF_T_LEN (sizeof("-2147483648") - 1)
+#define NGX_TIME_T_SIZE 4
+#define NGX_TIME_T_LEN (sizeof("-2147483648") - 1)
+#define NGX_MAX_TIME_T_VALUE 2147483647L
+#undef NGX_HAVE_INET6
+#define NGX_HAVE_PREAD 1
+#define NGX_HAVE_PWRITE 1
+#undef NGX_HAVE_PWRITEV
+#define NGX_HAVE_LOCALTIME_R 1
+#define NGX_HAVE_CLOCK_MONOTONIC 1
+#define NGX_HAVE_POSIX_MEMALIGN 1
+#define NGX_HAVE_MEMALIGN 1
+#define NGX_HAVE_MAP_ANON 1
+#undef NGX_HAVE_MAP_DEVZERO
+#undef NGX_HAVE_SYSVSHM
+#undef NGX_HAVE_POSIX_SEM
+#define NGX_HAVE_MSGHDR_MSG_CONTROL 1
+#define NGX_HAVE_FIONBIO 1
+#define NGX_HAVE_FIONREAD 1
+#define NGX_HAVE_GMTOFF 1
+#define NGX_HAVE_D_TYPE 1
+#define NGX_HAVE_SC_NPROCESSORS_ONLN 1
+#define NGX_HAVE_LEVEL1_DCACHE_LINESIZE 32
+#undef NGX_HAVE_OPENAT
+#define NGX_HAVE_GETADDRINFO 1
+#define NGX_HAVE_POLL 1
+#undef NGX_HTTP_CACHE
+#undef NGX_HTTP_UPSTREAM_ZONE
+#define NGX_PREFIX     "/mnt/fat/"
+#define NGX_CONF_PREFIX ""
+#define NGX_CONF_PATH  "CONF/NGINX.CNF"
+#define NGX_PID_PATH   "LOGS/NGINX.PID"
+#define NGX_LOCK_PATH  "LOGS/NGINX.LOCK"
+#define NGX_ERROR_LOG_PATH "LOGS/ERROR.LOG"
+#define NGX_HTTP_LOG_PATH  "LOGS/ACCESS.LOG"
+#define NGX_HTTP_CLIENT_TEMP_PATH "client_body_temp"
+#define NGX_HTTP_PROXY_TEMP_PATH  "proxy_temp"
+#define NGX_HTTP_FASTCGI_TEMP_PATH "fastcgi_temp"
+#define NGX_HTTP_UWSGI_TEMP_PATH  "uwsgi_temp"
+#define NGX_HTTP_SCGI_TEMP_PATH   "scgi_temp"
+#define NGX_SUPPRESS_WARN 1
+#undef NGX_SMP
+#define NGX_USER  "nobody"
+#define NGX_GROUP "nogroup"
+"""
+
+path = Path(__file__).resolve().parent / "nginx-1.26.2" / "objs" / "ngx_auto_config.h"
+path.write_text(config)
+print("ngx_auto_config.h patched")

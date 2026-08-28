@@ -198,12 +198,17 @@ int fat16_lookup(void *mnt,const char *path,fat16_dirent_t *out){
       if(d.attr&ATTR_VOLUME)continue;
       if(nameq(seg,d.name)){
         if(found)return -1;                        /* 不可能：防御 */
-        if(*p=='/'||*p){                           /* 还有后续段 */
-          while(*p=='/')p++;
-          if(*p){if(!(d.attr&ATTR_DIR))return -3;  /* 中间段非目录 */
-            isroot=0;dclu=d.cluster;found=1;break;}
+        {
+          int had_sep=(*p=='/');
+          const char *next=p;
+          while(*next=='/')next++;
+          if(*next){                               /* 还有后续段 */
+            if(!(d.attr&ATTR_DIR))return -3;      /* 中间段非目录 */
+            isroot=0;dclu=d.cluster;p=next;found=1;break;
+          }
+          if(had_sep&&!(d.attr&ATTR_DIR))return -3; /* 文件末尾不许 '/' */
         }
-        *out=d;return 0;                           /* 末段命中 */
+        *out=d;return 0;                           /* 末段命中（文件或目录） */
       }
     }
     if(!found)return -2;

@@ -19,7 +19,7 @@
 #include "elf.h"
 #include "shell_bin.h"
 #include "sock_abi_bin.h"   /* stage4: 内嵌 sock_abi 测试 ELF */
-#include "httpd_bin.h"      /* httpd 接线: 内嵌 ring3 HTTP 守护 ELF */
+#include "nginx_bin.h"      /* nginx: 内嵌 nginx ELF */
 
 #define VGA_W   80u
 #define VGA_H   25u
@@ -222,12 +222,12 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
 
 
 /* ===========================================================================
- * stage4: IRQ0 tick 钩子 —— 三阶段 autorun：
+ * stage4: IRQ0 tick 钩子 —— 启动阶段 autorun：
  *   phase1  boot 后延迟拉起内嵌 sock_abi 测试进程；
  *   phase2  sock_abi 流程完成后（PCB 转 PROC_TERMINATED）自动 exec 内嵌
  *           ring3 shell REPL（shell_user.elf，常驻 for(;;) 读 /dev/kbd）；
- *   phase3  shell 就绪后 exec 内嵌 httpd 守护（httpd.elf，常驻 listen :7000）。
- *           时序契约：sock_abi → 探针 → shell → httpd。
+ *   nginx 由 shell 的 `nginx` 命令显式 exec，避免网络服务在用户选择前
+ *   占用进程表和监听端口。
  *
  * 为什么放 tick 里而不是 kernel_main 顺序执行：enter_usermode() 的 ring3 探针
  * 以 jmp $ 终态驻留（usermode.c，用户锁定文件），kernel_main 中其后代码不可达；
@@ -237,8 +237,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
  *   探针     0x700000..0x701000（usermode.c iret 帧 SP=0x700FFC）
  *   sock_abi 0x702000..0x703000（CATOS_SOCKABI_*，elf.h）
  *   shell    0x704000..0x705000（下方 CATOS_SHELL_*；段本体在 0x3ff000/0x400000）
- *   httpd    0x706000..0x707000（CATOS_HTTPD_*；段本体在 0x4ff000/0x500000，
- *            与 shell 段位错开 —— 共享页目录下两常驻进程段不得重叠）
+ *   nginx    0x708000..0x718000（64KB=16 页；由 shell 命令启动）
  *
  * 调度：create_user_process 入队后由 sched_preempt_tick() 的量子轮转接管 CPU，
  * 与探针进程并存分时；sock_abi exit 后队列回落探针并即刻派发 shell；
@@ -253,17 +252,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_phys) {
 #define CATOS_SHELL_STACK_BASE 0x704000u
 #define CATOS_SHELL_USER_SP    (CATOS_SHELL_STACK_BASE + 4096u)
 
-/* httpd 接线: 守护进程专用栈布局 —— 探针 0x700000/sock_abi 0x702000/shell
- * 0x704000 之后顺延一页。elf_load_ex 对已映射 vaddr 是覆盖写 PTE，栈页重叠
- * 即踩掉先驻程序现场；httpd 与 shell 常驻并存，必须独立页。 */
-#define CATOS_HTTPD_STACK_BASE 0x706000u
-#define CATOS_HTTPD_USER_SP    (CATOS_HTTPD_STACK_BASE + 4096u)
-
 void stage4_autorun_tick(void)
 {
     static int sock_done;        /* phase1 已执行（无论成败） */
     static int shell_done;       /* phase2 已执行（一次性）   */
-    static int httpd_done;       /* phase3 已执行（一次性）   */
     static int32_t sock_pid = -1;
     uint32_t entry;
 
@@ -299,43 +291,6 @@ void stage4_autorun_tick(void)
         kput_hex32(entry);
         kputs("\n");
         return;
-    }
-
-    /* ---- phase3: shell 就绪后 exec 内嵌 httpd 守护（常驻；一次性）----
-     * ⚠️ 源码位置在 phase2 之前，但时序严格晚于 phase2：仅当 shell_done
-     * 已置位（phase2 在更早 tick 完成）才进入本块；未就绪时必须【落穿】
-     * 到下方 phase2，绝不可提前 return —— 否则 phase2 被永远挡在本函数外，
-     * shell_done 恒不置位，三阶段互相死等。
-     *
-     * httpd 链接于 0x500000、栈页 0x706000，与 shell(0x400000/0x704000)
-     * 互不重叠，单一共享页目录下可常驻并存；accept 空转靠调度量子轮转让出。
-     * 失败策略同前：仅日志不 panic，shell/httpd 互不依赖对方存活。 */
-    if (!httpd_done && shell_done) {
-        httpd_done = 1;
-
-        if (httpd_elf_len == 0u) {
-            kputs("[WARN] stage4: httpd image not linked\n");
-        } else {
-            kputs("[OK] stage4: exec embedded httpd daemon\n");
-            int segs3 = elf_load_ex(httpd_elf, httpd_elf_len, &entry,
-                                    CATOS_HTTPD_STACK_BASE);
-            if (segs3 < 0) {
-                kputs("[ERR] stage4: httpd elf_load_ex failed: ");
-                kput_sdec(segs3);
-                kputs("\n");
-            } else {
-                int pid3 = create_user_process(entry, 0u, CATOS_HTTPD_USER_SP);
-                if (pid3 < 0) {
-                    kputs("[ERR] stage4: create_user_process(httpd) failed\n");
-                } else {
-                    kputs("[OK] stage4: httpd pid=");
-                    kput_dec((uint32_t)pid3);
-                    kputs(" entry=");
-                    kput_hex32(entry);
-                    kputs(" (resident daemon, listen :7000)\n");
-                }
-            }
-        }
     }
 
     /* ---- phase2: sock_abi 流程完成后 exec 内嵌 shell REPL（一次性）---- */

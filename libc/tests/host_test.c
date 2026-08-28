@@ -335,13 +335,13 @@ static void test_fragmentation(void)
 
 static void test_exhaust_and_recover(void)
 {
-    enum { MAXP = 64 };
+    enum { MAXP = 256 };
     static unsigned char *ptrs[MAXP];
     static unsigned sizes[MAXP];
     int n = 0;
     void *big;
 
-    /* 阶段一：4000B 大块分配到耗尽（步进 4016，64KiB 池约容 16 块）；
+    /* 阶段一：4000B 大块分配到耗尽（步进 4016，512KiB 池约容 130 块）；
      * MAXP 仅作循环保险。 */
     while (n < MAXP) {
         unsigned char *p = malloc(4000);
@@ -352,7 +352,7 @@ static void test_exhaust_and_recover(void)
         sizes[n] = 4000u;
         n++;
     }
-    EXPECT(n >= 14 && n <= 18, "exhaustion point reached sanely");
+    EXPECT(n >= 120 && n < MAXP, "exhaustion point reached sanely");
 
     /* 阶段二：小块吸干尾部零料（含无分裂整块交付路径），直至真枯竭 */
     while (n < MAXP) {
@@ -364,7 +364,7 @@ static void test_exhaust_and_recover(void)
         sizes[n] = 64u;
         n++;
     }
-    EXPECT(malloc(8) == (void *)0, "pool fully exhausted");
+    EXPECT(malloc(64) == (void *)0, "pool has no 64-byte block left");
 
     for (int i = 0; i < n; i++)
         EXPECT(check(ptrs[i], sizes[i], (unsigned char)i),

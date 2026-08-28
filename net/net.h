@@ -138,6 +138,14 @@ typedef struct {
     };
 } socket_t;
 
+/* poll bit values shared by the socket layer and the syscall shim.  They
+ * intentionally match the Linux/POSIX values used by nginx's poll module. */
+#define NET_POLLIN   0x001
+#define NET_POLLOUT  0x004
+#define NET_POLLERR  0x008
+#define NET_POLLHUP  0x010
+#define NET_POLLNVAL 0x020
+
 /* ─── Public API ─── */
 void net_init(void);
 void net_poll(void);
@@ -182,6 +190,7 @@ socket_t *tcp_accept_socket(socket_t *s);
 int tcp_set_backlog(socket_t *s, uint32_t backlog);
 void tcp_abort_socket(socket_t *s);
 int net_socket_close(socket_t *s);
+short net_socket_poll(socket_t *s, short events);
 
 /* Convenience */
 void net_set_ip(uint32_t ip);

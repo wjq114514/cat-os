@@ -146,6 +146,29 @@ int net_socket_close(socket_t *s){
     }
     return -22;
 }
+
+short net_socket_poll(socket_t *s, short events)
+{
+    if (!s)
+        return NET_POLLNVAL;
+    if (s->type == SOCK_TCP_LISTEN || s->type == SOCK_TCP_ESTAB)
+        return tcp_socket_poll(s, events);
+    if (s->type == SOCK_UDP || s->type == SOCK_UDP_UNBOUND)
+        return udp_socket_poll(s, events);
+    return NET_POLLNVAL;
+}
+
+/* accept 路径 helper：返回对端 ip/port（host-order）。
+ * 仅对 SOCK_TCP_ESTAB 有意义；其他类型返回 0。 */
+void net_socket_peer(socket_t *s, uint32_t *ip, uint16_t *port)
+{
+    if (ip) *ip = 0;
+    if (port) *port = 0;
+    if (s && s->type == SOCK_TCP_ESTAB && s->tcp.conn) {
+        if (ip) *ip = s->tcp.conn->peer_ip;
+        if (port) *port = s->tcp.conn->peer_port;
+    }
+}
 socket_t *net_socket_open(uint32_t type){
     if(type==2){for(int i=0;i<UDP_SLOTS;i++)if(!udp_socks[i].used){udp_socks[i]=(udp_sock_t){0};udp_socks[i].used=true;udp_socks[i].owned=true;udp_handles[i]=(socket_t){SOCK_UDP_UNBOUND,{.udp={(uint16_t)0,(uint8_t)i,1}}};return &udp_handles[i];}return NULL;}
     if(type==1){for(int i=0;i<TCP_MAX_CONNS;i++)if(!tcp_conns[i].used){tcp_conns[i]=(tcp_conn_t){0};tcp_conns[i].used=true;tcp_conns[i].state=TCP_CLOSED;tcp_handles[i]=(socket_t){SOCK_TCP_UNBOUND,{.tcp={&tcp_conns[i]}}};return &tcp_handles[i];}return NULL;}

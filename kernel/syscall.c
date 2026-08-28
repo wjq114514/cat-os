@@ -15,6 +15,18 @@
 #include "process.h"
 #include "interrupts.h"
 
+/* 最小 sockaddr_in（accept 路径用）—— net.h 不暴露网络字节序宏，
+ * 填充时手工 swap。AF_INET=2。 */
+struct sockaddr_in {
+    uint16_t sin_family;
+    uint16_t sin_port;
+    struct in_addr { uint32_t s_addr; } sin_addr;
+    char sin_zero[8];
+};
+
+/* net.c 提供的 helper：填充 peer_ip/peer_port。 */
+extern void net_socket_peer(socket_t *s, uint32_t *ip, uint16_t *port);
+
 /* ── code2 改动范围声明（Cat-OS 并行任务，文件锁：本文件追加修改）───────
  * exec/exit/wait 进程类系统调用（nr=11..13）：
  *   - elf_load/create_user_process/exit_process 的实现在 elf.c/process.c。
@@ -51,11 +63,23 @@ extern unsigned int shell_user_elf_len __attribute__((weak));
  * weak 引用与 shell 同款模式：符号缺失时判空回落 VFS 分支，不影响链接。 */
 extern unsigned char sock_abi_elf[] __attribute__((weak));
 extern unsigned int sock_abi_elf_len __attribute__((weak));
+/* nginx: embedded nginx ELF (kernel.c include "nginx_bin.h" 后生效) */
+extern unsigned char nginx_elf[] __attribute__((weak));
+extern unsigned int nginx_elf_len __attribute__((weak));
 
 /* code2: 与 elf.h 定稿值的本地同步副本（不 include elf.h 所致；改动需双侧同步）
  *   elf.h:31 ELF_USER_STACK_SP = ELF_USER_STACK_BASE+4096 = 0x701000。
  * 栈页本身由 elf_load 内部映射（elf.c:199 map_user_page），exec 无需重复映射。 */
 #define CATOS_EXEC_USER_STACK_SP 0x701000u
+
+/* nginx 以单进程事件循环运行，但其启动阶段的配置/模块对象已经超过
+ * 默认一页用户栈；同时该进程不能覆盖探针(0x700000)或 shell(0x704000)
+ * 的栈页。与 kernel.c 的 stage4 布局保持一致，sys_exec(/bin/nginx)
+ * 使用独立的 64 KiB 用户栈。 */
+#define CATOS_NGINX_STACK_BASE  0x708000u
+#define CATOS_NGINX_STACK_PAGES 16u
+#define CATOS_NGINX_STACK_TOP   (CATOS_NGINX_STACK_BASE + CATOS_NGINX_STACK_PAGES * 4096u)
+#define CATOS_NGINX_USER_SP     CATOS_NGINX_STACK_TOP
 
 /* ── M2: 补充错误码常量 ──────────────────────────────────────────────
  * 数值依据 linux-ref/include/uapi/asm-generic/errno.h：
@@ -132,7 +156,7 @@ static int sys_streq(const char *a, const char *b)
 /* exec 镜像暂存缓冲（内核 BSS）：当前 devfs 无常规文件可读，缓冲上限按
  * shell ELF 实测 9KB 留 4x 余量；未来接入块设备 fs 后建议改为按 inode 尺寸
  * 分配。TODO(code2): 接入真实 fs 后评估动态分配替代静态缓冲。 */
-#define CATOS_EXEC_IMG_MAX 32768u
+#define CATOS_EXEC_IMG_MAX 524288u
 static uint8_t exec_img_buf[CATOS_EXEC_IMG_MAX];
 
 /* exec(path)：
@@ -165,6 +189,11 @@ static int sys_exec(const uint32_t *a)
         image = sock_abi_elf;
         ilen = sock_abi_elf_len;
     }
+    if (&nginx_elf != (void *)0 && nginx_elf_len > 0u &&
+        sys_streq(path, "/bin/nginx")) {
+        image = nginx_elf;
+        ilen = nginx_elf_len;
+    }
     if (image == (void *)0) {
         int fd = vfs_open(path, O_RDONLY); /* O_RDONLY=0，vfs.h:5 */
         if (fd < 0) return fd;
@@ -183,15 +212,33 @@ static int sys_exec(const uint32_t *a)
     }
 
     uint32_t entry = 0u;
-    int segs = elf_load(image, ilen, &entry);
+    int is_nginx = sys_streq(path, "/bin/nginx");
+    int segs = is_nginx
+        ? elf_load_ex(image, ilen, &entry, CATOS_NGINX_STACK_BASE)
+        : elf_load(image, ilen, &entry);
     if (segs < 0) return segs;
+
+    if (is_nginx) {
+        /* elf_load_ex maps the first stack page. Map the remaining pages
+         * before publishing the process, so nginx never runs on an
+         * incompletely provisioned stack. */
+        for (uintptr_t p = CATOS_NGINX_STACK_BASE + 4096u;
+             p < CATOS_NGINX_STACK_TOP; p += 4096u) {
+            uintptr_t phys = pmm_alloc_page();
+            if (!phys) return -CATOS_ENOMEM;
+            if (map_page(p, phys, _PAGE_PRESENT | _PAGE_RW | _PAGE_USER) != 0) {
+                pmm_free_page(phys);
+                return -CATOS_ENOMEM;
+            }
+        }
+    }
     /* page_dir=0：共享内核页目录（elf.h 注释确认 paging.c 未暴露独立地址
      * 空间 API，映射进当前目录低半区）。
      * 栈：stage4 起按镜像选择栈底 —— sock_abi 用独立栈 0x702000 与探针/shell
      * 并存（elf_load_ex 参数化栈底），其余沿用任务书默认 0x700000。
      * 注：本分支 image 已知来源，直接按 path 分派 SP，无需二次解析。 */
     {
-        uint32_t sp = CATOS_EXEC_USER_STACK_SP;
+        uint32_t sp = is_nginx ? CATOS_NGINX_USER_SP : CATOS_EXEC_USER_STACK_SP;
         if (sys_streq(path, "/bin/sock_abi"))
             sp = CATOS_SOCKABI_USER_SP;
         return create_user_process(entry, 0u, sp);
@@ -414,22 +461,14 @@ static int sys_clock_gettime(const uint32_t *a){
 static short poll_check_fd(int fd, short events){
     short re=0;
     socket_t *s=sock_fd(fd);
-    if(s){
-        if(s->type==SOCK_TCP_ESTAB){
-            if(events&CATOS_POLLIN) re|=CATOS_POLLIN;
-            if(events&CATOS_POLLOUT) re|=CATOS_POLLOUT;
-        }else if(s->type==SOCK_TCP_LISTEN){
-            if(events&CATOS_POLLIN) re|=CATOS_POLLIN;
-        }
-        return re;
-    }
+    if(s)return net_socket_poll(s,events);
     if(vfs_fd_readable(fd)){
         if(events&CATOS_POLLIN) re|=CATOS_POLLIN;
     }
     if(vfs_fd_writable(fd)){
         if(events&CATOS_POLLOUT) re|=CATOS_POLLOUT;
     }
-    if(!re&&!vfs_fd_exists(fd))re=CATOS_POLLERR;
+    if(!re&&!vfs_fd_exists(fd))re=CATOS_POLLNVAL;
     return re;
 }
 
@@ -438,10 +477,12 @@ static int sys_poll(const uint32_t *a){
     uint32_t nfds=a[1];
     int32_t timeout_ms=(int32_t)a[2];
     if(nfds==0u)return 0;
+    if(nfds>0xFFFFFFFFu/(uint32_t)sizeof(struct catos_pollfd))return -CATOS_EINVAL;
     uint32_t size=nfds*sizeof(struct catos_pollfd);
     if(bad_user(ufds,size,1))return -CATOS_EFAULT;
     uint32_t start_tick=ticks;
-    uint32_t timeout_ticks=(timeout_ms<0)?0xFFFFFFFFu:((uint32_t)timeout_ms/10u);
+    uint32_t timeout_ticks=(timeout_ms<0)?0xFFFFFFFFu:
+                           ((uint32_t)timeout_ms+9u)/10u;
     for(;;){
         int ready=0;
         for(uint32_t i=0;i<nfds;i++){
@@ -493,7 +534,9 @@ static int sys_mmap2(const uint32_t *a){
 static int sys_munmap(const uint32_t *a){(void)a;return 0;}
 
 /* dup2(oldfd, newfd) — nr=63 ───────────────────────────────────────── */
-static int sys_dup2(const uint32_t *a){return vfs_dup2((int)a[0],(int)a[1]);}
+static int sys_dup2(const uint32_t *a){
+    return vfs_dup2((int)a[0],(int)a[1]);
+}
 
 /* fcntl(fd, cmd, arg) — nr=55 ──────────────────────────────────────── */
 static int sys_fcntl(const uint32_t *a){return vfs_fcntl((int)a[0],(int)a[1],(int)a[2]);}
@@ -507,8 +550,60 @@ static int sys_fstat(const uint32_t *a){return vfs_fstat((int)a[0],(void*)(uintp
 /* lseek(fd, offset, whence) — nr=19 ────────────────────────────────── */
 static int sys_lseek(const uint32_t *a){return vfs_lseek((int)a[0],(int32_t)a[1],(int)a[2]);}
 
-/* writev(fd, iovec, iovcnt) — nr=146 ───────────────────────────────── */
-static int sys_writev(const uint32_t *a){return vfs_writev((int)a[0],(void*)(uintptr_t)a[1],(int)a[2]);}
+/* writev(fd, iovec, iovcnt) — nr=146 ─────────────────────────────────
+ *
+ * Linux's writev enters the file operation with an imported/validated iovec
+ * (linux-ref/fs/read_write.c:vfs_writev). Cat-OS's VFS implementation already
+ * provides that behavior for regular files, but FILE_SOCKET is deliberately
+ * rejected by vfs_write(). nginx uses writev() for response headers/body, so
+ * route TCP descriptors to tcp_send() here and preserve its short-write and
+ * EAGAIN semantics. The whole user vector is validated before the first send;
+ * this avoids accepting a prefix and then discovering a bad later vector.
+ */
+struct catos_sys_iovec { void *iov_base; uint32_t iov_len; };
+#define CATOS_SYS_UIO_MAXIOV 16u
+
+static int sys_writev(const uint32_t *a)
+{
+    int fd = (int)a[0];
+    uint32_t raw_iovcnt = a[2];
+    socket_t *s = sock_fd(fd);
+
+    if (!s)
+        return vfs_writev(fd, (void *)(uintptr_t)a[1], (int)raw_iovcnt);
+    if (raw_iovcnt > CATOS_SYS_UIO_MAXIOV)
+        return -CATOS_EINVAL;
+    if (s->type != SOCK_TCP_ESTAB)
+        return -CATOS_ENOTCONN;
+
+    struct catos_sys_iovec iov[CATOS_SYS_UIO_MAXIOV];
+    if (raw_iovcnt != 0u &&
+        bad_user((void *)(uintptr_t)a[1],
+                 raw_iovcnt * (uint32_t)sizeof(iov[0]), 0))
+        return -CATOS_EFAULT;
+
+    for (uint32_t i = 0; i < raw_iovcnt; ++i) {
+        memcpy(&iov[i], (const void *)(uintptr_t)a[1] +
+               i * sizeof(iov[0]), sizeof(iov[0]));
+        if (iov[i].iov_len != 0u &&
+            bad_user(iov[i].iov_base, iov[i].iov_len, 0))
+            return -CATOS_EFAULT;
+    }
+
+    uint32_t total = 0u;
+    for (uint32_t i = 0; i < raw_iovcnt; ++i) {
+        if (iov[i].iov_len == 0u)
+            continue;
+        int r = sock_xlate(tcp_send(s, (const uint8_t *)iov[i].iov_base,
+                                    iov[i].iov_len), -CATOS_EAGAIN);
+        if (r < 0)
+            return total != 0u ? (int)total : r;
+        total += (uint32_t)r;
+        if ((uint32_t)r < iov[i].iov_len)
+            break;
+    }
+    return (int)total;
+}
 
 static int32_t syscall_dispatch_nr(uint32_t nr,uint32_t n,const uint32_t *a){
     (void)n;if(!a)return -CATOS_EFAULT; /* 防御性守卫：现调用点 a 恒为内核栈数组非空 */
@@ -538,14 +633,16 @@ static int32_t syscall_dispatch_nr(uint32_t nr,uint32_t n,const uint32_t *a){
     case CATOS_SYS_SOCKET:{
         if(a[0]!=CATOS_SOCK_DGRAM&&a[0]!=CATOS_SOCK_STREAM)return -CATOS_EINVAL;
         socket_t *s=net_socket_open(a[0]);if(!s)return -CATOS_EMFILE;
-        int fd=vfs_socket_install(s);if(fd<0){net_socket_close(s);return fd;}return fd;
+        int fd=vfs_socket_install(s);if(fd<0){net_socket_close(s);return fd;}
+        return fd;
     }
     /* bind(fd,port)：a[1]=port（house ABI 无 sockaddr 结构，IPv4 隐含）。
      * net_socket_bind（net.c:497）契约：port==0 或类型不符 → -EINVAL(-22)；
      * 端口冲突/槽位占用 → -EADDRINUSE(-98)。映射正确，原样透传。
      * 分歧注记：Linux bind(port=0) 表示请求自动分配端口（最终 inet_autobind），
      * 此处为 -EINVAL —— 差异已知，归属 net.c 语义决策，不在本次范围。 */
-    case CATOS_SYS_BIND:{socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);return net_socket_bind(s,(uint16_t)a[1]);}
+    case CATOS_SYS_BIND:{socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);
+        return net_socket_bind(s,(uint16_t)a[1]);}
     /* listen(fd,backlog)：L1 语义缺口 —— 「未 bind 先 listen」当前得到 -EINVAL。
      * 根因定位（只读核实）：net.c tcp_set_backlog（net.c:535；预检报告所写
      * net.c:489 因 code2 工作区未提交改动而行号漂移）要求
@@ -564,7 +661,32 @@ static int32_t syscall_dispatch_nr(uint32_t nr,uint32_t n,const uint32_t *a){
      * 非 LISTEN 型 socket → -EINVAL（与 Linux 一致："socket is not listening"）；
      * 就绪队列为空 → -EAGAIN（accept 为非阻塞轮询语义；Linux 在 O_NONBLOCK 下
      * 同样返回 EAGAIN）。fd 安装失败 → 透传并以 tcp_abort_socket 回收连接。 */
-    case CATOS_SYS_ACCEPT:{socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);if(s->type!=SOCK_TCP_LISTEN)return -CATOS_EINVAL;socket_t *nxt=tcp_accept_socket(s);if(!nxt)return -CATOS_EAGAIN;int fd=vfs_socket_install(nxt);if(fd<0){tcp_abort_socket(nxt);return fd;}return fd;}
+    case CATOS_SYS_ACCEPT:{socket_t *s=sock_fd((int)a[0]);if(!s)return sock_err((int)a[0]);if(s->type!=SOCK_TCP_LISTEN)return -CATOS_EINVAL;socket_t *nxt=tcp_accept_socket(s);
+        if(!nxt)return -CATOS_EAGAIN;
+        int fd=vfs_socket_install(nxt);if(fd<0){tcp_abort_socket(nxt);return fd;}
+        /* 填充远端地址（nginx 路径必需）。a[1]=用户 sockaddr_in 指针 a[2]=addrlen 指针。
+         * 失败则 EFAULT 但连接已成功（fd 已分配），仅丢失地址信息。 */
+        if(a[1]!=0u){
+            struct sockaddr_in sa;
+            memset(&sa,0,sizeof(sa));
+            sa.sin_family=2; /* AF_INET */
+            if(nxt->type==SOCK_TCP_ESTAB){
+                uint32_t ip=0;uint16_t port=0;
+                net_socket_peer(nxt,&ip,&port);
+                sa.sin_addr.s_addr=((ip>>24)&0xffu)|((ip>>8)&0xff00u)|((ip<<8)&0xff0000u)|((ip<<24)&0xff000000u);
+                sa.sin_port=((port>>8)&0xffu)|((port<<8)&0xff00u);
+            }
+            unsigned alen=16u;
+            if(a[2]!=0u&&!bad_user((void*)a[2],sizeof(unsigned),1)){
+                unsigned user_alen=*(volatile unsigned*)a[2];
+                if(user_alen<alen)alen=user_alen;
+                *(volatile unsigned*)a[2]=sizeof(struct sockaddr_in);
+            }
+            if(!bad_user((void*)a[1],alen,1)){
+                memcpy((void*)a[1],&sa,alen);
+            }
+        }
+        return fd;}
     /* sendto(fd,buf,len,dst_ip,dst_port)：
      *   a[0]=fd a[1]=buf a[2]=len a[3]=dst_ip(uint32) a[4]=dst_port(uint16)。
      * 与 Linux 六参布局（flags/addr/addrlen）不同：int 0x80 仅 5 个传参寄存器，
@@ -707,5 +829,6 @@ static int32_t syscall_dispatch_nr(uint32_t nr,uint32_t n,const uint32_t *a){
  * 过投递器，满足「投递点=syscall 返回前」契约（interrupts.c 仅写回 eax）。 */
 int32_t syscall_dispatch(uint32_t nr,uint32_t n,const uint32_t *a)
 {
+    (void)n;
     return syscall_signal_deliver(syscall_dispatch_nr(nr,n,a));
 }

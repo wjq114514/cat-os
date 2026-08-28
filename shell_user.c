@@ -35,6 +35,17 @@ static int32_t syscall3(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2)
                      : "memory");
     return ret;
 }
+static int32_t syscall5(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
+                        uint32_t a3, uint32_t a4)
+{
+    int32_t ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"(nr), "b"(a0), "c"(a1), "d"(a2),
+                       "S"(a3), "D"(a4)
+                     : "memory");
+    return ret;
+}
 static int32_t sys_read(uint32_t fd, void *buf, uint32_t len)
 { return syscall3(0u, fd, (uint32_t)buf, len); }
 static int32_t sys_write(uint32_t fd, const void *buf, uint32_t len)
@@ -54,6 +65,9 @@ static int32_t sys_net_stats(uint32_t *buf, uint32_t cap)
 { return syscall3(CATOS_SYS_NET_STATS, (uint32_t)buf, cap, 0u); }
 static int32_t sys_resolve(const char *name, uint32_t *out_ip)
 { return syscall3(CATOS_SYS_RESOLVE, (uint32_t)name, (uint32_t)out_ip, 0u); }
+static int32_t sys_ping(const char *target, char *out, uint32_t out_len,
+                        uint32_t id, uint32_t seq)
+{ return syscall5(29u, (uint32_t)target, (uint32_t)out, out_len, id, seq); }
 
 /* ── 常量 ────────────────────────────────────────────────────────────── */
 #define SHELL_LINE_MAX  256u
@@ -137,7 +151,7 @@ static const char *hist_down(void){
  * 内置命令名列表 + /mnt/fat/ 路径补全。
  * 仅在光标位于行尾时触发（简化实现）。 */
 static const char *const builtins[]={
-    "echo","help","netstat","resolve","exec","exit","ls","cat","history",
+    "echo","help","netstat","resolve","ping","nginx","exec","exit","ls","cat","history",
     (const char*)0
 };
 static int try_complete(char *buf,uint32_t len,uint32_t *cursor){
@@ -409,6 +423,8 @@ static void cmd_help(void){
     print("  help             list commands\n");
     print("  netstat          show network counters\n");
     print("  resolve <host>   DNS resolve\n");
+    print("  ping <IPv4>      send one ICMP echo request\n");
+    print("  nginx            start embedded nginx on :8080\n");
     print("  exec <path>      run ELF32 program\n");
     print("  ls <path>        list FAT16 directory\n");
     print("  cat <path>       print file contents\n");
@@ -460,6 +476,31 @@ static void cmd_resolve(const char *host){
     int32_t r=sys_resolve(host,&ip);
     if(r==0){print(host);print(" -> ");print_ip(ip);print_char('\n');return;}
     print("resolve: ");print(host);print(" failed (errno ");print_i32(r);print(")\n");
+}
+
+/* ping */
+static void cmd_ping(const char *args){
+    char *rest=(char*)args;
+    char *host=next_token(&rest);
+    if(!host||*host=='\0'){print("ping: usage: ping <IPv4>\n");return;}
+    static char out[128];
+    static uint32_t seq;
+    int32_t r=sys_ping(host,out,sizeof(out)-1u,0xCA70u,seq++);
+    if(r<0){print("ping: failed (errno ");print_i32(-r);print(")\n");return;}
+    print_n(out,(uint32_t)r);
+}
+
+/* nginx */
+static void cmd_nginx(const char *args){
+    (void)args;
+    static int32_t nginx_pid=-1;
+    if(nginx_pid>0){
+        print("nginx: already started (pid=");print_i32(nginx_pid);print(")\n");
+        return;
+    }
+    nginx_pid=sys_exec("/bin/nginx");
+    if(nginx_pid<0){print("nginx: failed (errno ");print_i32(-nginx_pid);print(")\n");return;}
+    print("nginx: started (pid=");print_i32(nginx_pid);print(")\n");
 }
 
 /* exec */
@@ -524,6 +565,8 @@ static void shell_repl(void){
         else if(kstrcmp(cmd,"help")==0)   cmd_help();
         else if(kstrcmp(cmd,"netstat")==0) cmd_netstat();
         else if(kstrcmp(cmd,"resolve")==0) cmd_resolve(rest);
+        else if(kstrcmp(cmd,"ping")==0)    cmd_ping(rest);
+        else if(kstrcmp(cmd,"nginx")==0)   cmd_nginx(rest);
         else if(kstrcmp(cmd,"exec")==0)    cmd_exec(rest);
         else if(kstrcmp(cmd,"ls")==0)      cmd_ls(rest);
         else if(kstrcmp(cmd,"cat")==0)     cmd_cat(rest);

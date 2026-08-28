@@ -32,7 +32,7 @@ static int conwrite(struct file*f,const void*b,uint32_t n){(void)f;const char*p=
  *      注入键序依赖「探针 kbd 握手先于 shell 独占读」的时序契约。
  * 不选「后开者拒绝」（会杀死探针握手——stdin fd0 先开）与「每读者队列」
  * （需 file_t 侧 per-fd 缓冲 + 派发策略，超出病灶最小集）。 */
-static int kread(struct file*f,void*b,uint32_t n){(void)f;uint8_t*p=b;uint32_t i=0;if(!n)return 0;int c=keyboard_getchar_blocking(KBD_BLOCK_TIMEOUT_MS);if(c<0)return 0;p[i++]=(uint8_t)c;while(i<n){c=keyboard_getchar();if(c<0)break;p[i++]=(uint8_t)c;}return (int)i;}
+static int kread(struct file*f,void*b,uint32_t n){uint8_t*p=b;uint32_t i=0;if(!n)return 0;int c=(f&&((f->flags&O_NONBLOCK)!=0))?keyboard_getchar():keyboard_getchar_blocking(KBD_BLOCK_TIMEOUT_MS);if(c<0)return 0;p[i++]=(uint8_t)c;while(i<n){c=keyboard_getchar();if(c<0)break;p[i++]=(uint8_t)c;}return (int)i;}
 static int zread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++)((uint8_t*)b)[i]=0;return n;} static int urread(struct file*f,void*b,uint32_t n){(void)f;for(uint32_t i=0;i<n;i++){rnd=rnd*1664525u+1013904223u;((uint8_t*)b)[i]=(uint8_t)(rnd>>24);}return n;}
 static const file_ops_t noops={nullread,nullwrite,0},conops={0,conwrite,0},kop={kread,0,0},zops={zread,0,0},uops={urread,0,0};
 static inode_t nodes[]={{VFS_CHR,0,"/dev/null",&noops,0},{VFS_CHR,0,"/dev/console",&conops,0},{VFS_CHR,0,"/dev/kbd",&kop,0},{VFS_CHR,0,"/dev/zero",&zops,0},{VFS_CHR,0,"/dev/urandom",&uops,0}};
@@ -203,6 +203,7 @@ struct catos_stat {
 };
 #define S_IFCHR  0x2000u
 #define S_IFREG  0x8000u
+#define S_IFDIR  0x4000u
 #define S_IFSOCK 0xC000u
 
 int vfs_fstat(int fd, void *user_stat){
@@ -214,8 +215,14 @@ int vfs_fstat(int fd, void *user_stat){
         st.st_mode=S_IFSOCK;
     }else if(f->kind==FILE_VFS&&f->inode){
         if(f->inode->type==VFS_CHR) st.st_mode=S_IFCHR;
+        else if(f->private&&(((fatfh_t*)f->private)->de.attr&ATTR_DIR))
+            st.st_mode=S_IFDIR;
         else st.st_mode=S_IFREG;
         st.st_size=f->inode->size;
+        /* FAT 只读挂载：模板 inode(fattpl) size 恒 0，真实大小在 dirent。
+         * nginx 配置读取以 fstat.size 做读入门禁（ngx_conf_file.c:535），
+         * 传 0 会导致「空配置」假象。private= fatfh 句柄时以 de.size 为准。 */
+        if(st.st_size==0u&&f->private)st.st_size=((fatfh_t*)f->private)->de.size;
         st.st_dev=0;
     }
     st.st_nlink=1;

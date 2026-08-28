@@ -43,7 +43,11 @@ void enter_usermode(void){
      * + bytes then done. Exhausted retries or error prints
      * "kbd NOT_TESTED (3 tries)\n". No shell, no blocking read,
      * no busy-loop. */
-    syscall3(&p,5,PATH_KBD,0,0);steax(&p,KBD_FD);
+    /* The probe is a best-effort observer and must not hold the shared
+     * keyboard reader while the shell becomes interactive.  O_NONBLOCK is
+     * Linux's 1<<11 flag (linux-ref/include/uapi/asm-generic/fcntl.h); the
+     * shell's fd 0 remains a normal blocking descriptor. */
+    syscall3(&p,5,PATH_KBD,0x800,0);steax(&p,KBD_FD);
     syscall3(&p,5,PATH_CONSOLE,1,0);steax(&p,FD);
     v[0]=FD;v[1]=MSG_KBDOPEN;v[2]=21;v[3]=0;v[4]=0;
     syscall5(&p,1,v,1);

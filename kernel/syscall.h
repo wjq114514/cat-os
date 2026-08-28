@@ -65,6 +65,8 @@
 #define CATOS_POLLIN   0x001
 #define CATOS_POLLOUT  0x004
 #define CATOS_POLLERR  0x008
+#define CATOS_POLLHUP  0x010
+#define CATOS_POLLNVAL 0x020
 struct catos_pollfd { int fd; short events; short revents; };
 void syscall_init(void);
 int32_t syscall_dispatch(uint32_t,uint32_t,const uint32_t *);

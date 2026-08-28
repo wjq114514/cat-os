@@ -5,6 +5,7 @@
 #define O_RDONLY 0
 #define O_WRONLY 1
 #define O_RDWR 2
+#define O_NONBLOCK 0x800
 typedef enum { VFS_REG, VFS_CHR, VFS_DIR, VFS_BLK } inode_type_t;
 struct inode; struct file;
 typedef enum { FILE_VFS, FILE_SOCKET } file_kind_t;

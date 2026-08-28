@@ -66,4 +66,24 @@ int putenv(char *string);
 long strtol(const char *nptr, char **endptr, int base);
 unsigned long strtoul(const char *nptr, char **endptr, int base);
 
+int atoi(const char *s);
+long atol(const char *s);
+long long strtoll(const char *nptr, char **endptr, int base);
+int abs(int x);
+long labs(long x);
+
+void qsort(void *base, size_t nmemb, size_t size,
+           int (*compar)(const void *, const void *));
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+              int (*compar)(const void *, const void *));
+
+void srandom(unsigned int seed);
+long random(void);
+int rand(void);
+void srand(unsigned int seed);
+
+#define RAND_MAX 2147483647
+
+char *realpath(const char *path, char *resolved);
+
 #endif /* CATOS_LIBC_STDLIB_H */
