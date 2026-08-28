@@ -5,6 +5,8 @@
 
 - 仓库：`/home/wjqawa/osdev`，入库基线 HEAD=`6796bd6`（net: harden tcp sack edge cases）
 - 本目录只新增文件，未修改仓库任何现有文件（net.c/usermode.c/kernel.c 等均未触碰）
+- 当前 nginx 专项验收不属于 `net_suite.py`：nginx 1.26.2 的单进程静态 HTTP
+  已在实现基线 `be876b6` 对应的 r4 和独立 fresh QEMU 中通过；证据见下方「nginx 专项验收」。
 
 ## 文件清单
 
@@ -42,6 +44,29 @@ python3 ./net_suite.py --build-dhcp-scale-iso .. /tmp/dhcp_scale.iso
 ./run_all.sh                       # 产物默认在 /tmp/catos-tests-run-<ts>/
 CATOS_INJECT_CASES="sack_t1 rst_l1" ./run_all.sh   # 自选注入用例
 ```
+
+## nginx 专项验收（独立于 net_suite）
+
+nginx 使用独立的 FAT16 配置盘和 shell/QMP 驱动流程，不混入网络套件的断言总数。
+构建入口是仓库根目录的 `./build-nginx.sh`，随后由 Makefile 生成 `os.iso`；运行时
+配置、端口和 shell 命令见根目录 `README.md` 的「nginx 移植」一节。
+
+2026-08-28 fresh QEMU r4 以及独立复验的真实证据：
+
+- 结果：`/tmp/catos-nginx-rebuild-20260828r4.result`
+- 串口：`/tmp/catos-nginx-rebuild-20260828r4.serial`
+- 独立复验结果：`/tmp/catos-nginx-doc-verify.result`
+- 独立复验串口：`/tmp/catos-nginx-doc-verify.serial`
+- 结论：两次均为 `QEMU final rc=0`、`OVERALL: PASS`；覆盖 FAT16 挂载、shell `nginx` 启动、
+  HTTP `/` 200、`/missing` 404、重复启动保护、`netstat`、`ping`；r4 另外做了临时诊断扫描。
+
+独立驱动等待 `kbd handshake: ready` 后才注入命令；`keyboard IRQ1 active` 只代表键盘
+驱动初始化，不能作为 shell 已可读的就绪标记。该驱动还在串口中记录了
+`SUMMARY[user_sock_abi]: passed=85 failed=0 xfail=0 skip=4` 和 `USR_SOCK_ABI VERDICT rc=0`。
+
+该专项使用 `.result` + `.serial` 作为双重证据；`*.json` 规则仅适用于本目录的
+`net_suite.py` 套件。nginx 的 master/worker、upstream、可写日志、epoll 和高并发
+仍未被此专项宣称覆盖。
 
 ### qemu_run.sh 退出码
 `0`=成功（含 cmd rc=0）；`2`=cmd 断言失败；`3`=QEMU 启动失败；`4`=引导超时；`64`=用法错误。
@@ -89,16 +114,18 @@ C3/C7/D1 为该文附注中的存目编号。M1/M3/M4/L3/L4/L5/L7 在 SOCKET_API
 > 的原型脚本原居 /tmp 已随清理丢失，2026-08-25 以上述三个用例按现框架范式回填入库；
 > 断言全部对照工作树 net.c/net.h 实际行为书写（来源行号见各用例 docstring）。
 
-### 尚未接线（NOT_TESTED，归属 ring3/shell 方向任务）
+### 尚未接线（NOT_TESTED：旧 ring3 socket 骨架；不含已接入的 stage4 测试和 nginx 专项）
 
 `/tmp/cat-os-tests/user_ring3_socktest.c`（P01–P09/H1P/H1B/H2P… int 0x80 直调骨架，
 双语义模式 `-DSEMANTICS_CURRENT=1/0`）覆盖以下缺口的**逐条**断言，待其接入 ring3
-入口后在原处回填实测证据：
+入口后在原处回填实测证据。它与仓库内已由 stage4 自动拉起的
+`tests/user_sock_abi/user_sock_abi_test.c` 是两套不同资产；后者的当前 fresh 串口结果
+为 85 PASS / 0 FAIL / 4 skip，但不替代下表旧骨架的逐条接线工作：
 
 | 缺口 | 语义 | 骨架探针 |
 |---|---|---|
 | H1 | 用户指针非法族须 EFAULT、合法指针不得误报 | H1P/H1B |
-| H2（同源 D1） | TCP bind 同端口：现状静默「附着」返 0，目标 EADDRINUSE | H2P |
+| H2（同源 D1） | TCP bind 同端口：当前返回 `EADDRINUSE`，不再静默「附着」；H2P 保留为历史目标语义探针 | H2P |
 | M2 | 底层 -1 哨兵混叠 EMSGSIZE/EADDRNOTAVAIL/EAGAIN；UDP 上限预检；UNBOUND sendto 显式拒绝 | M2 组 |
 | L1 | listen-before-bind 应 `-EINVAL`（缺 autobind） | L1 组 |
 | L2 | fd 分配策略（0-2 std 流占用+最低空闲+kind 隔离，code7 已落地） | P01–P09 回归 |

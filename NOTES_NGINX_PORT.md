@@ -1,5 +1,10 @@
 # Cat-OS nginx 移植笔记
 
+> **当前状态（2026-08-28）**：静态 HTTP 最小闭环已在 fresh QEMU 中通过，相关
+> 实现已合入 `be876b6`（`port nginx to Cat-OS`）并推送到 `origin/master`。
+> 本笔记中的 PASS 均绑定下方 r4 以及独立复验的串口和结果文件；它不等价于完整
+> nginx master/worker、upstream 或生产级 POSIX 兼容。
+
 ## 已完成的关键修复
 
 ### 1. dup2() 桩修复 (libc/src/posix_stubs.c)
@@ -38,7 +43,7 @@
 - **问题**: `ev->index` 初始值为垃圾值 (`-791621424`)，导致 poll 不能正确添加新 fd
 - **修复**: 在 `ngx_poll_add_event` 中强制重置 partner 的 invalid index
 
-## 当前状态 (截至 2026-08-28 fresh QEMU r4)
+## 当前状态 (截至 2026-08-28 fresh QEMU r4 + 独立复验)
 
 ✅ shell 启动内嵌 nginx ELF
 ✅ FAT16 配置盘挂载并读取 `/mnt/fat/CONF/NGINX.CNF`
@@ -50,9 +55,20 @@
 ✅ 重复执行 `nginx` 返回 `already started`
 ✅ 串口无 `DBG`、`[SC]`、`[PT]`、`[SC-DUP2]`、`[TRAP]`、`[SMP]` 临时诊断标记
 
+shell 当前支持的最小操作面为：`nginx` 启动嵌入式 nginx（重复执行有保护）、
+`netstat` 查看网络计数器、`ping <IPv4>` 发出一次 ICMP Echo 并输出结果；其它
+shell 命令仍按原有最小用户态实现提供。
+
 最终 fresh 证据：
 - 串口：`/tmp/catos-nginx-rebuild-20260828r4.serial`
 - 判定：`/tmp/catos-nginx-rebuild-20260828r4.result`（`OVERALL: PASS`）
+
+独立复验（同一实现基线，host `18100 -> guest:8080`）：
+- 串口：`/tmp/catos-nginx-doc-verify.serial`
+- 判定：`/tmp/catos-nginx-doc-verify.result`（`QEMU final rc=0`、`OVERALL: PASS`）
+- 覆盖：shell `nginx` 启动、HTTP `/` 200、`/missing` 404、`netstat`、`ping` 和重复启动保护。
+- 驱动注意：必须等待 `kbd handshake: ready`；`keyboard IRQ1 active` 仅表示键盘驱动已初始化，
+  过早注入会得到真实失败而不是有效 shell 验收。
 
 ## 构建/测试命令
 
@@ -63,6 +79,9 @@ make libc-clean && make libc-test
 ./build-nginx.sh
 # 构建内核和 ISO
 make clean && make -j2
+
+# 独立 fresh QEMU shell/HTTP 复验（脚本和产物均在 /tmp）
+python3 /tmp/catos-nginx-doc-verify.py
 
 # 测试
 qemu-system-x86_64 -cdrom os.iso -m 128M -display none \
@@ -91,4 +110,6 @@ qemu-system-x86_64 -cdrom os.iso -m 128M -display none \
 ## 当前边界
 
 1. nginx 当前按 `master_process off` 单进程模式运行；master/worker、fork 和信号生命周期不在本次最小闭环内。
-2. HTTP 服务启动后需要等待其事件循环完成初始化；最终验收脚本对 guest:8080 使用有界重试。
+2. 当前配置只启用静态 HTTP、`poll` 和 FAT16 只读文件路径；upstream/connect、
+   epoll、可写日志、完整 signal 和高并发容量仍未承诺。
+3. HTTP 服务启动后需要等待其事件循环完成初始化；最终验收脚本对 guest:8080 使用有界重试。

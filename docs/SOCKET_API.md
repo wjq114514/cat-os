@@ -1,7 +1,8 @@
 # Cat-OS Socket API 现状文档
 
-> **版本说明**：本文档基于 **HEAD=`0d4b58342a1350d81eef82eb128c0c6fcd9df27c`** **+ 工作区未提交变更（`net.c` SACK/OOO/scoreboard 加固改动，`git diff net.c` 共 80 行级别变更）** 整理。文中 SACK 块解析、OOO 队列整理、scoreboard 重判定等行为均属**未提交工作区内容**。
-> **行号基准**：`文件:行号` 指**当前工作区文件内容**；源码内部注释引用的旧行号可能因并行改动漂移，以本文实测行号为准。
+> **版本说明**：本文主体是 2026-08-25/26 的 socket API 快照；当前实现基线为 **`be876b6`**。当前容量与 nginx 依赖关系已按 `net/net.h`、`net/net_tcp.c` 和 `docs/TEST_MATRIX.md` 的后续实证回填。
+> **当前验证边界（2026-08-28）**：nginx r4 与独立 fresh QEMU 复验已通过 `poll`/TCP 被动服务/静态 FAT16 文件读取；本文未把该专项扩展为完整 socket ABI 或完整 nginx 特性的 PASS。当前主线还修正了同端口 bind 冲突和 TCP 满缓冲返回值，历史段落中的旧行为以本注记为准。
+> **行号基准**：`文件:行号` 指实现基线 `be876b6` 对应的源码内容；源码内部注释引用的旧行号可能因后续改动漂移，以本文实测行号为准。
 > **整理方式**：纯读码归纳，零源码改动。RFC 对照仅限代码注释中明示的条目与可从代码直接验证的行为，不做臆测性推断。
 
 ---
@@ -20,12 +21,15 @@
 
 ## 1. 依据文件
 
+> 下方文件状态和行号主要保留 2026-08-25/26 的读码快照；当前源码已由后续提交收敛，
+> 当前运行证据以 `docs/TEST_MATRIX.md`、nginx r4 结果文件和独立复验结果文件为准。
+
 | 文件 | 工作区状态 | 本文引用的行号范围 |
 |---|---|---|
-| `net.c` | **已修改（未提交，SACK 改动即本文 §5 主要依据）** | 215–227, 259–313, 315–355, 356–563, 565–597, 599–681, 683–917, 919–978, 996–1008 |
-| `net.h` | 未修改 | 44–84, 60–71 |
-| `syscall.c` | 已修改（未提交） | 62–196（socket 组各 case） |
-| `vfs.c` | 已修改（未提交） | 73–77（socket fd 安装/获取/关闭） |
+| `net/net.c`、`net/net_tcp.c`、`net/net_udp.c` | 当前主线实现 | socket 状态、TCP 生命周期/收发、UDP 队列；历史行号只作追溯 |
+| `net/net.h`、`net/net_internal.h` | 当前主线实现 | 类型、容量常量和连接结构定义 |
+| `kernel/syscall.c`、`kernel/syscall.h` | 当前主线实现 | nr=20..32 socket 组；nr=168 poll；当前行号以源码为准 |
+| `fs/vfs.c`、`fs/vfs.h` | 当前主线实现 | socket fd 安装/获取/关闭与普通文件 fd |
 
 ---
 
@@ -52,12 +56,12 @@ SOCK_CLOSED ──┬── (UDP) SOCK_UDP_UNBOUND ──bind──► SOCK_UDP 
 |---|---|---|---|
 | `UDP_SLOTS` | 8 | UDP socket 槽位数 | net.c:216 |
 | `UDP_RXBUF` | 2048 B | 单 UDP socket 接收缓冲（线性包队列：`[len4][src_ip4][sport2]payload...`） | net.c:217, 218-222 |
-| `TCP_MAX_CONNS` | 16 | TCP 连接表容量（同时是 listen backlog 上限） | net.h:67 |
+| `TCP_MAX_CONNS` | 64 | TCP 连接表容量（同时是 listen backlog 上限） | `net/net.h:86,97-101` |
 | `TCP_MSS` | 1460 | 最大段长（也是单段上限） | net.h:69 |
 | `TCP_BUF_SIZE` | 4096 | 收/发缓冲大小 | net.h:70 |
 | `TCP_TX_SEG_MAX` | 8 | 发送侧 scoreboard 段数上限 | net.h:71 |
 | `TCP_RX_WINDOW` | 65535 | （已定义；实际通告窗口改为动态 `TCP_BUF_SIZE - rxn`，net.c:643 —— 该宏现网用途待核实） | net.h:68 |
-| OOO 队列 | 4 槽 × ≤MSS | 每连接乱序缓存槽位（总字节受 ooo_bytes ≤ TCP_BUF_SIZE 约束） | net.c:326-327, 423-430 |
+| OOO 队列 | 2 槽 × ≤MSS | 每连接乱序缓存槽位（总字节受 ooo_bytes ≤ TCP_BUF_SIZE 约束） | `net/net.h:91-96`、`net/net_tcp.c` |
 
 ---
 
@@ -99,7 +103,7 @@ SOCK_CLOSED ──┬── (UDP) SOCK_UDP_UNBOUND ──bind──► SOCK_UDP 
 | 层 | 行为 | 证据 |
 |---|---|---|
 | syscall | 非 SOCK_TCP_ESTAB → `-ENOTCONN`（ring3 探针依赖此断言）→ EFAULT(buf) → sock_xlate | syscall.c:144-157 |
-| net.c | `tcp_send`：len>1460 收缩到 MSS；超过发送缓冲余量再收缩；**收缩到 0 则返回 0**（调用方无法区分「成功 0 字节」与「缓冲满忙等」，TODO(code2)）；正常返回实际接受字节数（类似 write 部分写，合法）；数据进 `sndb` 缓冲后由 `tcp_xmit_pending` 受 cwnd/peer_win 约束发出 | net.c:935-945, 650-667 |
+| net/net_tcp.c | `tcp_send`：len>1460 收缩到 MSS；超过发送缓冲余量再收缩；**缓冲耗尽返回 `-EAGAIN`**；正常返回实际接受字节数（类似 write 部分写）；数据进 `sndb` 缓冲后由 `tcp_xmit_pending` 受 cwnd/peer_win 约束发出 | `net/net_tcp.c:799-817` |
 
 ### 3.5 recv(fd,buf,len) —— TCP 接收
 
@@ -138,7 +142,7 @@ TIME_WAIT 定长 200 ticks（@100Hz 即 2s）到期自动释放连接槽（net.c
 |---|---|---|
 | s==NULL 或 port==0 | 拒绝 | `-EINVAL(-22)` |
 | SOCK_UDP_UNBOUND | 槽位必须 owned 且未被占用；端口已被其他 UDP socket 绑定（`udp_sock_by_port`）→ 冲突；成功则转 SOCK_UDP 并清空接收队列 | 0 / `-EADDRINUSE(-98)` |
-| SOCK_TCP_UNBOUND | **若同端口已存在 LISTEN conn（`tcp_conn_find_listen`）→ 「附着」模式**：释放自己的 conn（used=false），挂接到既有 listener，**返回 0**（⚠️ 已知缺口 H2/D1，目标语义应为 EADDRINUSE）；否则本 conn 转 TCP_LISTEN、**backlog 固定置 1**、复位收发状态 | 0 |
+| SOCK_TCP_UNBOUND | 若同端口已存在 LISTEN conn（`tcp_conn_find_listen`）→ 拒绝并返回 `-EADDRINUSE`；否则本 conn 转 TCP_LISTEN、backlog 固定置 1、复位收发状态 | 0 / `-EADDRINUSE` |
 | 其余类型（含重复 bind、CLOSED、ESTAB） | 拒绝 | `-EINVAL(-22)` |
 
 分歧注记：Linux `bind(port=0)` 是请求自动分配端口；此处一律 `-EINVAL`（syscall.c:83-84 已知差异，归属 net.c 语义决策）。
@@ -150,7 +154,7 @@ TIME_WAIT 定长 200 ticks（@100Hz 即 2s）到期自动释放连接槽（net.c
 | 规则 | 内容 |
 |---|---|
 | 适用对象 | 仅 SOCK_TCP_LISTEN（**未 bind 先 listen 即 SOCK_TCP_UNBOUND → `-EINVAL`，L1 缺口**；Linux 会先 inet_autobind 再转 LISTEN，syscall.c:86-94 TODO(code2) 待修复） |
-| backlog 取值 | 0 → 按 1 处理；> TCP_MAX_CONNS(16) → 截到 16 |
+| backlog 取值 | 0 → 按 1 处理；> TCP_MAX_CONNS(64) → 截到 64 |
 | 生效点 | backlog 存于 listener conn，SYN 到达时检查 `tcp_pending_count(port) >= backlog` 则回 RST（accept queue full，net.c:698-702） |
 | 注意 | bind 路径创建的 listener backlog 固定为 1（net.c:510），需显式 listen 调大 |
 
@@ -165,7 +169,7 @@ TIME_WAIT 定长 200 ticks（@100Hz 即 2s）到期自动释放连接槽（net.c
 | 无就绪连接 / 无空闲 handle 槽 | NULL → syscall 层 **`-EAGAIN`**（非阻塞轮询语义，Linux O_NONBLOCK 同型） |
 | 成功 | 标记 accepted；从 `tcp_handles[16]` 找 SOCK_CLOSED 槽安装 ESTAB 句柄；新 fd 经 vfs_socket_install 分配 |
 | fd 安装失败 | 透传安装错误并以 `tcp_abort_socket` 回收连接（防泄漏，syscall.c:104） |
-| 对端信息 | house ABI 的 accept **不返回 peer_ip/peer_port**（五寄存器限制）；底层 `tcp_accept(s,&ip,&port)`（net.c:919-933）有此能力但仅供内核内演示路径使用 |
+| 对端信息 | syscall accept 支持可选 `sockaddr_in` 和长度出参；底层 `net_socket_peer()` 提供 peer_ip/peer_port，nginx r4 已经走通该最小路径 |
 
 连接建立路径（被动开放）：SYN → 查 listener → backlog 满 RST / 连接表满 RST → 建 SYN_RECEIVED conn（记 ISN、协商选项）→ SYN-ACK（RTO 保护重传，net.c:715）→ ACK 到达转 ESTABLISHED（net.c:794-799）。重复 SYN 保半开重发 SYN-ACK（RFC 793 注释，net.c:732-736）。
 
@@ -181,7 +185,7 @@ TIME_WAIT 定长 200 ticks（@100Hz 即 2s）到期自动释放连接槽（net.c
 
 ## 5. SACK / OOO 队列当前实现要点（RFC 2018/6675 对照）
 
-> 本节行为均来自工作区**未提交**的 net.c 改动（`git diff net.c`），属待加固/验证中的实现。
+> 本节行为来自实现基线中的 net.c；其中仍未有独立运行证据的条目继续按本节和 §7 标记，不因代码已合入就自动视为 PASS。
 
 ### 5.1 SACK 协商
 
@@ -229,7 +233,7 @@ TIME_WAIT 定长 200 ticks（@100Hz 即 2s）到期自动释放连接槽（net.c
 
 ### 5.5 接收侧 OOO 队列
 
-结构：`ooo[4]`（seq/len≤MSS/data/used）+ 总量计数 `ooo_bytes`（net.c:326-327）。
+结构：`ooo[2]`（seq/len≤MSS/data/used）+ 总量计数 `ooo_bytes`（`net/net_internal.h`）。
 
 | 函数 | 规则 | 对照 | 证据 |
 |---|---|---|---|
@@ -252,7 +256,7 @@ TCP :81 演示服务在 ESTABLISHED 后一次性排队 16×90B=1440B（16 段 > 
 | 编号 | 主题（可考者） | 本文档内的对应位置 | 登记依据 |
 |---|---|---|---|
 | **H1** | 用户指针非法族 EFAULT（kernel ptr/NULL/未映射页/越界尾须报 EFAULT；边界内合法指针不得误报） | ABI 文档 §6 | `/tmp/cat-os-tests/user_ring3_socktest.c:99-100,202-214`（H1P/H1B 探针名） |
-| **H2** | TCP bind 同端口语义：现状=静默「附着」返回 0；目标=EADDRINUSE（附着后原监听者仍可 accept 属 H2Q 探针范畴） | 本文 §4.1 | user_ring3_socktest.c:93-94,162-172；README「已知缺口 H2/D1」；代码路径 net.c:507-518 |
+| **H2** | TCP bind 同端口语义：当前冲突返回 `-EADDRINUSE`，不再静默「附着」 | 本文 §4.1 | `net/net.c` bind 分支；网络回归资料与 `docs/TEST_MATRIX.md` |
 | **M1** | 仅登记 | — | 仓库源码注释未见定义（待核实） |
 | **M2** | 错误码区分性：底层裸 `-1` 哨兵混叠 EMSGSIZE/EADDRNOTAVAIL/EAGAIN；UDP payload 上限预检；UNBOUND sendto 显式拒绝 | 本文 §3.2-3.4；ABI 文档 §5.1/§5.3 | syscall.c:3,15-29,41-60,116-127 |
 | **M3** | 仅登记 | — | 仓库源码注释未见定义（待核实） |
@@ -264,7 +268,7 @@ TCP :81 演示服务在 ESTABLISHED 后一次性排队 16×90B=1440B（16 段 > 
 | **L5** | 仅登记 | — | 仓库源码注释未见定义（待核实） |
 | **L6** | 零长缓冲误报 EFAULT（已修复：n==0 放行） | ABI 文档 §6.1 | paging.c:330-356（L6/code6 修复注记） |
 | **L7** | 仅登记 | — | 仓库源码注释未见定义（待核实） |
-| **L8** | close 双重别名关系文档化（nr==3 ↔ nr==6 ↔ nr==28） | ABI 文档 §3.3（已文档化，行为未改） | syscall.c:167-188；vfs.c:78-91 |
+| **L8** | close 双重别名关系文档化（nr=6/28；nr=3 为 read） | ABI 文档 §3.3（别名已移除） | commit `289e9ce`；当前 syscall/VFS close 路径 |
 
 附注：`/tmp/cat-os-tests/README.md` 还出现缺口编号 C3（port 7 双重行为）、C7（无 ICMP unreachable）、D1（与 H2 同源的 TCP 附着语义）及 backlog 探针 A/B 两态记录，不在本任务指定登记范围（H1/H2/M1-M4/L1-L8），此处仅存目。
 
@@ -274,10 +278,10 @@ TCP :81 演示服务在 ESTABLISHED 后一次性排队 16×90B=1440B（16 段 > 
 |---|---|
 | 无 connect，ring3 不能主动外连 TCP | §4.4 |
 | recvfrom 报文超长静默截断且余量丢弃，无 MSG_TRUNC 等价上报 | net.c:308；TODO 见 syscall.c:141-142 |
-| tcp_send 缓冲满返回 0 无法与成功区分 | net.c:938-940；syscall.c:151-155 |
+| tcp_send 缓冲满返回 `-EAGAIN`；部分写仍需调用方推进游标 | `net/net_tcp.c:799-817`；`kernel/syscall.c` send 分支 |
 | net_socket_close 对 CLOSED 型返回 -EBADF 且 fd 滞留 | net.c:554；syscall.c:184-187 |
 | lost 判定漏前缀洞（end==HighAck 场景延迟到 RTO） | net.c:479-482 注释自述 |
-| SACK 登记块上限 2 / scoreboard 段上限 8 / OOO 槽上限 4，超限降级为普通重 ACK | net.c:329, 373; net.h:71; net.c:424,427-429 |
+| SACK 登记块上限 2 / scoreboard 段上限 8 / OOO 槽上限 2，超限降级为普通重 ACK | `net/net.h:90-96`、`net/net_tcp.c` |
 | UDP 校验和恒为 0 不计算 | net.c:233 |
 | TIME_WAIT 固定 2s，无按 MSAS 协商 | net.c:825（注释 "2s"）、862 |
 | ISN 生成器为静态递增初值（非随机） | net.c:30, 712 |
@@ -289,14 +293,14 @@ TCP :81 演示服务在 ESTABLISHED 后一次性排队 16×90B=1440B（16 段 > 
 
 | # | 条目 | 状态 | 说明 |
 |---|---|---|---|
-| N1 | 本文全部行为条目 | **NOT_TESTED（静态阅读结论）** | 本任务只读源码、未编译未运行 |
-| N2 | §5 SACK/OOO/scoreboard 加固行为（工作区未提交改动） | NOT_TESTED（本任务口径） | 仓库根存在 qemu-sack-edge-t1~t6 日志（Aug 25 01:03–01:48），但其结论核对不在本任务范围；`NEXT_TASKS_AUTONOMOUS.md:35-37` 亦将重复/重叠/越界 SACK block/双缺口/scoreboard 上限等列为待补测试 |
-| N3 | ring3 socket 断言骨架运行时结果 | NOT_TESTED | `/tmp/cat-os-tests/README.md` 原文：「编译自检通过；运行时 NOT_TESTED」 |
+| N1 | 本文大部分行为条目 | **以静态读码为主** | nginx r4 与独立复验只覆盖 poll、TCP 被动服务、accept 地址出参、静态 FAT16 读取及 shell 辅助命令；不覆盖完整 socket ABI |
+| N2 | §5 SACK/OOO/scoreboard 加固行为（历史工作区改动） | **已由后续 QEMU inject 套件覆盖** | `docs/TEST_MATRIX.md` 记录 2026-08-26 run_all ALL GREEN；本文不重复计算套件断言 |
+| N3 | 旧 ring3 socket 断言骨架运行时结果 | NOT_TESTED | `/tmp/cat-os-tests/user_ring3_socktest.c` 仍未接线；仓库内 stage4 `user_sock_abi` 已有 85 PASS / 0 FAIL / 4 skip，但不是同一骨架 |
 | N4 | `TCP_RX_WINDOW(65535)` 现网用途 | 待核实 | 定义于 net.h:68；实际通告窗口为动态值（net.c:643），未见该宏参与计算 |
 | N5 | M1/M3/M4/L3/L4/L5/L7 缺口语义 | 待核实 | 仓库与 /tmp/cat-os-tests 内均未检索到逐条定义；以协调者持有的缺口清单为准 |
-| N6 | `tcp_accept(s,&ip,&port)`（net.c:919-933）在 ring3 路径的可连性 | 待核实 | house ABI accept 无地址出参形参，该底层函数当前主要服务内核内路径 |
+| N6 | ring3 accept 的 `sockaddr_in` 出参 | **nginx r4 与独立复验已覆盖最小路径** | `kernel/syscall.c` accept 分支将 peer 地址写回用户缓冲；底层 helper 仍不是 ring3 直接 ABI |
 | N7 | backlog 探针 A（排空）/B（RST）两态的实测归类 | NOT_TESTED | README 记录为「信息级」，结论未纳入本文档 |
 
 ---
 
-*文档结束。生成者：Cat-OS 并行任务 code8（接口文档完善）。约束遵守声明：本任务仅新建 `docs/` 下文档，未修改任何 `.c/.h/.md` 既有文件，未触碰 net.c/usermode.c/OSDEV_PROJECT_NOTES.md/NEXT_TASKS_AUTONOMOUS.md，未执行 push/reset/rebase/delete。*
+*文档结束。主体为 2026-08-25/26 socket API 快照；当前容量值和 nginx 相关 ABI 关系回填于 2026-08-28。当前回填只更新文档，不修改源码。*

@@ -1,14 +1,36 @@
-# Cat-OS × nginx 1.x 移植预研报告（NGINX_PORT_ANALYSIS）
+# Cat-OS × nginx 1.x 移植分析与实证回填（NGINX_PORT_ANALYSIS）
 
-> **任务**：code3 并行任务 · 只读分析，仅新建本文档与 `MINIMAL_HTTPD_DESIGN.md`，零源码改动。
-> **仓库基线**：`/home/wjqawa/osdev`，git log 最新提交 `6796bd6`（"net: harden tcp sack edge cases"；任务书所写 `0d4b583` 为其父提交，工作区另含多个并行任务的未提交改动，本文行号均指**当前工作区文件实测内容**）。
-> **nginx 参考基准**：nginx 主线 **1.26.x**（src/os/unix/ 目录布局）。⚠️ 本机无 nginx 源码树副本（`find` 仅见运行时安装 `/usr/local/nginx`），故 nginx 侧引用给到**文件名 + 函数名**级；具体行号待取得对应版本源码后回填核实，凡未核实处一律标注「待验证」，不做臆造。
+> **文档性质**：本文主体记录 2026-08-25 的移植前架构预研；下方“当前实施结论”是 2026-08-28 实证回填，优先于历史表格中的旧状态。
+> **实现基线**：`/home/wjqawa/osdev` 的 nginx 实现提交为 `be876b6`（`port nginx to Cat-OS`）；下方历史表格仍保留 2026-08-25 的 `6796bd6` 预研快照，旧行号只用于追溯。
+> **nginx 参考基准**：nginx 1.26.2 源码现已纳入 `nginx-1.26.2/`，移植构建使用 `nginx-shim/` 和 `build-nginx.sh`；未启用的完整 POSIX 特性仍按源码核对结果标记为限制，不把桩实现记作完整支持。
 > **状态标记约定**：✅可验证 = 已由源码/文档直接证实；🔍待验证 = 结论合理但未运行复现或未核对原始源码；⛔不可行 = 以现有架构无法满足，需重大变更。
+
+## 0. 当前实施结论（2026-08-28）
+
+当前已完成的是 nginx 1.26.2 的**单进程静态 HTTP 最小闭环**，不是原计划中的完整
+master/worker 形态：
+
+| 能力 | 当前实现 | 证据 |
+|---|---|---|
+| nginx 构建 | 交叉编译 nginx 1.26.2，使用 Cat-OS shim、`poll` 模块和本地 epoll 符号桩，生成 `nginx_bin.h` | `build-nginx.sh`、`build-nginx.py`、`nginx-shim/`；`./build-nginx.sh` 已通过 |
+| 文件与配置 | IDE 磁盘上的 FAT16 只读挂载，VFS 提供 `/mnt/fat/CONF/NGINX.CNF` 和 `/mnt/fat/WWW/` 读取 | `fs/fat16.c`、`fs/vfs.c`、`nginx.conf` |
+| 进程启动 | shell 的 `nginx` 命令执行 `/bin/nginx`；nginx 配置强制 `master_process off` | `shell_user.c`、`kernel/syscall.c`、`nginx_harness.c` |
+| 事件循环 | nginx 使用 `poll`；Cat-OS 提供 nr=168 `poll`，socket 就绪由 `net_socket_poll()` 检查 | `kernel/syscall.h`、`kernel/syscall.c`、`net/net_tcp.c` |
+| HTTP 结果 | `/` 返回 200 与 `Cat-OS nginx works`；`/missing` 返回 404 | r4 与独立复验：`/tmp/catos-nginx-rebuild-20260828r4.result`、`/tmp/catos-nginx-doc-verify.result` 及对应 `.serial` |
+| shell 辅助命令 | `nginx`、`netstat`、`ping <IPv4>` 已接线并在两次 fresh QEMU 验收 | r4 与独立复验均记录 `netstat: PASS`、`ping reply: PASS`；重复 `nginx` 亦通过 |
+
+两次结果均包含 `QEMU final rc=0` 和 `OVERALL: PASS`。nginx 源码与 1.26.2 归档
+对比时，除 `src/event/modules/ngx_poll_module.c` 的 Cat-OS poll 修复外，没有把
+其它上游源码差异混入移植补丁。
+
+仍未完成或仅作裁剪/桩化的能力包括：master/worker 的 nginx 运行验收、完整 signal
+生命周期、upstream/connect、可写日志文件系统、epoll、共享内存特性和高并发容量。
 
 ---
 
 ## 目录
 
+0. [当前实施结论](#0-当前实施结论2026-08-28)
 1. [执行摘要](#1-执行摘要)
 2. [Cat-OS 现状盘点（按子系统）](#2-cat-os-现状盘点按子系统)
 3. [nginx 1.x 依赖清单与差距矩阵](#3-nginx-1x-依赖清单与差距矩阵)
@@ -21,6 +43,8 @@
 ---
 
 ## 1. 执行摘要
+
+> 本节及后续差距矩阵主要记录移植前快照；当前实现结论以本文 §0 为准。
 
 | 问题 | 结论 |
 |---|---|
@@ -37,13 +61,13 @@
 
 | 能力 | 现状 | 证据 | 状态 |
 |---|---|---|---|
-| TCP 被动开放全链路 | socket/bind/listen/accept/send/recv/close 七件套齐备，含 backlog（上限 16）、TIME_WAIT、RST、persist 探针 | net.c:681(tcp_listen)、533(accept)、971(close)；syscall 层 nr=20..28（syscall.h:16-26） | ✅ |
+| TCP 被动开放全链路 | socket/bind/listen/accept/send/recv/close 七件套齐备，含 backlog（上限 64）、TIME_WAIT、RST、persist 探针 | `net/net_tcp.c`、`net/net.h:86-101`；syscall 层 nr=20..28 | ✅ |
 | TCP 主动开放 connect | **不存在**。`enum tcp_state` 预留了 `TCP_SYN_SENT`（net.h:47），但 net.h 公共 API 与 net.c 全文无任何 connect 实现（docs/SOCKET_API.md §4.4 同结论） | net.h:107-118 无声明；SOCKET_API.md §4.4 | ✅（缺口属实） |
 | UDP | sendto/recvfrom 可用；ring3 必须 bind 后才能发（UNBOUND → -EADDRNOTAVAIL） | net.c:294/300；syscall.c sendto 分支 | ✅ |
-| 可靠性机制 | SACK（≤2 块）/OOO 队列（4 槽）/scoreboard/RTO（300ms~2.4s）/NewReno 风格拥塞控制 | net.c:365-505, 583-605 | ✅ |
-| 容量常量 | TCP 连接表 16、收发缓冲各 4096B、单段 ≤1460B、UDP 槽 8 个 | net.h:67-71；net.c:216-217 | ✅（对 nginx 属硬约束，见 §6） |
+| 可靠性机制 | SACK（≤2 块）/OOO 队列（2 槽）/scoreboard/RTO（300ms~2.4s）/NewReno 风格拥塞控制 | `net/net_tcp.c`、`net/net.h:90-96` | ✅ |
+| 容量常量 | TCP 连接表 64、收发缓冲各 4096B、单段 ≤1460B、UDP 槽 8 个 | `net/net.h:86-96`；`net/net.c` UDP 表 | ✅（对 nginx 属硬约束，见 §6） |
 | 收包驱动模型 | `timer_handler`（IRQ0 @100Hz）每 tick 调 `net_poll()`；主循环亦忙轮询 | interrupts.c:23/26；kernel.c 主循环；net.c:1006 | ✅（架构瓶颈） |
-| 错误码区分性 | 底层失败一律折叠为裸 `-1` 哨兵，syscall 层 `sock_xlate` 统一译为 `-EAGAIN` | net.c:295/297/302/946…；syscall.c sock_xlate | ✅（缺口 M2 登记在案） |
+| 错误码区分性 | 部分底层失败仍使用裸 `-1` 哨兵并由 `sock_xlate` 折叠为 `-EAGAIN`；TCP 发送缓冲满已单独返回 `-EAGAIN` | `net/net_tcp.c`；`kernel/syscall.c` | ⚠️（M2 仅部分收敛） |
 
 ### 2.2 系统调用层（syscall.c，365 行 + syscall.h）
 
@@ -99,23 +123,25 @@
 
 ## 3. nginx 1.x 依赖清单与差距矩阵
 
-> nginx 侧依据：主线 1.26.x 源码布局（文件/函数名为稳定公开事实，**行号待取得源码后核实**）；Cat-OS 侧依据：§2 实测行号。
+> nginx 侧依据：仓库内 nginx 1.26.2 源码（如 `src/core/nginx.c:339-385`、
+> `src/event/modules/ngx_poll_module.c:30-100`、`src/http/modules/ngx_http_static_module.c:48-115`）；
+> Cat-OS 侧依据为本文 §0 的当前实现和历史表格的对应行号。
 
 ### 3.1 绿色档 —— 已满足（nginx 可直接使用或薄封装即可）
 
 | # | nginx 依赖 | nginx 参考位置 | Cat-OS 现状 | 评估 | 状态 |
 |---|---|---|---|---|---|
-| G1 | socket()/bind/listen/accept | src/os/unix/ngx_socket.c、ngx_accept.c | nr=20/21/22/23，非阻塞语义原生（accept 空队列→EAGAIN） | house ABI 无 sockaddr 结构（bind 直接传端口号），需 shim 层翻译；backlog 截断到 16 | ✅可验证 |
-| G2 | recv/send（TCP 收发，部分写语义） | src/os/unix/ngx_recv.c、ngx_unix_send.c | nr=26/27；tcp_send 为部分写（收缩返回实际字节）、recv EOF→0/无数据→EAGAIN，与 Unix 语义同型 | tcp_send 缓冲满可返回 0 造成歧义（TODO(code2) 已登记） | ✅可验证 |
+| G1 | socket()/bind/listen/accept | src/os/unix/ngx_socket.c、ngx_accept.c | nr=20/21/22/23，非阻塞语义原生（accept 空队列→EAGAIN） | house ABI 的 bind 仍直接传端口号；shim 负责地址翻译；backlog 上限为 64 | ✅可验证 |
+| G2 | recv/send（TCP 收发，部分写语义） | src/os/unix/ngx_recv.c、ngx_unix_send.c | nr=26/27；tcp_send 为部分写（收缩返回实际字节），满缓冲返回 `-EAGAIN`；recv EOF→0/无数据→EAGAIN | 其它底层瞬时失败仍可能经 `sock_xlate` 折叠为 EAGAIN；完整 errno 体系仍未完成 | ✅可验证 |
 | G3 | write/read（stderr 日志等） | src/os/unix/ngx_files.c（ngx_write_fd） | nr=1/0 写 /dev/console；stderr(fd2) 已装 | 日志落盘需黄档 F2 | ✅可验证 |
-| G4 | close | src/os/unix/ngx_files.c | nr=28 socket-aware 关闭（FIN/回收）；nr=6 关普通文件 | ⚠️ nr=3 别名 close 与 Linux ABI 冲突（L8 审计），移植前必须裁决移除，否则按 Linux 语义写的代码调 read(3) 会误关 fd | ✅可验证 |
+| G4 | close | src/os/unix/ngx_files.c | nr=28 socket-aware 关闭（FIN/回收）；nr=6 关普通文件；nr=3 已恢复为 read | 历史 L8 close 别名已由 `289e9ce` 移除；当前 nginx shim 使用 nr=28 关闭 socket | ✅可验证 |
 | G5 | UDP sendto/recvfrom | （mail/流模块及 DNS resolver 使用） | nr=24/25 可用；出参不可省略（严于 Linux） | resolver 若用 UDP 可通 | ✅可验证 |
 | G6 | errno 数值体系（EAGAIN/EINPROGRESS/EADDRINUSE/EMFILE/ENOTCONN…） | include/uapi asm-generic | Cat-OS 错误码逐一对齐 Linux 数值 | M2 折叠哨兵修复后即完整 | ✅可验证 |
 | G7 | /dev/urandom（ssl_session ticket 等随机源） | src/event/ngx_event_openssl.c | vfs.c:20 已提供 /dev/urandom | — | ✅可验证 |
 | G8 | exec 族（仅 master 启动 worker 用 execve 或直接 fork 继续；二进制更新 upgrade 用 execve） | src/os/unix/ngx_process.c（ngx_execute_proc） | nr=11 exec 已可从 ELF 镜像拉起 ring3 进程 | 语义差异：Cat-OS exec 是"新建进程"而非"替换自身"，见 §6 决策 D3 | 🔍待验证 |
-| G9 | 高分辨率单调时间（计时用，非必须精确） | src/core/ngx_times.c（ngx_monotonic_time） | ticks@100Hz（10ms 分辨率） | nginx 计时缓存粒度本就是 ~10ms 级（timer_resolution 默认），勉强够用；毫秒级 gettimeofday 见 Y9 | ✅可验证 |
+| G9 | 高分辨率单调时间（计时用，非必须精确） | src/core/ngx_times.c（ngx_monotonic_time） | ticks@100Hz（10ms 分辨率） | nginx 计时缓存粒度本就是 ~10ms 级（timer_resolution 默认），勉强够用；最小 `gettimeofday`/`clock_gettime` 见当前实施结论 | ✅可验证 |
 | G10 | 协作多任务上下文（nginx 无线程依赖，单进程事件循环即可） | src/event/ngx_event.c 设计前提 | 调度器 + int 0x80 + ELF 加载链路已打通（shell_user.elf 已能跑） | — | ✅可验证 |
-| G11 | TCP/IP 协议栈正确性（含窗口/重传/SACK） | 前提条件 | RFC 2018/6675/6298 简化版已在工作区落地并有 QEMU 黑盒套件 | 容量 16 连接是硬顶（§6 D5） | ✅可验证 |
+| G11 | TCP/IP 协议栈正确性（含窗口/重传/SACK） | 前提条件 | RFC 2018/6675/6298 简化版已在主线并有 QEMU 黑盒套件 | 容量 64 连接仍是硬顶（§6 D5） | ✅可验证 |
 
 ### 3.2 黄色档 —— 缺失但可在现有架构内增量补齐
 
@@ -167,7 +193,7 @@
                             R1/R3/R4/R5/R7 是真正的硬骨头）
 ```
 
-**结论**：nginx "能不能跑起来"的分水岭在 **R4（事件就绪通知）+ R1（fork/spawn）+ Y11（文件系统）+ R5-min（信号子集）** 四件事上。四者齐备前，任何"直接移植"的尝试都会卡死在 configure/编译期或首启的 ngx_init_cycle。
+**历史结论**：nginx "能不能跑起来"的分水岭曾被归纳为 **R4（事件就绪通知）+ R1（fork/spawn）+ Y11（文件系统）+ R5-min（信号子集）**；当前 §0 已证明单进程静态路径可以绕开 master/worker 与完整 signal，剩余项目只对完整 nginx 形态成立。
 
 ---
 
@@ -216,7 +242,7 @@
 | 4c. MAP_SHARED 共享内存（仅当需要 limit_req/cache zone 时） | R3 |
 | 4d. sendfile（若届时已有 page cache）或永久 --without-sendfile | R6 |
 | 4e. rlimit/daemon/user 桩完善、平滑升级（SIGUSR2+execve 链路）或明确裁剪 | R8/R9/R10 |
-| 4f. 性能与容量：TCP 连接表 16→≥1024、缓冲 4096→64KB 级、window scale 复核 | §6 D5 |
+| 4f. 性能与容量：TCP 连接表 64→≥1024、缓冲 4096→64KB 级、window scale 复核 | §6 D5 |
 
 ---
 
@@ -228,7 +254,7 @@
 | D2 | 事件框架起点：poll vs select vs 直接 epoll | 建议 **poll 语义先行**（参数扁平、内核实现最简），nginx 侧 `--with-poll_module`；epoll 作为阶段 4 增强 |
 | D3 | exec 语义偏差 | Cat-OS exec=新建进程返回 pid，Unix execve=替换自身不返回。nginx upgrade 路径用到后者；shim 层以"exit+spawn"模拟或明确裁剪平滑升级特性 |
 | D4 | nr==3 close 别名（L8） | **必须在任何 Linux ABI 兼容代码进入前移除**，否则 read(fd=3) 会静默关 fd——这是移植路上最阴险的地雷 |
-| D5 | 网络栈容量天花板 | TCP_MAX_CONNS=16 / 缓冲 4KB / backlog≤16（net.h:67-71）与 nginx 默认 worker_connections 1024 相差两个数量级；阶段 2 的 minimal httpd 就会感受到（并发 >16 即 RST，net.c:714） |
+| D5 | 网络栈容量天花板 | TCP_MAX_CONNS=64 / 缓冲 4KB / backlog≤64（`net/net.h:86-101`）与 nginx 默认 worker_connections 1024 仍有明显差距；并发超过可用连接表即 RST |
 | D6 | 32 位地址空间 | i686 4GB/进程上限对 nginx worker 通常够用（每个连接 ~几十KB 级），但连接数上千时 4KB 收发缓冲×2×N 的内核侧占用需重新规划缓冲策略 |
 | D7 | 时间精度 | 100Hz tick 对 nginx 计时够用，但对 RTO/keepalive_timeout 亚 10ms 粒度不足；引入 TSC 或 PIT 重编程留待阶段 3+ |
 
@@ -247,15 +273,18 @@
 
 ---
 
-## 8. NOT_TESTED 清单
+## 8. 历史 NOT_TESTED 与当前验证边界
+
+下表中的 N1/N2 来自 2026-08-25 的纯预研快照。源码树和移植实现已经补齐后，不能继续把
+历史快照的限制当成当前 nginx 结论；N3/N4 仍按各自的证据范围单独标记。
 
 | # | 条目 | 状态 |
 |---|---|---|
-| N1 | 本文全部 Cat-OS 行为条目均为**静态读码结论**（本任务零编译零运行），行号以工作区为准 | NOT_TESTED |
-| N2 | nginx 侧引用为 1.26.x 布局的文件/函数名，**未经本地源码树核对**；行号一律未给出即为刻意留空 | 🔍待验证（取得源码后回填 §3 表格） |
+| N1 | 原始预研的 Cat-OS 行为条目曾全部来自静态读码 | **历史限制；当前 nginx 最小路径已由 r4 fresh QEMU 验收，不能据此否定当前 PASS** |
+| N2 | nginx 侧引用曾未在本地源码树核对 | **已消除（nginx 1.26.2 已在仓库；`src/core/nginx.c:339-385`、`src/event/modules/ngx_poll_module.c:30-100`、`src/http/modules/ngx_http_static_module.c:48-115` 已核对）** |
 | N3 | 阶段划分的工作量估计（milestone 数）为经验值 | 🔍待验证 |
-| N4 | "minimal httpd 可跑在当前 ABI"这一论断的运行时证明 → 由 MINIMAL_HTTPD_DESIGN.md 的实施来闭环 | 🔍待验证 |
+| N4 | "minimal httpd 可跑在当前 ABI"这一论断的运行时证明 | **已由 2026-08-26 httpd M0 QEMU/curl 记录回填；与 nginx r4 证据分开计算** |
 
 ---
 
-*文档结束。生成者：Cat-OS 并行任务 code3（nginx 移植预研）。约束遵守声明：本任务仅新建 `docs/NGINX_PORT_ANALYSIS.md` 与 `docs/MINIMAL_HTTPD_DESIGN.md` 两个文件；未修改任何 `.c/.h/.md` 既有文件；未触碰 usermode.c / OSDEV_PROJECT_NOTES.md / NEXT_TASKS_AUTONOMOUS.md；未执行 push/reset/rebase/delete。*
+*文档结束。主体为 2026-08-25 预研快照；当前状态回填于 2026-08-28。当前回填只更新 nginx 相关文档，不修改 nginx/Cat-OS 源码。*

@@ -4,12 +4,21 @@
 >
 > 强制规则：每个子任务开始前阅读相关项目源码和 `linux-ref/` 参考源码，并在汇报中给出函数/行号与 RFC 依据。所有 PASS 必须来自真实 QEMU、串口、tcpdump 或测试脚本证据；无法触发标记 `NOT_TESTED`，失败标记 `FAIL`。临时脚本放 `/tmp`，不要提交。
 
+## 当前状态（2026-08-28）
+
+- nginx 实现基线为 `be876b6`，且已在 `origin/master`；本轮只同步文档和验证证据，不重复提交实现。
+- nginx 1.26.2 已完成单进程静态 HTTP 最小闭环：shell 可启动 nginx，FAT16 提供配置和静态文件，`/` 200、缺失路径 404。
+- r4 fresh QEMU 证据为 `/tmp/catos-nginx-rebuild-20260828r4.result` + `.serial`；独立复验为 `/tmp/catos-nginx-doc-verify.result` + `.serial`，两次均明确记录 `QEMU final rc=0`、`OVERALL: PASS`。
+- 独立复验还在串口中确认 stage4 `user_sock_abi` 为 `85 passed / 0 failed / 4 skip`；旧 `/tmp` socket 骨架仍单独标记 `NOT_TESTED`。
+- 未发现遗留的 QEMU、nginx、make、git 或文档验证进程；失败的过早键盘注入已修正为等待 `kbd handshake: ready` 后重新通过。
+- 当前真正遗留的是完整 master/worker 与 signal 生命周期、upstream/connect、可写日志、epoll、共享内存和高并发容量；不得把这些项目从历史 M1/M2 计划直接推断为已完成。
+
 ## 当前基线
 
-- 已推送：`287482a net: add TCP SACK scoreboard selective retransmit`
+- 已推送：当前 nginx 主线为 `be876b6 port nginx to Cat-OS`；更早的网络提交仍见下方历史记录。
 - 已完成并验证：ARP/IP/ICMP/UDP/TCP 基础栈、Reno、动态 RTT/RTO、接收端 OOO/SACK、发送端 SACK scoreboard/选择性重传、ring3 UDP/TCP echo。
 - ping 用户态任务已实现并真实验证核心链路：`ping 10.0.2.2`，3/3 reply、0% loss；非法地址路径已有验证。
-- 当前工作区包含历史未提交改动，任何提交前必须检查 diff，禁止误提交无关文件。
+- 当前工作树可能含用户文件和构建/测试生成物，任何提交前必须检查 diff，禁止误提交无关文件。
 - 当前不应自动 push；每次 push 必须单独得到用户明确确认。
 
 ## 总体执行协议
@@ -88,8 +97,8 @@
 - 选定目标网卡/驱动和 DMA/中断模型，先完成可行性分析。
 - 在真实硬件或更接近硬件的 QEMU 环境验证 ARP/IP/ICMP/UDP/TCP。
 - 补最小 libc socket wrapper、进程/文件接口所需支持。
-- 先做小型 HTTP 客户端/服务端，再开始 nginx 移植预研。
-- shell 移植放在网络基础设施稳定之后。
+- 小型 httpd 已作为 nginx 对照服务完成 M0 验证；nginx 1.26.2 最小静态路径也已落地，后续应针对明确列出的完整特性缺口推进。
+- shell 的 `nginx`、`netstat`、`ping <IPv4>` 已在 r4 和独立 fresh QEMU 中验收；`help`、`resolve`、`exec`、`ls`、`cat`、`history`、`exit` 已接线，但新增命令仍需独立真实证据。
 
 ## 停止条件
 
@@ -103,7 +112,7 @@
 
 ## 最终目标
 
-形成可启动、可进入用户态、能执行 `ping`、能通过 UDP/TCP socket API，并逐步具备运行真实网络应用（最终目标为 nginx）的 Cat-OS 网络系统。
+形成可启动、可进入用户态、能执行 `ping`、能通过 UDP/TCP socket API，并继续完善真实网络应用运行所需的 POSIX/进程/文件系统能力；当前 nginx 目标已达到单进程静态 HTTP 里程碑。
 
 ## 2026-08-25 Round1 推进记录（orchestrator 授权回填）
 
@@ -137,7 +146,7 @@
 
 ## 2026-08-26 并行波次记录（orchestrator 授权回填）
 
-### 已落地 commit（d934511..611b080，共 10 笔，均未 push）
+### 已落地 commit（d934511..611b080，共 10 笔；此处为历史记录）
 
 | commit | 内容 |
 |--------|------|
@@ -154,12 +163,11 @@
 
 docs 落点补充：除专笔 61f86c7 外，f9e226b/a6752ca 各随带 docs/RING3_SYSCALL_ABI.md 同步更新。
 
-### 在途待提交（工作区 M 文件已核实，reconcile 进行中）
+### 历史在途记录（截至 2026-08-26，已在后续提交中收敛）
 
-- TCP 64 连接扩容：net.h / net_internal.h / net_tcp.c（diff 中 "64" 扩容参数密集出现）
-- nr=33/34/35 fork/waitpid/kill：process.c/h、syscall.c/h（+331 行主实现）
-- dhcp_lease 用例：tests/net_suite.py
-- S7n/backlog 对齐：reconcile 进行中，勿抢先提交
+此前记录的 TCP 64 连接扩容、nr=33/34/35 fork/waitpid/kill、`dhcp_lease` 用例和
+S7n/backlog 对齐均已进入后续提交；当前没有遗留的代码提交进程。当前工作树中的
+`.opencode/`、`attic/`、`*.tar.gz`、`objs/`、测试日志等生成物不属于提交范围。
 
 ### 新开工
 
@@ -172,4 +180,6 @@ docs 落点补充：除专笔 61f86c7 外，f9e226b/a6752ca 各随带 docs/RING3
 ### 阶段宣告与下一主线
 
 - **阶段 5（网络工程完整性）宣告完成**：ARP 老化（f9e226b）、DHCP 续期（b9530ff）、DNS 解析与解压缩（46ff839+a6752ca）、统计计数器均已落地。
-- 下一主线 = nginx M1（fork/waitpid 已就绪待合入）→ M2 poll → 文件系统。
+- nginx M0（单进程静态 HTTP + poll + FAT16）已完成并有 r4 证据；下一主线是按优先级补齐
+  完整 nginx 仍缺的进程生命周期、signal、upstream/connect、可写日志、epoll 和容量能力，
+  每项均需独立真实验证后再更新状态。

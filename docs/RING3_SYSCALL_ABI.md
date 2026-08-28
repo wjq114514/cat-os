@@ -1,11 +1,11 @@
 # Cat-OS Ring3 `int 0x80` 系统调用 ABI 文档
 
-> **修订记录（2026-08-26 · fork/waitpid/kill 波次，HEAD=`611b080`）**：新增**进程控制组 nr=33/34/35**（fork / waitpid / kill，nginx M1 三件套），编号已锁定；**poll 及后续扩展自 nr≥36 预留**。详见 §3.4。同波次 `syscall.h` 迁入 `CATOS_SYS_EXEC/EXIT/WAIT(11/12/13)` 与 errno 家族（EPERM/ESRCH/ENOENT/E2BIG/ECHILD），数值不变；`exit(status)` 的 status 自此被记录并经 waitpid 收割（Linux wait-status 编码）。nr=13 wait 保持恒 `-ECHILD` stub 行为不变。
+> **修订记录（2026-08-26 · fork/waitpid/kill 波次，HEAD=`611b080`）**：新增**进程控制组 nr=33/34/35**（fork / waitpid / kill，nginx M1 三件套），编号已锁定；poll 后续实际分配为 `CATOS_SYS_POLL=168`，并非 nr=36。详见 §3.4。同波次 `syscall.h` 迁入 `CATOS_SYS_EXEC/EXIT/WAIT(11/12/13)` 与 errno 家族（EPERM=1、ESRCH=3、ENOENT=2、E2BIG=7、ECHILD=10），数值不变；`exit(status)` 的 status 自此被记录并经 waitpid 收割（Linux wait-status 编码）。nr=13 wait 保持恒 `-ECHILD` stub 行为不变。
 
 > **修订记录（2026-08-26）**：依据 commit **289e9ce**（"kernel: remove nr==3 close alias — read(fd=3) no longer silently closes"；核对时工作区 HEAD=`fcc386e`）完成 L8 别名拆除的语义跟进——**nr==3 一律 read；close 仅保留 nr==6（VFS）/ nr==28（socket）**；另对照 `syscall.h` 核实 `CATOS_SYS_RESOLVE=31`、`CATOS_SYS_NET_STATS=32` 编号无误，本文档 §3.2 条目无缺漏。
 
-> **版本说明**：本文档基于 **HEAD=`0d4b58342a1350d81eef82eb128c0c6fcd9df27c`**（"input: blocking read for /dev/kbd with timeout"）**+ 工作区未提交变更**（`git status` 显示 `net.c`/`paging.c`/`syscall.c`/`vfs.c`/`usermode.c`/`OSDEV_PROJECT_NOTES.md` 存在未提交修改，其中 `syscall.c`/`vfs.c`/`paging.c` 的改动内容已包含进本文依据）整理。
-> **行号基准**：文中 `文件:行号` 均指**当前工作区文件内容**（含未提交改动）；源码内部注释引用的行号（如 `syscall.c:88` 提及的 "net.c:497"）可能因其他代理的并行改动而漂移，以本文标注的工作区实测行号为准。
+> **版本说明**：本文主体是 2026-08-26 ABI 快照；当前 nginx 实现基线为 **`be876b6`**。nginx r4 及独立复验使用的 poll 入口为 nr=168，证据与当前 nginx 范围见 `docs/TEST_MATRIX.md`、`NOTES_NGINX_PORT.md`。本文其它 ABI 条目仍以未逐项运行复验为准。
+> **行号基准**：文中 `文件:行号` 均指实现基线 `be876b6` 对应的当前源码内容；源码内部注释引用的行号（如 `syscall.c:88` 提及的 "net.c:497"）可能因其他改动而漂移，以本文标注的工作区实测行号为准。
 > **整理方式**：纯读码归纳，零源码改动；未经运行时复验的行为均标注 NOT_TESTED / 待核实。
 
 ---
@@ -18,7 +18,7 @@
   - [3.1 VFS 组（nr < 20，委托 vfs_syscall）](#31-vfs-组-nr--20委托-vfs_syscall)
   - [3.2 网络/Socket 组（nr ≥ 20，syscall_dispatch 直辖）](#32-网络socket-组-nr--20syscall_dispatch-直辖)
   - [3.3 close 的两条路径与 L8 别名拆除记录](#33-close-的两条路径与-l8-别名拆除记录)
-  - [3.4 进程控制组（nr=33/34/35，编号已锁定；poll 预留 nr≥36）](#34-进程控制组nr334435编号已锁定poll-预留-nr36)
+  - [3.4 进程控制组（nr=33/34/35，编号已锁定；poll=168）](#34-进程控制组nr334435编号已锁定poll168)
 - [4. 参数寄存器约定](#4-参数寄存器约定)
 - [5. 返回码约定](#5-返回码约定)
 - [6. 用户指针校验规则（user_access_ok 语义）](#6-用户指针校验规则user_access_ok-语义)
@@ -31,13 +31,13 @@
 
 | 文件 | 工作区状态 | 本文引用的行号范围 |
 |---|---|---|
-| `syscall.c` | 已修改（未提交） | 1–199（全文） |
-| `syscall.h` | 未修改 | 1–31 |
-| `vfs.c` | 已修改（未提交） | 1–92（全文） |
+| `syscall.c` | 当前主线实现（nginx 基线 `be876b6`） | 当前工作区行号 |
+| `syscall.h` | 当前主线实现 | 当前工作区行号 |
+| `vfs.c` | 当前主线实现（nginx 基线 `be876b6`） | 当前工作区行号 |
 | `vfs.h` | 未修改 | 1–18 |
-| `net.c` | 已修改（未提交，SACK/OOO 改动） | 215–227, 259–313, 315–355, 500–563, 630–634, 935–959 |
-| `net.h` | 未修改 | 61–84 |
-| `paging.c` | 已修改（未提交） | 330–396 |
+| `net.c` | 当前主线实现（SACK/OOO 已合入） | 实现基线对应行号 |
+| `net.h` | 当前主线实现 | 实现基线对应行号 |
+| `paging.c` | 当前主线实现 | 实现基线对应行号 |
 | `interrupts.c` | 未修改 | 31（int 0x80 分发实证） |
 
 ---
@@ -152,9 +152,9 @@ ring3 read（nr==0 或 nr==3）────────────────�
 | 移除计划 | **已执行**：原「属 ABI 变更、超出锁内授权、留协调者裁决」事项由 289e9ce 终结（对应两处源码 TODO 注释的清理现状未逐一复核） | commit 289e9ce |
 | 既有审计附注 | `net_socket_close` 对已 SOCK_CLOSED 型返回 `-EBADF(-9)` 且不释放 fd，存在理论上的描述符滞留窗口（TODO(code2)：幂等释放或本层兜底，二选一） | syscall.c:184-187；net.c:554 |
 
-### 3.4 进程控制组（nr=33/34/35，编号已锁定；poll 预留 nr≥36）
+### 3.4 进程控制组（nr=33/34/35，编号已锁定；poll=168）
 
-> **编号锁定声明（2026-08-26）**：`CATOS_SYS_FORK=33`、`CATOS_SYS_WAITPID=34`、`CATOS_SYS_KILL=35` 归 nginx M1（master/worker 硬阻塞三件套）任务专属；**poll 及后续扩展自 nr=36 起预留**，其他任务不得占用。分发路由：`syscall_dispatch` 前置拦截 `(11..13 || 33..35)` → `proc_syscall`，与 VFS 兼容层（<20）及 socket 表（20..32）无重叠。常量定义于 `syscall.h`。
+> **编号锁定声明（2026-08-26）**：`CATOS_SYS_FORK=33`、`CATOS_SYS_WAITPID=34`、`CATOS_SYS_KILL=35` 归 nginx M1（master/worker 硬阻塞三件套）任务专属；poll 已实际分配为 `CATOS_SYS_POLL=168`，其他后续编号仍须先登记。分发路由：`syscall_dispatch` 前置拦截 `(11..13 || 33..35)` → `proc_syscall`，poll 由主分发路由处理。常量定义于 `syscall.h`。
 
 | nr | 名称 | 参数（a[i]） | 关键前置校验（按判定顺序） | 行为 | 返回 |
 |---|---|---|---|---|---|
@@ -239,7 +239,7 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 - `recv` 无数据且连接未关闭：`tcp_recv` → -1（net.c:952）→ sock_xlate → **`-EAGAIN`**；
 - `recv` 无数据且对端已 FIN（CLOSE_WAIT/LAST_ACK/TIME_WAIT）：`tcp_recv` → **0 = EOF**（net.c:951，syscall.c:159-160）；
 - `sendto` 于已 bind UDP 但 ARP 未决等底层瞬时失败：`udp_sendto` → -1（net.c:297）→ **`-EAGAIN`**（syscall.c:110-112）；
-- `send` 缓冲满隐患：`tcp_send` 可收缩到 0 字节并返回 **0**（net.c:938-940），调用方无法区分「成功 0 字节」与「缓冲满将忙等」——TODO(code2) 建议改返 `-EAGAIN`，0 仅保留于对端关闭场景（syscall.c:151-155）。
+- `send` 缓冲满：当前 `tcp_send` 返回 **`-EAGAIN`**；MSS/剩余空间仍会造成部分写，调用方必须推进游标并处理有限重试（`net/net_tcp.c:799-817`）。
 
 ### 5.4 各调用错误返回矩阵（工作区现状实测口径）
 
@@ -332,17 +332,17 @@ fd 已打开但 kind != FILE_SOCKET    → sock_err 返回 -ENOTSOCK(-88) [后�
 
 | # | 条目 | 状态 | 说明 |
 |---|---|---|---|
-| N1 | 本文全部行为条目 | **NOT_TESTED（静态阅读结论）** | 本任务只读源码、未编译未运行；所有结论以工作区源码为准，未做运行时复验 |
-| N2 | ring3 socket 全场景断言骨架（P01–P09/H1P/H1B/H2P/H2Q…） | NOT_TESTED | `/tmp/cat-os-tests/README.md` 明示：编译自检通过，**运行时 NOT_TESTED**（需阶段 1–3 接入 ring3 入口） |
-| N3 | `sock_xlate` 的区分性 errno 直通能力 | 待落地 | 依赖 net.c 底层废除裸 `-1` 哨兵（TODO(code2)，syscall.c:53-55）；现状所有底层失败均折叠为 `-EAGAIN` |
+| N1 | 本文大部分行为条目 | **以静态读码为主** | nginx r4 只覆盖 poll、TCP 被动服务、accept 地址出参、静态 FAT16 读取及 shell 辅助命令；不覆盖完整 ABI |
+| N2 | 旧 ring3 socket 全场景断言骨架（P01–P09/H1P/H1B/H2P/H2Q…） | NOT_TESTED | `/tmp/cat-os-tests/user_ring3_socktest.c` 仍未接入；不要与仓库内 stage4 `user_sock_abi` 混淆，后者在 nginx fresh 串口中为 85 PASS / 0 FAIL / 4 skip |
+| N3 | `sock_xlate` 的区分性 errno 直通能力 | 部分落地 | TCP 发送缓冲满已返回 `-EAGAIN`；其它底层裸 `-1` 仍可能折叠为 `-EAGAIN`，完整错误区分尚未完成 |
 | N4 | `CATOS_ETIMEDOUT(110)` 的返回路径 | 待核实 | 常量已定义（syscall.h:27），本次通读未见 dispatch 返回该值的路径 |
 | N5 | `user_range_ok` 的现存调用点 | 待核实 | 导出符号但未见调用（§6.3） |
 | N6 | vfs.c:46-64 `[VFS-FD] selftest` | 代码内置自检，本任务未复跑 | 断言逻辑见 vfs.c:46-64，输出标记 `[VFS-FD] selftest PASS ...` |
-| N7 | L1（listen 自动绑定）、H2（bind 同端口）、M 族错误码区分等加固 | 未修复/进行中 | 缺口编号登记见 `docs/SOCKET_API.md` §6；本文档如实记录现状行为 |
-| N8 | nr=32 `net_stats`（阶段5 任务1 新增） | NOT_TESTED（运行时） | 副本编译自检通过；ring3 实测入口为 shell 内建 `netstat`，计数器写入点均为既有行为路径旁的单条 u32 自增 |
+| N7 | L1（listen 自动绑定）与 M 族错误码区分等加固 | **部分未完成** | H2 同端口 bind 已返回 `-EADDRINUSE`，但 listen 自动绑定和其它底层错误的完整区分仍是缺口；编号登记见 `docs/SOCKET_API.md` §6 |
+| N8 | nr=32 `net_stats`（阶段5 任务1 新增） | **shell 路径已实测；直接 ABI 场景仍未单独覆盖** | nginx r4 与独立复验均通过 shell `netstat`；计数器写入点均为既有行为路径旁的单条 u32 自增 |
 | N9 | nr=33/34/35 fork/waitpid/kill（2026-08-26 新增） | 见副本验收记录 | 契约见 §3.4；副本内已完成内核态冒烟（fork→COW 写缺页→waitpid 收割退出码）与 sock_abi 式 ring3 自证（F 族断言），主仓运行时复验归 orchestrator；已知限制四条见 §3.4 末 |
-| N10 | nr≥36 预留（poll 等） | 锁定声明 | 编号锁定见 §3.4 头注；任何任务不得占用 |
+| N10 | nr=168 `poll` | **已实装；nginx r4 与独立复验均运行使用** | `kernel/syscall.h:54`、`kernel/syscall.c:458-525`；完整 epoll/select 仍未实现 |
 
 ---
 
-*文档结束。生成者：Cat-OS 并行任务 code8（接口文档完善）。约束遵守声明：本任务仅新建 `docs/` 下文档，未修改任何 `.c/.h/.md` 既有文件，未触碰 net.c/usermode.c/OSDEV_PROJECT_NOTES.md/NEXT_TASKS_AUTONOMOUS.md，未执行 push/reset/rebase/delete。*
+*文档结束。主体为 2026-08-26 ABI 快照；poll=168、nginx r4 和独立复验关系回填于 2026-08-28。当前回填只更新文档，不修改源码。*

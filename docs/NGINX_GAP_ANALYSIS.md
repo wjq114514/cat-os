@@ -1,21 +1,50 @@
-# 《nginx 移植缺口清单与阶段路线》
+# 《nginx 移植缺口清单与阶段路线》（历史基线 + 实证回填）
 
 > **生成日期**：2026-08-25  
 > **来源**：planner 只读架构分析（基于 opencode agent log）  
 > **基于**：HEAD 81514fc 前的工作区状态
+> **当前回填**：2026-08-28，当前优先结论见 §0；本文后续表格保留移植前缺口矩阵，避免丢失原始推理上下文。
+
+## 0. 2026-08-28 当前缺口状态
+
+原始矩阵中的“缺失”描述属于移植前快照。当前已针对最小静态 HTTP 路径补齐的项目如下：
+
+| 原缺口 | 当前状态 | 实现/证据 |
+|---|---|---|
+| S4 `accept` 对端地址 | 已补齐最小 `sockaddr_in` 出参 | `kernel/syscall.c` accept 分支、`net_socket_peer()`；r4 与独立复验均完成 nginx HTTP 200/404 |
+| S9 `writev` | 已提供 nr=146，socket 路径逐 iovec 调 `tcp_send()` | `kernel/syscall.c`、`libc/src/posix_stubs.c`；r4 与独立复验均完成 HTTP 响应 |
+| S11 `poll` | 已提供 nr=168，支持超时、`POLLIN/POLLOUT/POLLNVAL` 最小语义 | `kernel/syscall.c`、`net/net_tcp.c`、`nginx.conf` 的 `use poll`；两次 fresh QEMU 均 PASS |
+| S12 `dup2` | 已由 libc 桩接入 nr=63 | `libc/src/posix_stubs.c`、`kernel/syscall.c`；r4 与独立复验均完成 nginx 启动 |
+| S15 文件读取/stat/lseek | FAT16 只读挂载和 VFS 常规文件路径已接入 | `fs/fat16.c`、`fs/vfs.c`；r4 FAT16 mount PASS、配置和静态页读取成功 |
+| S16 时间接口 | 已提供 `gettimeofday`/`clock_gettime` 最小实现 | `kernel/syscall.c`；静态 HTTP 路径可用，精度仍受 100 Hz tick 限制 |
+| S18/S19 进程基础能力 | Cat-OS 已有 fork/waitpid/kill 数据面，但 nginx 当前明确禁用 master/worker | `kernel/process.c`、`kernel/syscall.c`、`nginx.conf`；尚无 nginx 多 worker 运行证据 |
+| S25 close 别名 | Linux ABI 冲突的 nr=3 别名已移除，socket 使用 nr=28 | `kernel/syscall.c`、`fs/vfs.c`；已随此前 socket ABI 回归验证 |
+
+当前真实验收证据包括 `/tmp/catos-nginx-rebuild-20260828r4.result` + `.serial`，以及
+独立复验 `/tmp/catos-nginx-doc-verify.result` + `.serial`。两次均明确记录 shell 启动
+nginx、HTTP `/` 200、`/missing` 404、`netstat`、`ping`、重复启动保护和 QEMU 返回码 0；
+r4 另外包含临时诊断扫描。
+
+对当前静态 nginx 路径仍保留的缺口：完整 master/worker 与 signal 生命周期、
+upstream/connect、可写文件系统和日志轮转、epoll、共享内存、sendfile，以及
+TCP 连接表/FD 表面向高并发的扩容。这些项目不能因为 shim 返回成功或静态路径未调用
+就标记为完整支持。
 
 ---
 
 ## 1. syscall 缺口：nginx 最小集 vs 现有 ABI 逐项对照
 
+> 本表是移植前缺口快照；当前已实现的最小静态 HTTP 路径以 §0 为准，表内未启用的
+> master/worker、upstream 和完整 POSIX 能力仍保持为缺口。
+
 | # | nginx 依赖系统调用 | nginx 代码位置（参考 1.26.x） | Cat-OS 现有编号/实现 | 状态 | 证据与替代方案 |
 |---|---|---|---|---|---|
 | S1 | `socket(AF_INET,SOCK_STREAM)` | `ngx_socket.c` | **nr=20** `CATOS_SYS_SOCKET` | ✅已有 | `syscall.c:260-264`；仅 `type` 参数，无 domain/protocol |
 | S2 | `bind(fd, addr, addrlen)` | `ngx_socket.c` | **nr=21** `CATOS_SYS_BIND` | ✅已有/受限 | `syscall.c:270`：house ABI 仅 `(fd,port)`，无 sockaddr 结构；`port==0 → -EINVAL`（无自动端口分配）`net.c:511-518` |
-| S3 | `listen(fd, backlog)` | `ngx_accept.c` | **nr=22** `CATOS_SYS_LISTEN` | ⚠️黄（L1） | `syscall.c:280-284`：未 bind 先 listen → `-EINVAL`（L1 缺口）；`backlog>16` 截断 `net.c:553-559` |
+| S3 | `listen(fd, backlog)` | `ngx_accept.c` | **nr=22** `CATOS_SYS_LISTEN` | ⚠️黄（L1） | `syscall.c:280-284`：未 bind 先 listen → `-EINVAL`（L1 缺口）；当前 `backlog` 上限为 64（`net/net.h:86-101`） |
 | S4 | `accept4/accept` | `ngx_accept.c` | **nr=23** `CATOS_SYS_ACCEPT` | ✅已有/受限 | `syscall.c:289`：非阻塞原生（空队列 `-EAGAIN`）；**不返回对端地址**（五寄存器限制）`net.c:919-933` 仅内核内路径 |
 | S5 | `connect(fd, addr, addrlen)` | `ngx_connect.c`、upstream 全系 | **无编号** | ⛔缺失 | `net.h:107-118` 无声明；`TCP_SYN_SENT` 仅枚举预留 `net.h:62-65`；需新增 nr + `net_socket_connect` |
-| S6 | `send/recv` (TCP) | `ngx_send.c`、`ngx_recv.c` | **nr=26/27** | ✅已有 | `syscall.c:334-354`：部分写语义、EOF=0、`-EAGAIN`、`-ENOTCONN`；**`send` 缓冲满可返回 0 歧义** `net.c:938-940` `syscall.c:341` |
+| S6 | `send/recv` (TCP) | `ngx_send.c`、`ngx_recv.c` | **nr=26/27** | ✅已有 | `kernel/syscall.c`：部分写语义、EOF=0、`-EAGAIN`、`-ENOTCONN`；当前发送缓冲满返回 `-EAGAIN`，其它底层哨兵折叠仍有限 |
 | S7 | `sendto/recvfrom` (UDP) | resolver、mail | **nr=24/25** | ✅已有/受限 | `syscall.c:298-330`：出参不可省略（严于 Linux）；UDP 未 bind 发送 `-EADDRNOTAVAIL` |
 | S8 | `write/read` (文件/日志) | `ngx_files.c` | **nr=1/0** | ✅已有 | `vfs.c:68`：仅 `/dev/*` 设备文件；**无常规文件系统**（见 §3） |
 | S9 | `writev` | `ngx_writev_chain.c` | **无编号** | ⛔缺失 | 可 shim：用户态拼接单缓冲 `send`（首响应 ≤MSS 无损） |
@@ -78,6 +107,8 @@
 
 ## 3. 内核机制缺口
 
+> 本节保留移植前架构评估；FAT16、poll 和 fork/waitpid/kill 的当前落点见 §0。
+
 | 机制 | 现状 | 缺口评估 | 建议 |
 |---|---|---|---|
 | **COW fork / 进程地址空间隔离** | 并行开发中（任务书声称 "COW fork 正在并行开发"） | **关键前置 R1/R2/Y5**<br>- `paging.c:15` 单一全局 `kernel_page_directory` 静态实例<br>- `map_page` 仅写此目录 `paging.c:302-306`<br>- `process_trampoline` 已支持 `cr3` 切换 `process.c:136-138`（硬件通路在）<br>- **无 `pgdir_create/switch/destroy` API**<br>- **无 kmalloc/内核堆** `grep malloc/kmalloc *.c *.h → 空` | **按"将有"评估**：<br>1. 先补 `kmalloc`（Y4，服务页目录创建、fd 表扩容）<br>2. 再暴露 `pgdir_create()` 复制内核高半区 PDE（0xC0000000+）+ 清空低半区<br>3. fork 两条路：<br>   - **急切复制低半区页表**（用户空间小、页表仅 KB 级，可接受）<br>   - **vfork 式 spawn 共享只读镜像**（放弃 COW，接受内存翻倍，先跑通 nginx worker 模型）<br>4. COW 缺页分配留待阶段 4 优化 |
@@ -129,7 +160,7 @@
 
 | 前置依赖 | 关键实施项 | 验收标准 |
 |---|---|---|
-| R4 内核事件子系统（核心工程） | 1. `e1000.c` RX 中断注册 `irq_register_handler` `interrupts.c:20`<br>2. `net_napi_poll(budget)` 预算循环（现为直通包装 `net.c:1065`）<br>3. 新增 `event.c`：fd→就绪位登记表（socket 状态变化打标：rxb 非空→readable；sndb 有余量→writable；ESTAB 入表→listener readable）<br>4. 新增 **nr=31 `poll(fds*, nfds, timeout_ticks)`** `syscall.h/syscall.c` | 1. 串口周期性 `[EVT] napi budget=<n> rx=<m>`<br>2. **并发 4 连接** python asyncio 探针：4 请求处理日志**交错**出现且全部 200（串行版必然顺序阻塞）<br>3. `poll(timeout=0)` 非阻塞语义探针 PASS |
+| R4 内核事件子系统（核心工程） | 1. `e1000.c` RX 中断注册 `irq_register_handler` `interrupts.c:20`<br>2. `net_napi_poll(budget)` 预算循环（现为直通包装 `net.c:1065`）<br>3. 新增 `event.c`：fd→就绪位登记表（socket 状态变化打标：rxb 非空→readable；sndb 有余量→writable；ESTAB 入表→listener readable）<br>4. 当前最小实现提供 **nr=168 `poll(fds*, nfds, timeout_ms)`** `kernel/syscall.h/syscall.c` | 1. 当前 `poll_check_fd` 检查 socket/VFS 就绪<br>2. nginx r4 使用 `poll` 完成静态 HTTP `/` 200 与 `/missing` 404<br>3. 完整 epoll/select 和事件等待队列仍待后续 | ⚠️部分完成 |
 | Y2 睡眠原语（poll 阻塞语义前置） | 骨架期允许忙轮询 `poll(timeout=0)`，阻塞语义后补 | nginx `--with-poll_module` configure 通过 |
 
 **决策点 D2**：建议 **poll 语义先行**（参数扁平、内核实现最简），nginx 侧 `--with-poll_module`；epoll 作为阶段 4 增强。
@@ -141,7 +172,7 @@
 | 优化项 | 依赖 | 说明 |
 |---|---|---|
 | netring 零拷贝收发 | `netring.h` 已存在 `net.h:5`；`net_napi_poll` 改造后可对接 | 避免 `tcp_send/recv` 拷贝；需 ring3 共享内存映射（依赖 R2 mmap） |
-| TCP 连接表 16→≥1024 | `net.h:67 TCP_MAX_CONNS` | 硬约束，nginx 默认 `worker_connections 1024` 差两个数量级 |
+| TCP 连接表 64→≥1024 | `net/net.h:86 TCP_MAX_CONNS` | 当前第一档为 64，仍是 nginx 默认 `worker_connections 1024` 的容量缺口 |
 | 发送/接收缓冲 4KB→64KB 级 | `net.h:70 TCP_BUF_SIZE` | 慢客户端反压、大响应吞吐 |
 | Window Scale / SACK 完善 | 已有 SACK≤2 块 `net.c:329` | 高延迟链路吞吐 |
 | sendfile 零拷贝 | R6（需 page cache） | **官方逃生门：`--without-sendfile` 永久禁用**，退化为 read+writev 链 |
@@ -189,7 +220,7 @@
 |---|---|
 | 单一全局页目录，无 per-process 地址空间 API | `paging.c:15,302-306` |
 | 无内核堆分配器 | `grep malloc/kmalloc *.c *.h → 空` |
-| TCP 连接表硬上限 16 | `net.h:67` |
+| TCP 连接表硬上限 64 | `net/net.h:86` |
 | accept 无对端地址出参 | `syscall.c:289` `net.c:919-933` |
 | connect 完全缺失 | `net.h:107-118` 无声明 |
 | wait stub 恒 -ECHILD | `syscall.c:226-230` |
@@ -205,10 +236,13 @@
 
 ---
 
-**总结论**：nginx 移植的**四大分水岭**（按依赖拓扑序）：
+**历史总结论**：原始 nginx 移植的**四大分水岭**（按依赖拓扑序）：
 1. **Y11 romfs 只读文件系统**（配置/静态内容前置）
 2. **R4 事件就绪通知 + poll() syscall**（事件引擎心脏）
 3. **R1/Y5 fork + 独立地址空间**（master/worker 模型根基）
 4. **R5-min 信号最小集**（master 优雅生命周期）
 
-**建议执行顺序**：M0 httpd（当前 ABI 可跑通） → M1 fork/wait/信号最小集 → M2 poll/事件驱动 → M3 性能调优。**每阶段产出独立可验证里程碑**，回归资产连续累积。
+**2026-08-28 当前结论**：M0 httpd 已有独立 QEMU/curl 证据；nginx 1.26.2 的单进程静态
+HTTP（`master_process off` + `poll` + FAT16）已通过 r4 fresh QEMU。后续不再把 M1/M2
+当作 nginx 最小闭环的启动前置，而按优先级推进完整 master/worker、signal、upstream/connect、
+可写日志、epoll、共享内存和容量扩展；每项仍须独立真实验证。

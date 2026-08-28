@@ -1,7 +1,11 @@
 # Cat-OS 最小 HTTP 服务器设计（MINIMAL_HTTPD_DESIGN）
 
 > **任务**：code3 并行任务 · 设计文档（nginx 移植的中间步骤，配套 `NGINX_PORT_ANALYSIS.md` §5 阶段 2）。
-> **基线**：同 NGINX_PORT_ANALYSIS.md（工作区 HEAD=`6796bd6` + 未提交改动，行号均为实测）。
+> **基线**：本文主体是 2026-08-25 的设计快照；当前 nginx 实现基线为 `be876b6`。
+> **当前关系（2026-08-28）**：httpd M0 已有独立 QEMU/curl 记录；nginx 1.26.2 的
+> 单进程静态 HTTP 已通过 r4 和独立 fresh QEMU 复验，详见 `README.md` 与 `NOTES_NGINX_PORT.md`。
+> **语义回填**：下文保留设计期的旧行号和取舍；当前 TCP 发送缓冲耗尽返回 `-EAGAIN`，
+> accept syscall 已支持可选 `sockaddr_in` 出参，不能把旧设计假设当成当前 nginx 全能力。
 > **约束**：本文为设计稿，不附带任何源码；所有引用的现状能力均标注依据行号，未证实处标 🔍待验证。
 
 ---
@@ -37,14 +41,14 @@
 - ❌ keep-alive、pipelining、chunked（HTTP/1.1 高级特性；响应固定 `Connection: close`）
 - ❌ CGI/proxy/upstream（依赖 connect=Y1 与 fork=R1）
 - ❌ 动态路由、TLS
-- ❌ 高并发（受 TCP 连接表 16 上限硬约束，见 §7）
+- ❌ 高并发（受当前 TCP 连接表 64、VFS fd 表 32 等硬约束，见 §7）
 
 ---
 
 ## 2. 为什么它是 nginx 移植的正确中间步骤
 
 1. **几乎零前置依赖**。所需系统调用全部落在绿档（G1-G4）：nr=20..28 socket 组 + nr=1 write。对照 NGINX_PORT_ANALYSIS §3.1，无需等待黄档任何一项即可开工——唯一的软依赖是静态内容来源（§6 提供三档策略，最低档连 romfs 都不用）。
-2. **它是 nginx 的功能子集参照物**。nginx 移植完成后的第一个对照测试就是：同一请求序列在 httpd 与 nginx 上行为一致。
+2. **它是 nginx 的功能子集参照物**。nginx 的单进程静态路径已经通过独立 r4 验收；同一请求序列在 httpd 与 nginx 上的对照仍是后续回归资产。
 3. **它把"轮询式 accept"的痛提前暴露**。当前 accept 无连接返回 -EAGAIN（syscall.c ACCEPT 分支），单进程只能忙等或睡 tick——这正是催生 R4 事件框架的第一手需求证据。
 4. **风险隔离**。httpd 是纯 ring3 用户程序（ELF 经 nr=11 exec 加载，syscall.c sys_exec），不碰内核一行代码，符合并行任务纪律。
 
@@ -65,7 +69,7 @@
 │   main:                                                                     │
 │     lfd = socket(STREAM)          ; nr=20                                   │
 │     bind(lfd, 80)                 ; nr=21                                   │
-│     listen(lfd, 16)               ; nr=22（backlog 上限即 TCP_MAX_CONNS）   │
+│     listen(lfd, 64)               ; nr=22（当前 backlog 上限即 TCP_MAX_CONNS）│
 │   loop:                                                                     │
 │     cfd = accept(lfd)            ─┐ nr=23；-EAGAIN 时 yield/sleep（§4.2）   │
 │     n = recv(cfd, reqbuf, N)      ; nr=27；读满 \r\n\r\n 或 EOF             │
@@ -134,7 +138,7 @@ Connection: close\r\n
 <body>
 ```
 
-- 发送：header 与 body 若能拼入一个 ≤1460B（TCP_MSS，net.h:69）缓冲则一次 send；否则先发 header 再循环 send body——**必须处理部分写**：tcp_send 是收缩式部分写语义（net.c:945-954），且缓冲满可返回 0（TODO(code2) 已知歧义），发送侧以「进度游标 + 总尝试上限」推进，超限即放弃关闭（宁可截断不可死循环）。
+  - 发送：header 与 body 若能拼入一个 ≤1460B（TCP_MSS，net.h:69）缓冲则一次 send；否则先发 header 再循环 send body——**必须处理部分写**：tcp_send 是收缩式部分写语义，缓冲满返回 `-EAGAIN`，发送侧以「进度游标 + 有界重试」推进，超限即放弃关闭（宁可截断不可死循环）。
 - 错误页：404/400/405/503 固定内嵌字符串。
 - HEAD：与 GET 同解析，仅丢弃 body 保留 Content-Length。
 
@@ -143,7 +147,9 @@ Connection: close\r\n
 stdout（fd=1，/dev/console，vfs.c vfs_init 装 0-2）单行访问日志：
 `[httpd] peer=<由 accept 无法获得对端地址，见下> path=/ len=200`
 
-> ⚠️ 新缺口（回填建议）：house ABI 的 accept **不返回对端 IP/端口**（SOCKET_API.md §4.3：底层 tcp_accept(s,&ip,&port) 有此能力 net.c:929-943，但五寄存器限制下 syscall 层未透出）。日志只能记 fd。改进项：新增 nr 或复用 getpeername 语义——列入阶段 3e 白名单。
+> 设计期限制：旧 house ABI 的 accept 曾不返回对端 IP/端口。当前 syscall accept 已支持可选
+> `sockaddr_in` 和长度出参，nginx r4 走该路径完成静态请求；独立 httpd 的日志格式仍需按
+> 其实际调用方式单独验证。
 
 ---
 
@@ -179,14 +185,14 @@ stdout（fd=1，/dev/console，vfs.c vfs_init 装 0-2）单行访问日志：
 
 | # | 限制 | 根因（证据） | 影响 |
 |---|---|---|---|
-| L1 | 并发 ≤16 连接（实际有效并发=1 服务 + backlog 排队） | TCP_MAX_CONNS=16（net.h:67）；backlog 满 SYN→RST（net.c:708-711） | 压测工具并发参数须 ≤15 |
+| L1 | 并发受限（实际有效并发=1 服务 + backlog 排队） | TCP_MAX_CONNS=64（net.h:86）；backlog 满 SYN→RST（`net/net_tcp.c` conn-table-full 路径） | 压测工具须按当前 listener 占槽和 fd 上限推导 |
 | L2 | 单请求体上限：只支持"头小请求"，无 body 读取 | 设计取舍（§4.3） | POST 一律 405 |
 | L3 | 单次 send 有效载荷 ≤1460B，大响应多次 send | TCP_MSS=1460（net.h:69）、tcp_send clamp（net.c:948） | 发送游标逻辑必测 |
 | L4 | 发送缓冲 4096B：响应大于 4KB 时 tcp_send 会收缩返回 | TCP_BUF_SIZE=4096（net.h:70）；net.c:949 | 游标推进必须容忍"一次只吞几百字节" |
 | L5 | 无对端地址可见性 | house ABI accept 无出参（SOCKET_API.md §4.3） | 日志降级（§4.5） |
 | L6 | 忙等能耗 | 无 ring3 yield/sleep syscall（§4.2 新缺口 Y6'） | QEMU 无碍；真实硬件费电 |
 | L7 | 用户栈仅 4KB | elf.h:30-31 单栈页 | 解析缓冲+局部变量预算 ≤2KB；溢出即 #PF（现网大概率 panic，无 page fault handler） |
-| L8 | TIME_WAIT 2s × 连接表 16 | net.c TIME_WAIT 定长（SOCKET_API.md §3.6） | 快速重启压测可能耗尽连接表 → RST，测试脚本需间隔 |
+| L8 | TIME_WAIT 2s × 连接表 64 | `net/net_tcp.c` TIME_WAIT 定长（SOCKET_API.md §3.6） | 快速重启压测仍可能耗尽连接表 → RST，测试脚本需间隔 |
 
 ---
 
@@ -218,11 +224,12 @@ httpd v1（本文档，L0 内嵌内容，忙等 accept）
    ├─► httpd v3：单进程事件驱动（poll 就绪集驱动 N 连接并发）——R4 的验收载体，
    │             结构上已等价于「nginx event engine 的骨架」
    │  + R1/R3/R5-min ……
-   └─► nginx 1.26 移植（configure --with-poll_module --without-sendfile 起）
+   └─► nginx 1.26.2 当前最小闭环（`master_process off` + `poll` + FAT16 静态文件，已通过 r4）
+                 └─► 完整 master/worker、upstream、可写日志、epoll 和高并发仍待后续
 ```
 
-每一级演进都**复用上一级的请求解析/响应生成代码**，保证回归资产连续累积；v3 的事件循环代码结构将直接映射 nginx `ngx_process_events_and_timers` 的形态，为 shim 层编写提供活样例。
+每一级演进都**复用上一级的请求解析/响应生成代码**，保证回归资产连续累积；v3 的事件循环代码结构可对照 nginx `ngx_process_events_and_timers`（nginx 1.26.2 `src/event/ngx_event.c:194-195`），而当前 nginx r4 已直接使用 `src/event/modules/ngx_poll_module.c` 的 poll 模块。
 
 ---
 
-*文档结束。生成者：Cat-OS 并行任务 code3。约束遵守声明：本任务仅新建 `docs/MINIMAL_HTTPD_DESIGN.md` 与 `docs/NGINX_PORT_ANALYSIS.md`；未修改任何既有 `.c/.h/.md`；未触碰 usermode.c / OSDEV_PROJECT_NOTES.md / NEXT_TASKS_AUTONOMOUS.md；未执行 push/reset/rebase/delete。*
+*文档结束。主体为 2026-08-25 设计快照；当前关系回填于 2026-08-28。本文回填只更新文档，不修改 nginx/Cat-OS 源码。*
